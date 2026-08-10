@@ -1,0 +1,343 @@
+export interface Config {
+  site_name: string;
+  site_description: string;
+  site_announcement: string;
+  favicon_url: string;
+  locale: "zh-CN" | "en";
+  federation_sites: FederationSite[];
+  public_dashboard: boolean;
+  offline_threshold_seconds: number;
+  history_retention_days: number;
+  default_theme: "system" | "light" | "dark";
+  background_url: string;
+  theme_url: string;
+  theme_options: Record<string, ThemeSettingValue>;
+  show_search: boolean;
+  show_groups: boolean;
+  show_stats: boolean;
+  show_assets: boolean;
+  show_traffic: boolean;
+  show_speed: boolean;
+  show_price: boolean;
+  show_expiry: boolean;
+  show_latency: boolean;
+  show_uptime: boolean;
+  turnstile_enabled: boolean;
+  turnstile_login_enabled: boolean;
+  turnstile_site_key: string;
+  websocket: boolean;
+}
+
+export type ThemeSettingValue = string | number | boolean;
+
+export const ASSET_CURRENCIES = [
+  "CNY", "USD", "HKD", "EUR", "GBP", "JPY", "RUB", "CHF", "INR", "VND", "THB", "CAD",
+] as const;
+export type AssetCurrency = typeof ASSET_CURRENCIES[number];
+
+interface ThemeSettingChoice {
+  label: string;
+  value: string;
+}
+
+export interface ThemeSettingField {
+  key: string;
+  label: string;
+  type: "text" | "textarea" | "url" | "color" | "select" | "toggle" | "number";
+  default?: ThemeSettingValue;
+  placeholder?: string;
+  options?: ThemeSettingChoice[];
+  min?: number;
+  max?: number;
+  step?: number;
+}
+
+export interface ThemeSettingsSchema {
+  schema: number;
+  source: "builtin" | "third-party";
+  settings: ThemeSettingField[];
+}
+
+export interface ExchangeRates {
+  base: "CNY";
+  rates: Record<string, number>;
+  source: string;
+  date: string;
+  fetched_at: number;
+  stale: boolean;
+  cny?: Record<string, number>;
+}
+
+export interface FederationSite {
+  name: string;
+  url: string;
+}
+
+interface DiskMetric {
+  name: string;
+  mount_point: string;
+  used: number;
+  total: number;
+  read_bps: number;
+  write_bps: number;
+  read_iops: number;
+  write_iops: number;
+  await_ms: number;
+  utilization: number;
+}
+
+interface GpuMetric {
+  model: string;
+  usage: number;
+  memory_used: number;
+  memory_total: number;
+}
+
+export type TrafficLimitType = "sum" | "max" | "min" | "up" | "down";
+
+export interface LatencySample {
+  task_id: string;
+  server_id: string;
+  name: string;
+  task_type: "tcp" | "icmp";
+  target: string;
+  timestamp: number;
+  latency_ms: number;
+  packet_loss: number;
+}
+
+export interface LatencyTestPoint {
+  id: string;
+  name: string;
+  task_type: "tcp" | "icmp";
+  target: string;
+  interval_seconds: number;
+}
+
+export interface LatencyTask {
+  id: string;
+  name: string;
+  task_type: "tcp" | "icmp";
+  target: string;
+  interval_seconds: number;
+  default_enabled: boolean;
+  sort_order: number;
+  server_ids: string[];
+  created_at: number;
+  updated_at: number;
+}
+
+export type LatencyTaskInput = Pick<LatencyTask, "name" | "task_type" | "target" | "interval_seconds" | "default_enabled" | "server_ids">;
+
+export interface Server {
+  id: string;
+  name: string;
+  region: string;
+  group_name: string;
+  tags: string;
+  note: string;
+  hidden: number;
+  sort_order: number;
+  expires_at: number | null;
+  traffic_limit: number;
+  traffic_limit_type: TrafficLimitType;
+  price: number;
+  billing_cycle: number;
+  currency: string;
+  auto_renewal: number;
+  public_remark: string;
+  network_interface: string;
+  reset_day: number;
+  report_interval: number;
+  collect_interval: number;
+  rx_correction: number;
+  tx_correction: number;
+  offline_notify_disabled: number;
+  auto_update: number;
+  created_at: number;
+  updated_at: number;
+  timestamp: number | null;
+  cpu: number | null;
+  load1: number | null;
+  load5: number | null;
+  load15: number | null;
+  mem_used: number | null;
+  mem_total: number | null;
+  swap_used: number | null;
+  swap_total: number | null;
+  disk_used: number | null;
+  disk_total: number | null;
+  net_in: number | null;
+  net_out: number | null;
+  net_rx_total: number | null;
+  net_tx_total: number | null;
+  uptime: number | null;
+  processes: number | null;
+  tcp_connections: number | null;
+  udp_connections: number | null;
+  cpu_cores: number | null;
+  cpu_model: string | null;
+  os: string | null;
+  kernel: string | null;
+  arch: string | null;
+  virtualization: string | null;
+  ipv4: string | null;
+  ipv6: string | null;
+  gpu_usage: number | null;
+  gpu_model: string | null;
+  agent_version: string | null;
+  disk_read_bps: number | null;
+  disk_write_bps: number | null;
+  disk_read_iops: number | null;
+  disk_write_iops: number | null;
+  disk_await_ms: number | null;
+  disk_utilization: number | null;
+  disks?: DiskMetric[];
+  gpus?: GpuMetric[];
+  source_url?: string;
+  source_name?: string;
+  source_id?: string;
+  message: string | null;
+  latency?: LatencySample[];
+}
+
+export interface HistoryPoint {
+  timestamp: number;
+  cpu: number;
+  load1: number;
+  load5: number;
+  load15: number;
+  mem_used: number;
+  mem_total: number;
+  swap_used: number;
+  swap_total: number;
+  disk_used: number;
+  disk_total: number;
+  net_in: number;
+  net_out: number;
+  net_rx_total: number;
+  net_tx_total: number;
+  processes: number;
+  tcp_connections: number;
+  udp_connections: number;
+  gpu_usage: number;
+  disk_read_bps: number;
+  disk_write_bps: number;
+  disk_read_iops: number;
+  disk_write_iops: number;
+  disk_await_ms: number;
+  disk_utilization: number;
+}
+
+export interface ServerInput {
+  name: string;
+  region: string;
+  group_name: string;
+  tags: string;
+  note: string;
+  hidden: boolean;
+  expires_at: number | null;
+  traffic_limit: number;
+  traffic_limit_type: TrafficLimitType;
+  price: number;
+  billing_cycle: number;
+  currency: string;
+  auto_renewal: boolean;
+  public_remark: string;
+  network_interface: string;
+  reset_day: number;
+  report_interval: number;
+  collect_interval: number;
+  rx_correction: number;
+  tx_correction: number;
+  offline_notify_disabled: boolean;
+  auto_update: boolean;
+}
+
+export interface Settings extends Omit<Config, "websocket"> {
+  admin_username: string;
+  admin_password_configured: boolean;
+  new_password?: string;
+  turnstile_secret_key: string;
+  notification_enabled: boolean;
+  notification_endpoint: string;
+  notification_target: string;
+  offline_alert_minutes: number;
+  expiry_alert_days: number;
+  cloudflare_account_id: string;
+  cloudflare_api_token: string;
+  cors_allowed_origins: string;
+  csp_asset_origins: string;
+}
+
+type AlertMetric = "cpu" | "memory" | "disk" | "net_in" | "net_out";
+type AlertAggregation = "average" | "continuous";
+
+export interface AlertRule {
+  id: string;
+  name: string;
+  metric: AlertMetric;
+  threshold: number;
+  duration_minutes: number;
+  aggregation: AlertAggregation;
+  enabled: number;
+  server_ids: string[];
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AlertRuleInput extends Omit<AlertRule, "id" | "enabled" | "created_at" | "updated_at"> {
+  enabled: boolean;
+}
+
+export interface DatabaseStats {
+  server_count: number;
+  online_count: number;
+  history_rows: number;
+  oldest_history: number | null;
+  newest_history: number | null;
+}
+
+interface CloudflareUsagePeriod {
+  rows_read: number;
+  rows_written: number;
+  workers_requests: number;
+}
+
+export interface CloudflareUsage {
+  today: CloudflareUsagePeriod;
+  yesterday: CloudflareUsagePeriod;
+}
+
+export interface AgentInstallTarget {
+  id: string;
+  name: string;
+  agent_token: string;
+}
+
+interface ThemeVersion {
+  version?: string;
+  short_version?: string;
+  commitid?: string;
+  commitId?: string;
+  theme_url?: string;
+  releaseDate?: string;
+  changelog?: string;
+}
+
+export interface ThirdPartyTheme {
+  id: string;
+  title: string;
+  cover: string;
+  tags?: string[];
+  description?: string | Record<string, string>;
+  url: string;
+  branch?: string;
+  author?: string;
+  versions?: ThemeVersion[];
+}
+
+export interface ThemeStore {
+  schema: number;
+  themes: ThirdPartyTheme[];
+}

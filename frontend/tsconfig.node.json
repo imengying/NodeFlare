@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "../node_modules/.cache/cf-monitor/tsconfig.node.tsbuildinfo",
+    "composite": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["vite.config.ts", "vite.admin.config.ts"]
+}

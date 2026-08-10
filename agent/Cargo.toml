@@ -1,0 +1,24 @@
+[package]
+name = "cf-monitor-agent"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Independent Rust telemetry agent for CF Monitor"
+repository = "https://github.com/imengying/CF-Monitor"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "network", "system"] }
+ureq = { version = "2.12", default-features = false, features = ["json", "native-tls"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

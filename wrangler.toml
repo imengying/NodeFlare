@@ -1,0 +1,36 @@
+name = "cf-monitor"
+main = "build/index.js"
+compatibility_date = "2026-08-07"
+
+[build]
+command = "sh scripts/build-worker.sh"
+
+[assets]
+directory = "./frontend/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true
+
+[vars]
+SITE_NAME = "CF Monitor"
+OFFLINE_THRESHOLD_SECONDS = "180"
+HISTORY_RETENTION_DAYS = "30"
+
+[[d1_databases]]
+binding = "DB"
+# Wrangler 4.45+ provisions and binds this database when database_id is omitted.
+database_name = "cf-monitor-db"
+
+[[durable_objects.bindings]]
+name = "LIVE_HUB"
+class_name = "LiveHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LiveHub"]
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[dev]
+port = 8787

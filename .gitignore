@@ -1,0 +1,11 @@
+/build/
+/target/
+/node_modules/
+/frontend/public/agent-*
+/frontend/dist/
+/frontend/admin-dist/
+/frontend/node_modules/
+/.wrangler/
+/.dev.vars
+*.log
+*.tsbuildinfo

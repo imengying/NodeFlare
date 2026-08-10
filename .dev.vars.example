@@ -1,0 +1,7 @@
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=change-this-local-password
+# Optional: set a stable signing key for admin sessions in production.
+# SESSION_SECRET=replace-with-a-random-secret
+# Optional: enable Cloudflare usage statistics in the admin data workspace.
+# CLOUDFLARE_ACCOUNT_ID=your-account-id
+# CLOUDFLARE_API_TOKEN=token-with-account-analytics-read
