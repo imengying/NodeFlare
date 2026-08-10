@@ -23,7 +23,10 @@ use sysinfo::{Disks, Networks, System};
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 compile_error!("cf-monitor-agent supports Linux, Windows, and macOS");
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = match option_env!("CF_MONITOR_AGENT_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
 const RELEASE_DOWNLOAD_BASE: &str =
     "https://github.com/imengying/CF-Monitor/releases/latest/download";
 const PROBE_ATTEMPTS: usize = 4;

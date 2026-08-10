@@ -3,47 +3,37 @@ name: Build tagged release
 on:
   push:
     tags:
-      - "*.*.*"
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       version:
-        description: Three-part release version, for example 0.0.1
+        description: Tag version with a v prefix, for example v0.0.1
         required: true
-        default: 0.0.1
+        default: v0.0.1
 
 permissions:
   contents: write
 
 jobs:
   metadata:
-    name: Validate version
+    name: Validate tag
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
       - id: version
-        name: Validate three-part version
+        name: Validate three-part tag
         shell: bash
         env:
           RAW_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         run: |
-          version="${RAW_VERSION#v}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Tag must be a three-part version such as v1.2.3 or 1.2.3" >&2
+          if [[ ! "$RAW_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must use the v-prefixed format v1.2.3" >&2
             exit 1
           fi
 
-          root_version=$(node -p "require('./package.json').version")
-          frontend_version=$(node -p "require('./frontend/package.json').version")
-          worker_version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
-          agent_version=$(awk -F '"' '/^version = / { print $2; exit }' agent/Cargo.toml)
-          for package_version in "$root_version" "$frontend_version" "$worker_version" "$agent_version"; do
-            if [ "$package_version" != "$version" ]; then
-              echo "Tag version $version does not match package version $package_version" >&2
-              exit 1
-            fi
-          done
+          version="${RAW_VERSION#v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   agent:
@@ -52,6 +42,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_TARGET_DIR: target/agent
+      CF_MONITOR_AGENT_VERSION: ${{ needs.metadata.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
