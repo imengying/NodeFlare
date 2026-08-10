@@ -1574,16 +1574,16 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
 
     if method == Method::Get && path == "/api/admin/cloudflare-usage" {
         let account_id = if settings.cloudflare_account_id.trim().is_empty() {
-            env.secret("CLOUDFLARE_ACCOUNT_ID")
-                .or_else(|_| env.var("CLOUDFLARE_ACCOUNT_ID"))
+            env.secret("CF_USAGE_ACCOUNT_ID")
+                .or_else(|_| env.var("CF_USAGE_ACCOUNT_ID"))
                 .map(|value| value.to_string())
                 .unwrap_or_default()
         } else {
             settings.cloudflare_account_id.clone()
         };
         let token = if settings.cloudflare_api_token.trim().is_empty() {
-            env.secret("CLOUDFLARE_API_TOKEN")
-                .or_else(|_| env.var("CLOUDFLARE_API_TOKEN"))
+            env.secret("CF_USAGE_API_TOKEN")
+                .or_else(|_| env.var("CF_USAGE_API_TOKEN"))
                 .map(|value| value.to_string())
                 .unwrap_or_default()
         } else {

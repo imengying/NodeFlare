@@ -14,20 +14,24 @@
 - 节点管理、批量删除、拖拽排序、Agent 密钥轮换和在线配置
 - Telegram 通知、资源告警、离线/到期提醒和数据维护
 - 内置主题与 CFSM Theme Store，支持主题预览、应用和自定义设置
-- 多站点聚合，支持最多 16 个公开 CF Monitor 站点
 - Rust Agent 支持 Linux x86_64/ARM64、Windows x86_64 和 macOS ARM64，可按节点自动更新
 
 ## 部署到 Cloudflare
 
-1. Fork 本项目，在 Cloudflare Dashboard 打开 **Workers & Pages**，选择 **Continue with GitHub** 并导入仓库。
+1. Fork 本项目，打开 [Workers & Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages/create)，选择 **Continue with GitHub** 并导入仓库。
 2. 使用生产分支 `main`，根目录 `/`，构建命令留空，部署命令填写 `bun run deploy`。
-3. 在 Worker 的 **Settings → Variables and Secrets** 中设置 `ADMIN_PASSWORD`；用户名默认为 `admin`，也可以设置 `ADMIN_USERNAME`。`SESSION_SECRET`、Cloudflare 用量查询凭据按需添加。
+3. 在创建页展开 **高级设置**，按下表添加变量。
 
-| 变量 | 默认值 | 说明 |
+| 变量 | 必填/可选 | 说明 |
 | --- | ---: | --- |
-| `SITE_NAME` | `CF Monitor` | 站点名称 |
-| `OFFLINE_THRESHOLD_SECONDS` | `180` | 离线判定秒数，范围 30-3600 |
-| `HISTORY_RETENTION_DAYS` | `30` | 历史保留天数，范围 1-365 |
+| `ADMIN_USERNAME` | 可选 | 管理员登录用户名，未设置时使用 `admin` |
+| `ADMIN_PASSWORD` | 必填 | 初始管理员密码，勾选“加密” |
+| `SESSION_SECRET` | 可选 | 会话签名密钥，勾选“加密”；未设置时使用密码哈希 |
+| `SITE_NAME` | 可选 | 站点名称，未设置时使用 `CF Monitor` |
+| `OFFLINE_THRESHOLD_SECONDS` | 可选 | 离线判定秒数，未设置时使用 180，范围 30-3600 |
+| `HISTORY_RETENTION_DAYS` | 可选 | 历史保留天数，未设置时使用 30，范围 1-365 |
+| `CF_USAGE_ACCOUNT_ID` | 可选 | Cloudflare 用量查询的账户 ID，不设置则不启用用量查询 |
+| `CF_USAGE_API_TOKEN` | 可选 | 用量查询 Token，勾选“加密”；需要 Account Analytics Read 权限 |
 
 ## API
 
@@ -62,6 +66,10 @@
 | `POST` | `/api/admin/notifications/test` | 发送一条通知测试消息 |
 
 第三方主题可在构建目录提供 `theme-settings.json`（`schema: 1`）。后台按字段生成设置控件，保存值通过 `/api/config` 的 `theme_options` 返回。
+
+## 鸣谢
+
+感谢 [CF-Server-Monitor](https://github.com/huilang-me/CF-Server-Monitor) 项目提供的思路。
 
 ## License
 

@@ -1,12 +1,53 @@
 #!/bin/sh
 set -eu
 
+runtime_secrets_file=""
+
+cleanup() {
+  if [ -n "$runtime_secrets_file" ]; then
+    rm -f "$runtime_secrets_file"
+  fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+prepare_runtime_secrets() {
+  runtime_secrets_file=$(mktemp)
+  RUNTIME_SECRETS_FILE="$runtime_secrets_file" bun -e '
+    const names = ["ADMIN_PASSWORD", "SESSION_SECRET", "CF_USAGE_API_TOKEN"];
+    const secrets = Object.fromEntries(
+      names.flatMap((name) => process.env[name] ? [[name, process.env[name]]] : []),
+    );
+    if (Object.keys(secrets).length > 0) {
+      await Bun.write(process.env.RUNTIME_SECRETS_FILE, JSON.stringify(secrets));
+    }
+  '
+
+  if [ ! -s "$runtime_secrets_file" ]; then
+    rm -f "$runtime_secrets_file"
+    runtime_secrets_file=""
+  fi
+}
+
+deploy_worker() {
+  set -- bunx wrangler deploy
+  [ -z "${ADMIN_USERNAME:-}" ] || set -- "$@" --var "ADMIN_USERNAME:${ADMIN_USERNAME}"
+  [ -z "${SITE_NAME:-}" ] || set -- "$@" --var "SITE_NAME:${SITE_NAME}"
+  [ -z "${OFFLINE_THRESHOLD_SECONDS:-}" ] || set -- "$@" --var "OFFLINE_THRESHOLD_SECONDS:${OFFLINE_THRESHOLD_SECONDS}"
+  [ -z "${HISTORY_RETENTION_DAYS:-}" ] || set -- "$@" --var "HISTORY_RETENTION_DAYS:${HISTORY_RETENTION_DAYS}"
+  [ -z "${CF_USAGE_ACCOUNT_ID:-}" ] || set -- "$@" --var "CF_USAGE_ACCOUNT_ID:${CF_USAGE_ACCOUNT_ID}"
+  [ -z "$runtime_secrets_file" ] || set -- "$@" --secrets-file "$runtime_secrets_file"
+  "$@"
+}
+
+prepare_runtime_secrets
+
 # Some Cloudflare deployment flows provision bindings before this script runs.
 # A first deployment without that pre-provisioning needs one upload to create D1.
 if ! bunx wrangler d1 info DB --json >/dev/null 2>&1; then
   echo "D1 binding is not provisioned; creating it through Wrangler deploy..."
-  bunx wrangler deploy
+  deploy_worker
 fi
 
 bunx wrangler d1 migrations apply DB --remote
-exec bunx wrangler deploy
+deploy_worker

@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/ensure-rust.sh"
+
 if [ "${CF_MONITOR_ADMIN_READY:-0}" != "1" ]; then
   bun run build:agent
   bun run build:frontend
