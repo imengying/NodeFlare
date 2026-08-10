@@ -22,22 +22,12 @@
 1. Fork 本项目，在 Cloudflare Dashboard 打开 **Workers & Pages**，选择 **Continue with GitHub** 并导入仓库。
 2. 使用生产分支 `main`，根目录 `/`，构建命令留空，部署命令填写 `bun run deploy`。
 3. 在 Worker 的 **Settings → Variables and Secrets** 中设置 `ADMIN_PASSWORD`；用户名默认为 `admin`，也可以设置 `ADMIN_USERNAME`。`SESSION_SECRET`、Cloudflare 用量查询凭据按需添加。
-4. 保存并部署。`DB` binding 会自动创建或连接 D1，部署脚本会自动执行 migration，无需手动填写 `database_id`。
-5. 打开生成的 Worker 地址登录管理面板，添加节点并生成对应平台的 Agent 安装命令。
-
-部署后的节点、延迟、通知、主题、汇率和 Cloudflare 用量都在管理面板中配置。
-
-## 配置
-
-`wrangler.toml` 中可调整：
 
 | 变量 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `SITE_NAME` | `CF Monitor` | 初始站点名，可在管理端覆盖 |
-| `OFFLINE_THRESHOLD_SECONDS` | `180` | 初始离线判定秒数 |
+| `SITE_NAME` | `CF Monitor` | 站点名称 |
+| `OFFLINE_THRESHOLD_SECONDS` | `180` | 离线判定秒数，范围 30-3600 |
 | `HISTORY_RETENTION_DAYS` | `30` | 历史保留天数，范围 1-365 |
-
-管理凭据存入 Worker Secrets 或后台“安全”设置，不要写入 `wrangler.toml`。开启 Turnstile 后，填写 Site Key 和 Secret Key。
 
 ## API
 

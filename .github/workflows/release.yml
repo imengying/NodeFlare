@@ -132,11 +132,29 @@ jobs:
     needs: [metadata, agent, frontend]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Build changelog from commits
+        shell: bash
+        run: |
+          previous_tag=$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)
+          if [ -n "$previous_tag" ]; then
+            commit_range="${previous_tag}..${GITHUB_SHA}"
+          else
+            commit_range="${GITHUB_SHA}"
+          fi
+
+          git log "$commit_range" --no-merges --pretty=format:'- %s' > CHANGELOG.md
+          if [ ! -s CHANGELOG.md ]; then
+            git log -1 --pretty=format:'- %s' "$GITHUB_SHA" > CHANGELOG.md
+          fi
+          printf '\n' >> CHANGELOG.md
+      - uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
       - uses: softprops/action-gh-release@v3
         with:
-          generate_release_notes: true
+          body_path: CHANGELOG.md
           files: release-assets/**

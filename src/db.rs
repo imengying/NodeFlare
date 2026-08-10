@@ -758,6 +758,7 @@ pub async fn settings(
     db: &D1Database,
     default_name: &str,
     default_threshold: i64,
+    default_retention: i64,
     default_username: &str,
 ) -> Result<SettingsView> {
     let rows: Vec<SettingRow> = db
@@ -781,7 +782,11 @@ pub async fn settings(
             .get("offline_threshold_seconds")
             .and_then(|value| value.parse().ok())
             .unwrap_or(default_threshold),
-        history_retention_days: integer_setting(&values, "history_retention_days", 30),
+        history_retention_days: integer_setting(
+            &values,
+            "history_retention_days",
+            default_retention.clamp(1, 365),
+        ),
         default_theme: string_setting(&values, "default_theme", "system"),
         background_url: string_setting(&values, "background_url", ""),
         theme_url: string_setting(&values, "theme_url", ""),

@@ -152,7 +152,6 @@ INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES
   ('favicon_url', '', unixepoch()),
   ('locale', 'zh-CN', unixepoch()),
   ('public_dashboard', 'true', unixepoch()),
-  ('history_retention_days', '30', unixepoch()),
   ('default_theme', 'system', unixepoch()),
   ('background_url', '', unixepoch()),
   ('theme_url', '', unixepoch()),

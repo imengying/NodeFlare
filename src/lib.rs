@@ -43,8 +43,10 @@ fn now() -> i64 {
 
 fn env_text(env: &Env, key: &str, fallback: &str) -> String {
     env.var(key)
+        .ok()
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| fallback.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn env_number(env: &Env, key: &str, fallback: i64) -> i64 {
@@ -732,11 +734,13 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
 
     let default_name = env_text(&env, "SITE_NAME", "CF Monitor");
     let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180).clamp(30, 3600);
+    let default_retention = env_number(&env, "HISTORY_RETENTION_DAYS", 30).clamp(1, 365);
     let default_username = env_text(&env, "ADMIN_USERNAME", "admin");
     let settings = db::settings(
         &database,
         &default_name,
         default_threshold,
+        default_retention,
         &default_username,
     )
     .await?;
@@ -954,6 +958,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             &database,
             &default_name,
             default_threshold,
+            default_retention,
             &default_username,
         )
         .await?
@@ -1809,6 +1814,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             &database,
             &default_name,
             default_threshold,
+            default_retention,
             &default_username,
         )
         .await?;
@@ -1950,18 +1956,20 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         return;
     };
     let default_name = env_text(&env, "SITE_NAME", "CF Monitor");
-    let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180);
+    let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180).clamp(30, 3600);
+    let default_retention = env_number(&env, "HISTORY_RETENTION_DAYS", 30).clamp(1, 365);
     let default_username = env_text(&env, "ADMIN_USERNAME", "admin");
     let settings = db::settings(
         &database,
         &default_name,
         default_threshold,
+        default_retention,
         &default_username,
     )
     .await;
     let retention = match &settings {
         Ok(settings) => settings.history_retention_days,
-        Err(_) => env_number(&env, "HISTORY_RETENTION_DAYS", 30),
+        Err(_) => default_retention,
     };
     let current = now();
     let last_cleanup = db::get_setting(&database, "last_history_cleanup")
