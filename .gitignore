@@ -1,5 +1,6 @@
 /build/
 /target/
+/agent/target/
 /node_modules/
 /frontend/public/agent-*
 /frontend/dist/
