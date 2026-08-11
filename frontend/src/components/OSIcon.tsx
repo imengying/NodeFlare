@@ -2,6 +2,7 @@ import { MonitorCog } from "lucide-react";
 import { useState } from "react";
 
 const systems = [
+  ["alibaba", "os-alibaba.svg", "Alibaba Cloud Linux"],
   ["alma", "os-alma.svg", "AlmaLinux"], ["alpine", "os-alpine.webp", "Alpine Linux"],
   ["arch", "os-arch.svg", "Arch Linux"], ["armbian", "os-armbian.png", "Armbian"],
   ["centos", "os-centos.svg", "CentOS"], ["debian", "os-debian.svg", "Debian"],

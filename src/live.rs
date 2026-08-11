@@ -7,6 +7,9 @@ pub struct LiveHub {
 
 impl DurableObject for LiveHub {
     fn new(state: State, _env: Env) -> Self {
+        if let Ok(pair) = WebSocketRequestResponsePair::new("ping", "pong") {
+            state.set_websocket_auto_response(&pair);
+        }
         Self { state }
     }
 
@@ -51,12 +54,9 @@ impl DurableObject for LiveHub {
 
     async fn websocket_message(
         &self,
-        ws: WebSocket,
-        message: WebSocketIncomingMessage,
+        _ws: WebSocket,
+        _message: WebSocketIncomingMessage,
     ) -> Result<()> {
-        if matches!(message, WebSocketIncomingMessage::String(ref value) if value == "ping") {
-            ws.send_with_str("pong")?;
-        }
         Ok(())
     }
 

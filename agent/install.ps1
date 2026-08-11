@@ -21,17 +21,22 @@ function Assert-Safe([string]$Name, [string]$Value) {
 
 function Assert-WorkerUrl([string]$Value) {
   $Parsed = $null
+  $SecureScheme = $false
+  if ([Uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$Parsed)) {
+    $SecureScheme = $Parsed.Scheme -eq "https" -or (
+      $Parsed.Scheme -eq "http" -and $Parsed.Host -in @("localhost", "127.0.0.1", "::1")
+    )
+  }
   if (
     $Value.Length -gt 2048 -or
     $Value -match "\s" -or
     $Value.Contains("'") -or
-    -not [Uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$Parsed) -or
-    $Parsed.Scheme -notin @("http", "https") -or
+    -not $SecureScheme -or
     -not [string]::IsNullOrEmpty($Parsed.UserInfo) -or
     -not [string]::IsNullOrEmpty($Parsed.Query) -or
     -not [string]::IsNullOrEmpty($Parsed.Fragment)
   ) {
-    throw "Url must be an absolute HTTP or HTTPS URL"
+    throw "Url must use HTTPS; HTTP is only allowed for loopback development"
   }
 }
 

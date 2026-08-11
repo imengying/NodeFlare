@@ -13,7 +13,8 @@
 - 用户名密码登录、Cloudflare Turnstile、节点隐藏和公开备注
 - 节点管理、批量删除、拖拽排序、Agent 密钥轮换和在线配置
 - Telegram 通知、资源告警、离线/到期提醒和数据维护
-- 内置 Komari Glass 主题，支持展示项、背景图和主题选项配置
+- 内置 Komari Glass 主题，并提供远程主题商店
+- 远程主题仅支持 GitHub `tree` 地址，Worker 代理 `index.html` 与 `assets/`
 - Rust Agent 支持 Linux x86_64/ARM64、Windows x86_64 和 macOS ARM64，可按节点自动更新
 
 ## 部署到 Cloudflare
@@ -56,6 +57,10 @@
 | `POST` | `/api/admin/servers/:id/token` | 轮换探针密钥 |
 | `DELETE` | `/api/admin/servers` | 批量删除节点 |
 | `GET/PATCH` | `/api/admin/settings` | 读写站点与展示设置 |
+| `GET/POST` | `/api/admin/themes` | 查询或添加主题 |
+| `POST` | `/api/admin/themes/:id/activate` | 启用主题 |
+| `POST` | `/api/admin/themes/:id/preview` | 创建短时主题预览链接 |
+| `DELETE` | `/api/admin/themes/:id` | 删除主题 |
 | `GET` | `/api/admin/theme-settings` | 读取当前前端提供的主题设置描述 |
 | `POST` | `/api/turnstile/verify` | 校验全站 Turnstile 令牌 |
 | `GET` | `/api/admin/database` | 查询 D1 节点、历史和数据库统计 |
@@ -63,6 +68,10 @@
 | `POST` | `/api/admin/exchange-rates/refresh` | 立即拉取并更新 D1 汇率快照 |
 | `DELETE` | `/api/admin/history` | 清理历史指标 |
 | `POST` | `/api/admin/notifications/test` | 发送一条通知测试消息 |
+
+## 主题
+
+GitHub `tree` 地址对应的目录需提供 `index.html` 和 `assets/`，并使用 NodeFlare 公开 API 读取数据。启用第三方主题前请确认来源可信。
 
 ## 鸣谢
 

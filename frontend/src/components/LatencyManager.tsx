@@ -19,7 +19,20 @@ function validHost(value: string) {
   const [name, port] = host.split(":");
   if (port && (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535)) return false;
   if (!name || name.startsWith(".") || name.endsWith(".")) return false;
-  return name.split(".").every((part) => /^[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?$/.test(part));
+  const labels = name.split(".");
+  if (labels.length === 4 && labels.every((part) => /^\d+$/.test(part))) {
+    const octets = labels.map(Number);
+    if (octets.some((part) => part < 0 || part > 255)) return false;
+    const [a, b, c] = octets;
+    return !(a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 0 && (c === 0 || c === 2)) || (a === 192 && b === 168)
+      || (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100)))
+      || (a === 203 && b === 0 && c === 113) || a >= 224);
+  }
+  const lower = name.toLowerCase();
+  if (labels.length < 2 || ["local", "localhost", "internal", "lan", "localdomain"].some((suffix) => lower === suffix || lower.endsWith(`.${suffix}`)) || lower === "home.arpa" || lower.endsWith(".home.arpa")) return false;
+  return labels.every((part) => /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(part));
 }
 
 export function LatencyManager({
@@ -83,7 +96,7 @@ export function LatencyManager({
   async function save(event: FormEvent) {
     event.preventDefault();
     if (!validHost(form.target) || (form.task_type === "icmp" && form.target.includes(":"))) {
-      onError(form.task_type === "icmp" ? "ICMP 目标应为域名或 IPv4，不能包含端口" : "TCP 目标应为域名、IPv4 或 host:port");
+      onError(form.task_type === "icmp" ? "ICMP 目标应为公网域名或公网 IPv4，不能包含端口" : "TCP 目标应为公网域名、公网 IPv4 或 host:port");
       return;
     }
     if (!form.default_enabled && !form.server_ids.length) {

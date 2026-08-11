@@ -10,6 +10,7 @@ export const demoConfig: Config = {
   offline_threshold_seconds: 180,
   history_retention_days: 30,
   default_theme: "system",
+  active_theme_id: "builtin-komari-glass",
   background_url: "",
   theme_options: {},
   show_search: true,
@@ -25,6 +26,7 @@ export const demoConfig: Config = {
   turnstile_enabled: false,
   turnstile_login_enabled: true,
   turnstile_site_key: "",
+  password_client_salt: "nodeflare-demo-password-kdf",
   websocket: true,
 };
 
@@ -77,9 +79,6 @@ const baseServer: Server = {
   region: "",
   group_name: "默认",
   tags: "",
-  note: "",
-  hidden: 0,
-  sort_order: 0,
   expires_at: null,
   traffic_limit: 0,
   traffic_limit_type: "sum",
@@ -88,16 +87,7 @@ const baseServer: Server = {
   currency: "CNY",
   auto_renewal: 0,
   public_remark: "",
-  network_interface: "",
   reset_day: 1,
-  report_interval: 60,
-  collect_interval: 5,
-  rx_correction: 0,
-  tx_correction: 0,
-  offline_notify_disabled: 0,
-  auto_update: 1,
-  created_at: now - 365 * 86400,
-  updated_at: now,
   timestamp: now - 12,
   cpu: 24,
   load1: 0.42,
@@ -123,8 +113,6 @@ const baseServer: Server = {
   kernel: "6.1.0",
   arch: "x86_64",
   virtualization: "KVM",
-  ipv4: "203.0.113.8",
-  ipv6: "2001:db8::8",
   gpu_usage: 0,
   gpu_model: "",
   agent_version: "0.0.1",
@@ -140,21 +128,21 @@ const baseServer: Server = {
   latency: [],
 };
 
-function node(sort_order: number, input: Partial<Server> & Pick<Server, "id" | "name">): Server {
-  const server = { ...baseServer, ...input, sort_order };
+function node(input: Partial<Server> & Pick<Server, "id" | "name">): Server {
+  const server = { ...baseServer, ...input };
   server.latency = input.latency ?? demoLatestLatency(server.id);
   return server;
 }
 
 export const demoServers: Server[] = [
-  node(0, { id: "hongkong-edge", name: "香港 Edge 01", region: "HK", group_name: "边缘网络", tags: "主力,线路:BGP,用途:网站", price: 128, expires_at: now + 46 * 86400, traffic_limit: 2 * 1024 ** 4 }),
-  node(1, { id: "tokyo-core", name: "东京 Core", region: "JP", group_name: "核心服务", tags: "主力,线路:Premium", price: 9.9, currency: "USD", expires_at: now + 46 * 86400, mem_total: 16 * 1024 ** 3, mem_used: 6.72 * 1024 ** 3, disk_total: 224 * 1024 ** 3, disk_used: 69.44 * 1024 ** 3, traffic_limit: 2 * 1024 ** 4, net_rx_total: 810 * 1024 ** 3, net_tx_total: 310 * 1024 ** 3, cpu: 31 }),
-  node(2, { id: "singapore-data", name: "新加坡 Data", region: "SG", group_name: "数据服务", tags: "数据库,NVMe", price: 88, expires_at: now + 46 * 86400, mem_total: 24 * 1024 ** 3, mem_used: 10.08 * 1024 ** 3, disk_total: 288 * 1024 ** 3, disk_used: 89.28 * 1024 ** 3, traffic_limit: 2 * 1024 ** 4, net_rx_total: 980 * 1024 ** 3, net_tx_total: 400 * 1024 ** 3, cpu: 38 }),
-  node(3, { id: "los-angeles-west", name: "洛杉矶 West", region: "US", group_name: "边缘网络", tags: "备用,线路:CN2", price: 24, currency: "USD", expires_at: now + 46 * 86400, disk_total: 352 * 1024 ** 3, disk_used: 109.12 * 1024 ** 3, traffic_limit: 2 * 1024 ** 4, net_rx_total: 1.12 * 1024 ** 4, net_tx_total: 490 * 1024 ** 3, cpu: 45 }),
-  node(4, { id: "frankfurt-lab", name: "法兰克福 Lab", region: "DE", group_name: "实验服务", tags: "Lab,IPv6", price: -1, expires_at: null, mem_total: 16 * 1024 ** 3, mem_used: 6.72 * 1024 ** 3, cpu: 52, uptime: 134 * 86400 }),
-  node(5, { id: "taipei-homelab", name: "台北 HomeLab", region: "TW", group_name: "家庭网络", tags: "HomeLab,自建", price: -1, expires_at: null, mem_total: 24 * 1024 ** 3, mem_used: 10.08 * 1024 ** 3, cpu: 59, uptime: 122 * 86400 }),
-  node(6, { id: "london-archive", name: "伦敦 Archive", region: "GB", group_name: "存储服务", tags: "Archive,HDD", price: 18, currency: "EUR", billing_cycle: 365, expires_at: now + 110 * 86400, disk_total: 4 * 1024 ** 4, disk_used: 2.7 * 1024 ** 4, cpu: 66, latency: [] }),
-  node(7, { id: "toronto-standby", name: "多伦多 Standby", region: "CA", group_name: "备用节点", tags: "Standby", price: 16, currency: "CAD", expires_at: now + 18 * 86400, timestamp: now - 640, cpu: 0, net_in: 0, net_out: 0, message: "节点维护中" }),
+  node({ id: "hongkong-edge", name: "香港 Edge 01", region: "HK", group_name: "边缘网络", tags: "主力,线路:BGP,用途:网站", price: 128, expires_at: now + 46 * 86400, traffic_limit: 2 * 1024 ** 4 }),
+  node({ id: "tokyo-core", name: "东京 Core", region: "JP", group_name: "核心服务", tags: "主力,线路:Premium", price: 9.9, currency: "USD", expires_at: now + 46 * 86400, mem_total: 16 * 1024 ** 3, mem_used: 6.72 * 1024 ** 3, disk_total: 224 * 1024 ** 3, disk_used: 69.44 * 1024 ** 3, traffic_limit: 2 * 1024 ** 4, net_rx_total: 810 * 1024 ** 3, net_tx_total: 310 * 1024 ** 3, cpu: 31 }),
+  node({ id: "singapore-data", name: "新加坡 Data", region: "SG", group_name: "数据服务", tags: "数据库,NVMe", price: 88, expires_at: now + 46 * 86400, mem_total: 24 * 1024 ** 3, mem_used: 10.08 * 1024 ** 3, disk_total: 288 * 1024 ** 3, disk_used: 89.28 * 1024 ** 3, traffic_limit: 2 * 1024 ** 4, net_rx_total: 980 * 1024 ** 3, net_tx_total: 400 * 1024 ** 3, cpu: 38 }),
+  node({ id: "los-angeles-west", name: "洛杉矶 West", region: "US", group_name: "边缘网络", tags: "备用,线路:CN2", price: 24, currency: "USD", expires_at: now + 46 * 86400, disk_total: 352 * 1024 ** 3, disk_used: 109.12 * 1024 ** 3, traffic_limit: 2 * 1024 ** 4, net_rx_total: 1.12 * 1024 ** 4, net_tx_total: 490 * 1024 ** 3, cpu: 45 }),
+  node({ id: "frankfurt-lab", name: "法兰克福 Lab", region: "DE", group_name: "实验服务", tags: "Lab,IPv6", price: -1, expires_at: null, mem_total: 16 * 1024 ** 3, mem_used: 6.72 * 1024 ** 3, cpu: 52, uptime: 134 * 86400 }),
+  node({ id: "taipei-homelab", name: "台北 HomeLab", region: "TW", group_name: "家庭网络", tags: "HomeLab,自建", price: -1, expires_at: null, mem_total: 24 * 1024 ** 3, mem_used: 10.08 * 1024 ** 3, cpu: 59, uptime: 122 * 86400 }),
+  node({ id: "london-archive", name: "伦敦 Archive", region: "GB", group_name: "存储服务", tags: "Archive,HDD", price: 18, currency: "EUR", billing_cycle: 365, expires_at: now + 110 * 86400, disk_total: 4 * 1024 ** 4, disk_used: 2.7 * 1024 ** 4, cpu: 66, latency: [] }),
+  node({ id: "toronto-standby", name: "多伦多 Standby", region: "CA", group_name: "备用节点", tags: "Standby", price: 16, currency: "CAD", expires_at: now + 18 * 86400, timestamp: now - 640, cpu: 0, net_in: 0, net_out: 0, message: "节点维护中" }),
 ];
 
 export function demoHistory(serverId: string, hours: number): HistoryPoint[] {

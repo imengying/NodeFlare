@@ -12,16 +12,19 @@ on:
         default: v0.0.1
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   metadata:
     name: Validate tag
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - id: version
         name: Validate three-part tag
         shell: bash
@@ -40,6 +43,11 @@ jobs:
     name: Agent (${{ matrix.platform }})
     needs: metadata
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     env:
       CARGO_TARGET_DIR: target/agent
       NODEFLARE_AGENT_VERSION: ${{ needs.metadata.outputs.version }}
@@ -72,8 +80,10 @@ jobs:
             extension: ""
             cross: false
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
       - name: Install Linux cross compiler
@@ -90,7 +100,10 @@ jobs:
         run: |
           mkdir -p release
           cp "target/agent/${{ matrix.target }}/release/nodeflare-agent${{ matrix.extension }}" "release/${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release/${{ matrix.asset }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.asset }}
           path: release/${{ matrix.asset }}
@@ -100,9 +113,16 @@ jobs:
     name: Frontend
     needs: metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: oven-sh/setup-bun@v2.2.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.14
       - name: Install dependencies
@@ -111,7 +131,10 @@ jobs:
         run: bun run --cwd frontend build:public
       - name: Package frontend
         run: tar -czf "nodeflare-frontend-${{ needs.metadata.outputs.version }}.tar.gz" -C frontend/dist .
-      - uses: actions/upload-artifact@v6
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: nodeflare-frontend-${{ needs.metadata.outputs.version }}.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: frontend
           path: nodeflare-frontend-${{ needs.metadata.outputs.version }}.tar.gz
@@ -122,10 +145,15 @@ jobs:
     if: github.event_name == 'push'
     needs: [metadata, agent, frontend]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Build changelog from commits
         shell: bash
         run: |
@@ -141,7 +169,7 @@ jobs:
             git log -1 --pretty=format:'- %s' "$GITHUB_SHA" > CHANGELOG.md
           fi
           printf '\n' >> CHANGELOG.md
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: release-assets
           merge-multiple: true
@@ -154,7 +182,7 @@ jobs:
           cp agent/install.ps1 release-package/install-agent.ps1
           cp agent/install-macos.sh release-package/install-agent-macos.sh
           (cd release-package && sha256sum * > SHA256SUMS)
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
         with:
           body_path: CHANGELOG.md
           files: release-package/**

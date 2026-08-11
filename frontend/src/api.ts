@@ -1,4 +1,4 @@
-import type { AlertRule, AlertRuleInput, CloudflareUsage, Config, DatabaseStats, ExchangeRates, HistoryPoint, LatencySample, LatencyTask, LatencyTaskInput, LatencyTestPoint, Server, ServerInput, Settings, ThemeSettingsSchema } from "./types";
+import type { AdminServer, AlertRule, AlertRuleInput, CloudflareUsage, Config, DatabaseStats, ExchangeRates, HistoryPoint, LatencySample, LatencyTask, LatencyTaskInput, LatencyTestPoint, Server, ServerInput, Settings, Theme, ThemeSettingsSchema } from "./types";
 
 const TOKEN_KEY = "nodeflare-admin-token";
 const TURNSTILE_KEY = "nodeflare-turnstile-verified";
@@ -45,8 +45,8 @@ export const api = {
   config: () => request<Config>("/api/config"),
   exchangeRates: () => request<ExchangeRates>("/api/exchange-rates"),
   refreshExchangeRates: () => request<ExchangeRates>("/api/admin/exchange-rates/refresh", { method: "POST" }, true),
-  servers: (admin = false) =>
-    request<{ servers: Server[] }>(admin ? "/api/admin/servers" : "/api/servers", {}, admin),
+  servers: () => request<{ servers: Server[] }>("/api/servers"),
+  adminServers: () => request<{ servers: AdminServer[] }>("/api/admin/servers", {}, true),
   server: (id: string) => request<Server>(`/api/servers/${encodeURIComponent(id)}`),
   history: (id: string, hours: number) =>
     request<{ points: HistoryPoint[] }>(`/api/history/${encodeURIComponent(id)}?hours=${hours}`),
@@ -54,10 +54,10 @@ export const api = {
     request<{ tasks: LatencyTestPoint[]; points: LatencySample[] }>(`/api/latency/${encodeURIComponent(id)}?hours=${hours}`),
   verifyTurnstile: (token: string) =>
     request<{ verification: string }>("/api/turnstile/verify", { method: "POST", body: JSON.stringify({ token }) }),
-  login: (username: string, password: string, turnstileToken: string) =>
+  login: (username: string, password: string, passwordDerived: string, turnstileToken: string) =>
     request<{ token: string }>("/api/admin/login", {
       method: "POST",
-      body: JSON.stringify({ username, password, turnstile_token: turnstileToken }),
+      body: JSON.stringify({ username, password, password_derived: passwordDerived, turnstile_token: turnstileToken }),
     }),
   settings: () => request<Settings>("/api/admin/settings", {}, true),
   latencyTasks: () => request<{ tasks: LatencyTask[] }>("/api/admin/latency-tasks", {}, true),
@@ -75,6 +75,15 @@ export const api = {
   deleteAlertRule: (id: string) =>
     request<{ success: boolean }>(`/api/admin/alert-rules/${encodeURIComponent(id)}`, { method: "DELETE" }, true),
   themeSettings: () => request<ThemeSettingsSchema>("/api/admin/theme-settings", {}, true),
+  themes: () => request<{ themes: Theme[] }>("/api/admin/themes", {}, true),
+  addTheme: (input: Pick<Theme, "name" | "description" | "url">) =>
+    request<{ id: string }>("/api/admin/themes", { method: "POST", body: JSON.stringify(input) }, true),
+  activateTheme: (id: string) =>
+    request<{ success: boolean }>(`/api/admin/themes/${encodeURIComponent(id)}/activate`, { method: "POST" }, true),
+  previewTheme: (id: string) =>
+    request<{ preview_url: string }>(`/api/admin/themes/${encodeURIComponent(id)}/preview`, { method: "POST" }, true),
+  deleteTheme: (id: string) =>
+    request<{ success: boolean }>(`/api/admin/themes/${encodeURIComponent(id)}`, { method: "DELETE" }, true),
   saveSettings: (input: Partial<Settings>) =>
     request<{ settings: Settings; token: string | null }>("/api/admin/settings", { method: "PATCH", body: JSON.stringify(input) }, true),
   createServer: (input: ServerInput) =>

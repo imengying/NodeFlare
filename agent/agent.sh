@@ -38,7 +38,11 @@ install_agent() {
   collect_interval=$(arg --collect-interval "$@" || printf '5')
   worker_url=${worker_url%/}
   safe_value "$server_id" && safe_value "$token" && safe_value "$worker_url" || { echo "Invalid install argument" >&2; exit 1; }
-  case "$worker_url" in http://?*|https://?*) ;; *) echo "Worker URL must use HTTP or HTTPS" >&2; exit 1 ;; esac
+  case "$worker_url" in
+    https://?*|http://localhost|http://localhost/*|http://localhost:*|http://127.0.0.1|http://127.0.0.1/*|http://127.0.0.1:*) ;;
+    *) echo "Worker URL must use HTTPS; HTTP is only allowed for loopback development" >&2; exit 1 ;;
+  esac
+  case "$worker_url" in *@*) echo "Worker URL must not contain user information" >&2; exit 1 ;; esac
   case "$interval" in ''|*[!0-9]*) echo "Invalid interval" >&2; exit 1 ;; esac
   [ "$interval" -ge 15 ] && [ "$interval" -le 3600 ] || { echo "Interval must be between 15 and 3600 seconds" >&2; exit 1; }
   case "$collect_interval" in ''|*[!0-9]*) echo "Invalid collect interval" >&2; exit 1 ;; esac

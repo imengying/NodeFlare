@@ -5,7 +5,7 @@ use worker::{wasm_bindgen::JsValue, D1Database, Fetch, Method, Request, RequestI
 
 use crate::db::{self, SettingsView};
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize, PartialEq, Eq)]
 struct AlertState {
     offline: HashSet<String>,
     expiry: HashSet<String>,
@@ -63,7 +63,7 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
 
     let servers = db::list_servers(db_conn, true).await?;
     let stored = db::get_setting(db_conn, "alert_state").await?;
-    let mut previous: AlertState = stored
+    let previous: AlertState = stored
         .as_deref()
         .and_then(|value| serde_json::from_str(value).ok())
         .unwrap_or_default();
@@ -72,7 +72,7 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
     let offline_after = settings.offline_alert_minutes.clamp(2, 1440) * 60;
     let mut messages = Vec::new();
 
-    for server in servers {
+    for server in &servers {
         let server_id = server.id.clone();
         let is_offline = server
             .timestamp
@@ -119,9 +119,25 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
 
     let previous_resources = db::active_alert_states(db_conn).await?;
     let mut current_resources = HashSet::new();
+    let mut evaluated_resources = HashSet::new();
+    let mut eligible_resources = HashSet::new();
     for rule in db::list_alert_rules(db_conn).await? {
         if rule.enabled == 0 {
             continue;
+        }
+        if rule.server_ids.is_empty() {
+            eligible_resources.extend(
+                servers
+                    .iter()
+                    .filter(|server| server.hidden == 0)
+                    .map(|server| format!("{}:{}", rule.id, server.id)),
+            );
+        } else {
+            eligible_resources.extend(
+                rule.server_ids
+                    .iter()
+                    .map(|server_id| format!("{}:{server_id}", rule.id)),
+            );
         }
         let metric_label = match rule.metric.as_str() {
             "cpu" => "CPU",
@@ -138,6 +154,7 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
         };
         for value in db::alert_metric_values(db_conn, &rule, current_time).await? {
             let key = format!("{}:{}", rule.id, value.server_id);
+            evaluated_resources.insert(key.clone());
             if value.value >= rule.threshold {
                 current_resources.insert(key.clone());
                 if !previous_resources.contains(&key) {
@@ -163,12 +180,18 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
             }
         }
     }
+    for key in &previous_resources {
+        if eligible_resources.contains(key) && !evaluated_resources.contains(key) {
+            current_resources.insert(key.clone());
+        }
+    }
 
     if !messages.is_empty() {
         let body = format!("NodeFlare 告警\n\n{}", messages.join("\n"));
         send(settings, &body).await?;
     }
-    previous = current;
-    db::save_setting(db_conn, "alert_state", &serde_json::to_string(&previous)?).await?;
-    db::replace_active_alert_states(db_conn, &current_resources).await
+    if previous != current {
+        db::save_setting(db_conn, "alert_state", &serde_json::to_string(&current)?).await?;
+    }
+    db::sync_active_alert_states(db_conn, &previous_resources, &current_resources).await
 }

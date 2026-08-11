@@ -13,9 +13,6 @@ struct TaskRow {
     target: String,
     interval_seconds: i64,
     default_enabled: i64,
-    sort_order: i64,
-    created_at: i64,
-    updated_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,10 +29,7 @@ pub struct LatencyTaskView {
     pub target: String,
     pub interval_seconds: i64,
     pub default_enabled: bool,
-    pub sort_order: i64,
     pub server_ids: Vec<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -61,8 +55,8 @@ fn number(value: impl ToString) -> JsValue {
 pub async fn list_tasks(db: &D1Database) -> Result<Vec<LatencyTaskView>> {
     let rows: Vec<TaskRow> = db
         .prepare(
-            "SELECT id, name, task_type, target, interval_seconds, default_enabled, \
-             sort_order, created_at, updated_at FROM latency_tasks \
+            "SELECT id, name, task_type, target, interval_seconds, default_enabled \
+             FROM latency_tasks \
              ORDER BY sort_order ASC, created_at ASC",
         )
         .all()
@@ -93,9 +87,6 @@ pub async fn list_tasks(db: &D1Database) -> Result<Vec<LatencyTaskView>> {
             target: row.target,
             interval_seconds: row.interval_seconds,
             default_enabled: row.default_enabled != 0,
-            sort_order: row.sort_order,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
         })
         .collect())
 }
@@ -153,8 +144,8 @@ pub async fn update_task(
 ) -> Result<bool> {
     let exists: Option<TaskRow> = db
         .prepare(
-            "SELECT id, name, task_type, target, interval_seconds, default_enabled, \
-             sort_order, created_at, updated_at FROM latency_tasks WHERE id = ?1",
+            "SELECT id, name, task_type, target, interval_seconds, default_enabled \
+             FROM latency_tasks WHERE id = ?1",
         )
         .bind(&[text(id)])?
         .first(None)

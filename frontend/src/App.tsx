@@ -152,7 +152,9 @@ export default function App() {
       if (proof) endpoint.searchParams.set("turnstile_verified", proof);
       const socket = new WebSocket(endpoint);
       wsRef.current.push(socket);
+      socket.onopen = () => void load(true);
       socket.onclose = () => {
+        wsRef.current = wsRef.current.filter((current) => current !== socket);
         if (!cancelled) reconnects.push(window.setTimeout(connect, 3000));
       };
       socket.onmessage = (event) => {
@@ -175,7 +177,7 @@ export default function App() {
       wsRef.current.forEach((socket) => socket.close());
       wsRef.current = [];
     };
-  }, [config.websocket, config.public_dashboard, config.turnstile_enabled, loading, needsVerification, selectedId]);
+  }, [config.websocket, config.public_dashboard, config.turnstile_enabled, load, loading, needsVerification, selectedId]);
 
   const groups = useMemo(() => ["__all__", ...Array.from(new Set(servers.map((server) => server.group_name || "默认")))], [servers]);
   const visible = useMemo(() => servers.filter((server) => {

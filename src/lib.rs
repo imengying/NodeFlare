@@ -10,27 +10,89 @@ mod theme;
 mod turnstile;
 
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 
-use serde::Serialize;
+use futures_util::TryStreamExt;
+use serde::{de::DeserializeOwned, Serialize};
 use worker::*;
 
 use crate::auth::{
-    bearer_token, create_admin_jwt, create_turnstile_proof, hash_password, is_admin, sha256_hex,
-    verify_credentials, verify_turnstile_proof,
+    bearer_token, create_admin_jwt, create_theme_preview_proof, create_turnstile_proof,
+    hash_password, is_admin, random_salt, sha256_hex, verify_credentials,
+    verify_theme_preview_proof, verify_turnstile_proof,
 };
 use crate::models::{
     AgentReport, AgentReportBatch, AlertRuleInput, ApiError, LatencyTaskInput, LoginRequest,
-    ServerBatchInput, ServerInput, ServerOrderInput, ServerView, SettingsInput,
-    TurnstileVerifyRequest,
+    ServerBatchInput, ServerInput, ServerOrderInput, ServerView, SettingsInput, ThemeInput,
+    ThemeView, TurnstileVerifyRequest,
 };
 
 const ADMIN_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.html"));
 const ADMIN_SCRIPT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.js"));
 const ADMIN_STYLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.css"));
+const HISTORY_CACHE_SECONDS: i64 = 30;
+const API_JSON_MAX_BYTES: usize = 1024 * 1024;
+const AGENT_JSON_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Serialize)]
 struct Success {
     success: bool,
+}
+
+#[derive(Serialize)]
+struct PublicServer {
+    id: String,
+    name: String,
+    region: String,
+    group_name: String,
+    tags: String,
+    expires_at: Option<i64>,
+    traffic_limit: i64,
+    traffic_limit_type: String,
+    price: f64,
+    billing_cycle: i64,
+    currency: String,
+    auto_renewal: i64,
+    public_remark: String,
+    reset_day: i64,
+    timestamp: Option<i64>,
+    cpu: Option<f64>,
+    load1: Option<f64>,
+    load5: Option<f64>,
+    load15: Option<f64>,
+    mem_used: Option<i64>,
+    mem_total: Option<i64>,
+    swap_used: Option<i64>,
+    swap_total: Option<i64>,
+    disk_used: Option<i64>,
+    disk_total: Option<i64>,
+    net_in: Option<f64>,
+    net_out: Option<f64>,
+    net_rx_total: Option<i64>,
+    net_tx_total: Option<i64>,
+    uptime: Option<i64>,
+    processes: Option<i64>,
+    tcp_connections: Option<i64>,
+    udp_connections: Option<i64>,
+    cpu_cores: Option<i64>,
+    cpu_model: Option<String>,
+    os: Option<String>,
+    kernel: Option<String>,
+    arch: Option<String>,
+    virtualization: Option<String>,
+    gpu_usage: Option<f64>,
+    gpu_model: Option<String>,
+    agent_version: Option<String>,
+    disk_read_bps: Option<f64>,
+    disk_write_bps: Option<f64>,
+    disk_read_iops: Option<f64>,
+    disk_write_iops: Option<f64>,
+    disk_await_ms: Option<f64>,
+    disk_utilization: Option<f64>,
+    message: Option<String>,
+    disks: serde_json::Value,
+    gpus: serde_json::Value,
+    latency: Vec<latency::LatencySample>,
 }
 
 fn now() -> i64 {
@@ -71,8 +133,42 @@ fn json<T: Serialize>(value: &T, status: u16) -> Result<Response> {
     Ok(response)
 }
 
+async fn request_json<T: DeserializeOwned>(req: &mut Request, limit: usize) -> Result<T> {
+    if req
+        .headers()
+        .get("Content-Length")?
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length == 0 || length > limit)
+    {
+        return Err(Error::RustError(
+            "JSON request body size is invalid".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut stream = req.stream()?;
+    while let Some(mut chunk) = stream.try_next().await? {
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > limit)
+        {
+            return Err(Error::RustError(
+                "JSON request body is too large".to_string(),
+            ));
+        }
+        bytes.append(&mut chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|error| Error::RustError(error.to_string()))
+}
+
 fn error(message: &str, status: u16) -> Result<Response> {
     json(&ApiError { error: message }, status)
+}
+
+fn rate_limited() -> Result<Response> {
+    let mut response = error("请求过于频繁，请稍后重试", 429)?;
+    response.headers_mut().set("Retry-After", "60")?;
+    Ok(response)
 }
 
 fn mutable_response(response: Response) -> Result<Response> {
@@ -106,10 +202,157 @@ fn embedded_admin_response(body: &[u8], content_type: &str) -> Result<Response> 
     Ok(response)
 }
 
+fn secure_public_response(mut response: Response) -> Result<Response> {
+    let headers = response.headers_mut();
+    headers.set("X-Content-Type-Options", "nosniff")?;
+    headers.set("X-Frame-Options", "DENY")?;
+    headers.set("Referrer-Policy", "strict-origin-when-cross-origin")?;
+    headers.set(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=()",
+    )?;
+    headers.set(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:; frame-src https://challenges.cloudflare.com; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+    )?;
+    Ok(response)
+}
+
+fn remote_theme_content_type(path: &str) -> Option<&'static str> {
+    let path = path.split('?').next().unwrap_or(path);
+    if path == "index.html" {
+        return Some("text/html; charset=utf-8");
+    }
+    match path.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("js" | "mjs") => Some("application/javascript; charset=utf-8"),
+        Some("css") => Some("text/css; charset=utf-8"),
+        Some("json" | "map") => Some("application/json; charset=utf-8"),
+        Some("svg") => Some("image/svg+xml"),
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("webp") => Some("image/webp"),
+        Some("ico") => Some("image/x-icon"),
+        Some("woff") => Some("font/woff"),
+        Some("woff2") => Some("font/woff2"),
+        Some("ttf") => Some("font/ttf"),
+        Some("wasm") => Some("application/wasm"),
+        _ => None,
+    }
+}
+
+fn remote_theme_failure(message: &str) -> Result<Response> {
+    let mut response = Response::error(message, 502)?;
+    response.headers_mut().set("Cache-Control", "no-store")?;
+    secure_public_response(response)
+}
+
+async fn remote_theme_response(path: &str, base: &str) -> Result<Option<Response>> {
+    let (remote_url, relative) =
+        if path == "/" || path == "/index.html" || path.starts_with("/instance/") {
+            let Some(index) = theme::index_url(base) else {
+                return Ok(Some(remote_theme_failure("远程主题来源不受支持")?));
+            };
+            (index, "index.html".to_string())
+        } else if let Some(url) = theme::asset_url(base, path) {
+            (url, path.trim_start_matches('/').to_string())
+        } else {
+            return Ok(Some(remote_theme_failure("远程主题资源路径不受支持")?));
+        };
+    let is_index = relative == "index.html";
+    let cache = Cache::default();
+    if let Ok(Some(response)) = cache.get(remote_url.as_str(), false).await {
+        return Ok(Some(secure_public_response(mutable_response(response)?)?));
+    }
+    let request = Request::new(&remote_url, Method::Get)?;
+    let mut response = match Fetch::Request(request).send().await {
+        Ok(response) if (200..300).contains(&response.status_code()) => response,
+        Ok(response) => {
+            console_warn!(
+                "remote theme returned HTTP {} for {}",
+                response.status_code(),
+                remote_url
+            );
+            return if is_index {
+                Ok(None)
+            } else {
+                Ok(Some(remote_theme_failure("远程主题资源暂时不可用")?))
+            };
+        }
+        Err(error) => {
+            console_warn!("remote theme request failed for {remote_url}: {error}");
+            return if is_index {
+                Ok(None)
+            } else {
+                Ok(Some(remote_theme_failure("远程主题资源加载失败")?))
+            };
+        }
+    };
+    let limit = if is_index {
+        theme::INDEX_MAX_BYTES
+    } else {
+        theme::ASSET_MAX_BYTES
+    };
+    let Some(body) = theme::read_response_limited(&mut response, limit).await? else {
+        return if is_index {
+            Ok(None)
+        } else {
+            Ok(Some(remote_theme_failure("远程主题资源大小无效")?))
+        };
+    };
+    let mut response = Response::from_bytes(body)?;
+    let headers = response.headers_mut();
+    headers.set("Cache-Control", "public, max-age=300")?;
+    if let Some(content_type) = remote_theme_content_type(&relative) {
+        headers.set("Content-Type", content_type)?;
+    }
+    let mut response = secure_public_response(response)?;
+    if let Ok(cached) = response.cloned() {
+        let _ = cache.put(remote_url.as_str(), cached).await;
+    }
+    Ok(Some(response))
+}
+
+async fn remote_theme_preview_response(
+    relative: &str,
+    base: &str,
+    preview_prefix: &str,
+) -> Result<Response> {
+    if relative.starts_with("assets/") {
+        let path = format!("/{relative}");
+        return Ok(remote_theme_response(&path, base)
+            .await?
+            .unwrap_or(remote_theme_failure("主题预览资源不存在")?));
+    }
+    if !relative.is_empty() && relative != "index.html" && !relative.starts_with("instance/") {
+        return Response::error("Theme preview path not found", 404);
+    }
+    let Some(index) = theme::index_url(base) else {
+        return remote_theme_failure("远程主题来源不受支持");
+    };
+    let request = Request::new(&index, Method::Get)?;
+    let mut response = Fetch::Request(request).send().await?;
+    if !(200..300).contains(&response.status_code()) {
+        return remote_theme_failure("主题预览页面暂时不可用");
+    }
+    let Some(body) = theme::read_response_limited(&mut response, theme::INDEX_MAX_BYTES).await?
+    else {
+        return remote_theme_failure("主题预览页面大小无效");
+    };
+    let html = String::from_utf8(body)
+        .map_err(|_| Error::RustError("主题 index.html 不是 UTF-8 文本".to_string()))?;
+    let asset_prefix = format!("{preview_prefix}/assets/");
+    let html = html
+        .replace("\"/assets/", &format!("\"{asset_prefix}"))
+        .replace("'/assets/", &format!("'{asset_prefix}"));
+    let mut response = Response::from_html(html)?;
+    response.headers_mut().set("Cache-Control", "no-store")?;
+    secure_public_response(response)
+}
+
 fn valid_ping_target(value: &str) -> bool {
     let raw = value.trim();
     if raw.is_empty() {
-        return true;
+        return false;
     }
     if raw.len() > 60
         || raw.contains("://")
@@ -143,23 +386,50 @@ fn valid_ping_target(value: &str) -> bool {
             .iter()
             .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()));
     if ipv4_like {
-        return labels.iter().all(|label| label.parse::<u8>().is_ok());
+        return host.parse::<Ipv4Addr>().is_ok_and(public_probe_ipv4);
+    }
+    let lower = host.to_ascii_lowercase();
+    if labels.len() < 2
+        || ["local", "localhost", "internal", "lan", "localdomain"]
+            .iter()
+            .any(|suffix| lower == *suffix || lower.ends_with(&format!(".{suffix}")))
+        || lower == "home.arpa"
+        || lower.ends_with(".home.arpa")
+    {
+        return false;
     }
     labels.iter().all(|label| {
         !label.is_empty()
             && label.len() <= 63
-            && label.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
-            })
+            && label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
             && label
                 .chars()
                 .next()
-                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+                .is_some_and(|character| character.is_ascii_alphanumeric())
             && label
                 .chars()
                 .last()
-                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+                .is_some_and(|character| character.is_ascii_alphanumeric())
     })
+}
+
+fn public_probe_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
 }
 
 fn valid_cloudflare_account_id(value: &str) -> bool {
@@ -171,6 +441,20 @@ fn valid_cloudflare_account_id(value: &str) -> bool {
 fn valid_cloudflare_api_token(value: &str) -> bool {
     let value = value.trim();
     value.chars().count() <= 512 && !value.chars().any(char::is_whitespace)
+}
+
+fn valid_password_derived(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn submitted_secret<'a>(submitted: Option<&'a str>, stored: &'a str) -> &'a str {
+    match submitted.map(str::trim) {
+        Some(db::SECRET_MASK) | None => stored.trim(),
+        Some(value) => value,
+    }
 }
 
 fn same_origin(origin: &str, request_url: &Url) -> bool {
@@ -187,7 +471,7 @@ fn validate_latency_task(input: &LatencyTaskInput) -> Option<&'static str> {
     }
     let target = input.target.trim();
     if target.is_empty() || !valid_ping_target(target) {
-        return Some("目标应为域名、IPv4 或 TCP host:port");
+        return Some("目标应为公网域名、公网 IPv4 或 TCP host:port");
     }
     if input.task_type == "icmp" && target.contains(':') {
         return Some("ICMP 目标不能包含端口");
@@ -242,6 +526,19 @@ fn validate_alert_rule(input: &AlertRuleInput) -> Option<&'static str> {
         || input.server_ids.iter().collect::<HashSet<_>>().len() != input.server_ids.len()
     {
         return Some("告警服务器列表无效");
+    }
+    None
+}
+
+fn validate_theme(input: &ThemeInput) -> Option<&'static str> {
+    if !(1..=80).contains(&input.name.trim().chars().count()) {
+        return Some("主题名称长度应为 1 至 80 个字符");
+    }
+    if input.description.trim().chars().count() > 300 {
+        return Some("主题说明不能超过 300 个字符");
+    }
+    if theme::normalize_url(&input.url).is_none() {
+        return Some("主题 URL 必须是 GitHub tree 地址");
     }
     None
 }
@@ -401,15 +698,7 @@ fn validate_report(report: &AgentReport) -> Option<&'static str> {
     None
 }
 
-fn public_server(mut server: ServerView) -> ServerView {
-    server.note.clear();
-    server.network_interface.clear();
-    server.auto_update = 0;
-    server
-}
-
-fn server_json(server: ServerView, latency: Vec<latency::LatencySample>) -> serde_json::Value {
-    let mut value = serde_json::to_value(&server).unwrap_or_else(|_| serde_json::json!({}));
+fn public_server(server: ServerView, latency: Vec<latency::LatencySample>) -> PublicServer {
     let disks = server
         .disk_info
         .as_deref()
@@ -420,17 +709,60 @@ fn server_json(server: ServerView, latency: Vec<latency::LatencySample>) -> serd
         .as_deref()
         .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
         .unwrap_or_else(|| serde_json::json!([]));
-    if let Some(object) = value.as_object_mut() {
-        object.remove("disk_info");
-        object.remove("gpu_info");
-        object.insert("disks".to_string(), disks);
-        object.insert("gpus".to_string(), gpus);
-        object.insert(
-            "latency".to_string(),
-            serde_json::to_value(latency).unwrap_or_else(|_| serde_json::json!([])),
-        );
+    PublicServer {
+        id: server.id,
+        name: server.name,
+        region: server.region,
+        group_name: server.group_name,
+        tags: server.tags,
+        expires_at: server.expires_at,
+        traffic_limit: server.traffic_limit,
+        traffic_limit_type: server.traffic_limit_type,
+        price: server.price,
+        billing_cycle: server.billing_cycle,
+        currency: server.currency,
+        auto_renewal: server.auto_renewal,
+        public_remark: server.public_remark,
+        reset_day: server.reset_day,
+        timestamp: server.timestamp,
+        cpu: server.cpu,
+        load1: server.load1,
+        load5: server.load5,
+        load15: server.load15,
+        mem_used: server.mem_used,
+        mem_total: server.mem_total,
+        swap_used: server.swap_used,
+        swap_total: server.swap_total,
+        disk_used: server.disk_used,
+        disk_total: server.disk_total,
+        net_in: server.net_in,
+        net_out: server.net_out,
+        net_rx_total: server.net_rx_total,
+        net_tx_total: server.net_tx_total,
+        uptime: server.uptime,
+        processes: server.processes,
+        tcp_connections: server.tcp_connections,
+        udp_connections: server.udp_connections,
+        cpu_cores: server.cpu_cores,
+        cpu_model: server.cpu_model,
+        os: server.os,
+        kernel: server.kernel,
+        arch: server.arch,
+        virtualization: server.virtualization,
+        gpu_usage: server.gpu_usage,
+        gpu_model: server.gpu_model,
+        agent_version: server.agent_version,
+        disk_read_bps: server.disk_read_bps,
+        disk_write_bps: server.disk_write_bps,
+        disk_read_iops: server.disk_read_iops,
+        disk_write_iops: server.disk_write_iops,
+        disk_await_ms: server.disk_await_ms,
+        disk_utilization: server.disk_utilization,
+        message: server.message,
+        disks,
+        gpus,
+        latency,
     }
-    value
 }
 
 fn request_cookie(req: &Request, name: &str) -> Option<String> {
@@ -449,6 +781,116 @@ fn client_ip(req: &Request) -> Option<String> {
         .or_else(|| req.headers().get("X-Forwarded-For").ok().flatten())
         .map(|value| value.split(',').next().unwrap_or("").trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn rate_limit_binding(method: Method, path: &str) -> Option<&'static str> {
+    if method == Method::Post && matches!(path, "/api/admin/login" | "/api/turnstile/verify") {
+        Some("AUTH_RATE_LIMITER")
+    } else if method == Method::Post && path == "/api/agent/report" {
+        Some("AGENT_RATE_LIMITER")
+    } else if path.starts_with("/api/") {
+        Some("API_RATE_LIMITER")
+    } else {
+        None
+    }
+}
+
+fn rate_limit_key(req: &Request) -> String {
+    let identity = client_ip(req).unwrap_or_else(|| {
+        req.headers()
+            .get("User-Agent")
+            .ok()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "anonymous".to_string())
+    });
+    sha256_hex(&identity)
+}
+
+fn allow_on_rate_limit_failure(binding: &str) -> bool {
+    binding != "AUTH_RATE_LIMITER"
+}
+
+async fn request_within_rate_limit(env: &Env, binding: &str, key: String) -> bool {
+    let limiter = match env.rate_limiter(binding) {
+        Ok(value) => value,
+        Err(error) => {
+            console_warn!("rate limit binding {binding} unavailable: {error}");
+            return allow_on_rate_limit_failure(binding);
+        }
+    };
+    match limiter.limit(key).await {
+        Ok(outcome) => outcome.success,
+        Err(error) => {
+            console_warn!("rate limit check failed for {binding}: {error}");
+            allow_on_rate_limit_failure(binding)
+        }
+    }
+}
+
+fn requested_hours(req: &Request, maximum: i64) -> Result<i64> {
+    Ok(req
+        .url()?
+        .query_pairs()
+        .find(|(key, _)| key == "hours")
+        .and_then(|(_, value)| value.parse::<i64>().ok())
+        .unwrap_or(24)
+        .clamp(1, maximum))
+}
+
+fn history_cache_key(
+    request_url: &Url,
+    kind: &str,
+    server_id: &str,
+    hours: i64,
+    version: i64,
+) -> String {
+    let mut url = request_url.clone();
+    url.set_path(&format!("/__nodeflare-cache/{kind}/{server_id}"));
+    url.set_query(Some(&format!("hours={hours}&version={version}")));
+    url.set_fragment(None);
+    url.to_string()
+}
+
+async fn cached_history_response(key: &str) -> Option<Response> {
+    match Cache::default().get(key, false).await {
+        Ok(Some(response)) => {
+            let mut response = mutable_response(response).ok()?;
+            response
+                .headers_mut()
+                .set("Cache-Control", "no-store")
+                .ok()?;
+            response.headers_mut().set("X-Cache", "HIT").ok()?;
+            Some(response)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            console_warn!("history cache read failed: {error}");
+            None
+        }
+    }
+}
+
+async fn store_history_response(key: &str, response: &mut Response) {
+    if response.headers_mut().set("X-Cache", "MISS").is_err() {
+        return;
+    }
+    let Ok(mut cached) = response.cloned() else {
+        return;
+    };
+    if cached
+        .headers_mut()
+        .set(
+            "Cache-Control",
+            &format!("public, max-age={HISTORY_CACHE_SECONDS}"),
+        )
+        .is_err()
+    {
+        return;
+    }
+    if let Err(error) = Cache::default().put(key, cached).await {
+        console_warn!("history cache write failed: {error}");
+    }
 }
 
 fn request_turnstile_proof(req: &Request) -> Option<String> {
@@ -474,6 +916,115 @@ fn server_id(path: &str, prefix: &str) -> Option<String> {
     }
 }
 
+async fn handle_agent_report(
+    mut req: Request,
+    env: Env,
+    ctx: Context,
+    database: &D1Database,
+) -> Result<Response> {
+    let agent_config_hash = req
+        .headers()
+        .get("X-Agent-Config-Sha256")?
+        .unwrap_or_default();
+    let agent_config_schema = req
+        .headers()
+        .get("X-Agent-Config-Schema")?
+        .unwrap_or_default();
+    let token = match bearer_token(&req) {
+        Some(value) => value,
+        None => return error("缺少探针凭据", 401),
+    };
+    let batch: AgentReportBatch = match request_json(&mut req, AGENT_JSON_MAX_BYTES).await {
+        Ok(value) => value,
+        Err(_) => return error("指标格式无效", 400),
+    };
+    if batch.server_id.is_empty() || batch.server_id.len() > 80 {
+        return error("节点 ID 无效", 400);
+    }
+    if batch.samples.is_empty() || batch.samples.len() > 720 {
+        return error("每批应包含 1 至 720 个样本", 400);
+    }
+    let received_at = now();
+    for report in &batch.samples {
+        if report.timestamp <= 0 || (report.timestamp - received_at).abs() > 7200 {
+            return error("样本时间戳超出允许范围", 400);
+        }
+        if let Some(message) = validate_report(report) {
+            return error(message, 400);
+        }
+    }
+    let Some(row) = db::get_token_hash(database, &batch.server_id).await? else {
+        return error("节点不存在", 404);
+    };
+    if sha256_hex(&token) != row.token_hash {
+        return error("探针凭据无效", 401);
+    }
+    let latency_results = batch
+        .samples
+        .iter()
+        .flat_map(|report| report.latency_results.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !latency_results.is_empty() {
+        let assigned: HashSet<String> = latency::tasks_for_server(database, &batch.server_id)
+            .await?
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        if latency_results
+            .iter()
+            .any(|result| !assigned.contains(&result.task_id))
+        {
+            return error("延迟结果包含未分配给该节点的任务", 400);
+        }
+    }
+    db::save_reports(database, &batch.server_id, &batch.samples).await?;
+    latency::save_results(database, &batch.server_id, &latency_results, received_at).await?;
+
+    let public_dashboard = db::get_setting(database, "public_dashboard")
+        .await?
+        .is_none_or(|value| value == "true");
+    if row.hidden == 0 && public_dashboard {
+        let latest = batch
+            .samples
+            .iter()
+            .max_by_key(|report| report.timestamp)
+            .expect("batch is non-empty");
+        let metrics = serde_json::to_value(latest)?;
+        let payload = serde_json::to_string(&serde_json::json!({
+            "type": "metrics",
+            "server_id": batch.server_id,
+            "timestamp": latest.timestamp,
+            "metrics": metrics
+        }))?;
+        let server_id = batch.server_id.clone();
+        ctx.wait_until(async move {
+            let _ = live::broadcast(&env, &server_id, &payload).await;
+        });
+    }
+    let config = db::agent_config(database, &batch.server_id).await?;
+    let config_json = serde_json::to_string(&config)?;
+    let config_hash = sha256_hex(&format!("1:{config_json}"));
+    if agent_config_schema == "1" && agent_config_hash == config_hash {
+        let mut response = Response::empty()?.with_status(204);
+        response.headers_mut().set("X-Agent-Config-Schema", "1")?;
+        response
+            .headers_mut()
+            .set("X-Agent-Config-Sha256", &config_hash)?;
+        response.headers_mut().set("Cache-Control", "no-store")?;
+        return Ok(response);
+    }
+    let mut response = json(
+        &serde_json::json!({ "success": true, "config": config }),
+        202,
+    )?;
+    response.headers_mut().set("X-Agent-Config-Schema", "1")?;
+    response
+        .headers_mut()
+        .set("X-Agent-Config-Sha256", &config_hash)?;
+    Ok(response)
+}
+
 async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     let method = req.method();
     let path = req.path();
@@ -497,6 +1048,10 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     let database = env.d1("DB")?;
+
+    if method == Method::Post && path == "/api/agent/report" {
+        return handle_agent_report(req, env, ctx, &database).await;
+    }
 
     let default_name = env_text(&env, "SITE_NAME", "NodeFlare");
     let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180).clamp(30, 3600);
@@ -539,6 +1094,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "offline_threshold_seconds": settings.offline_threshold_seconds,
                 "history_retention_days": settings.history_retention_days,
                 "default_theme": settings.default_theme,
+                "active_theme_id": settings.active_theme_id,
                 "background_url": settings.background_url,
                 "theme_options": settings.theme_options,
                 "show_search": settings.show_search,
@@ -554,6 +1110,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "turnstile_enabled": public_turnstile_enabled,
                 "turnstile_login_enabled": login_protection_enabled || public_turnstile_enabled,
                 "turnstile_site_key": turnstile_site_key,
+                "password_client_salt": settings.password_client_salt,
                 "websocket": true
             }),
             200,
@@ -564,11 +1121,14 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if settings.admin_password_hash.is_empty() && env.secret("ADMIN_PASSWORD").is_err() {
             return error("尚未配置 ADMIN_PASSWORD", 503);
         }
-        let input: LoginRequest = match req.json().await {
+        let input: LoginRequest = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("请求格式无效", 400),
         };
-        if input.username.trim().is_empty() || input.password.is_empty() {
+        if input.username.trim().is_empty()
+            || input.password.is_empty()
+            || !valid_password_derived(&input.password_derived)
+        {
             return error("请输入用户名和密码", 400);
         }
         let login_turnstile_enabled = public_turnstile_enabled || login_protection_enabled;
@@ -590,12 +1150,15 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             &settings.admin_password_hash,
             &input.username,
             &input.password,
+            &input.password_derived,
         ) {
             return error("用户名或密码错误", 401);
         }
         let session_password_hash = if settings.admin_password_hash.is_empty() {
-            let namespace = env.durable_object("LIVE_HUB")?;
-            let password_hash = hash_password(&input.password, &namespace.unique_id()?.to_string());
+            let Some(salt) = random_salt() else {
+                return error("运行时随机源不可用，无法初始化管理员密码", 503);
+            };
+            let password_hash = hash_password(&input.password_derived, &salt);
             db::save_setting(&database, "admin_password_hash", &password_hash).await?;
             password_hash
         } else {
@@ -611,7 +1174,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if !public_turnstile_enabled {
             return error("全站人机验证未启用", 400);
         }
-        let input: TurnstileVerifyRequest = match req.json().await {
+        let input: TurnstileVerifyRequest = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("验证请求格式无效", 400),
         };
@@ -636,91 +1199,6 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             ),
         )?;
         return Ok(response);
-    }
-
-    if method == Method::Post && path == "/api/agent/report" {
-        let token = match bearer_token(&req) {
-            Some(value) => value,
-            None => return error("缺少探针凭据", 401),
-        };
-        let batch: AgentReportBatch = match req.json().await {
-            Ok(value) => value,
-            Err(_) => return error("指标格式无效", 400),
-        };
-        if batch.server_id.is_empty() || batch.server_id.len() > 80 {
-            return error("节点 ID 无效", 400);
-        }
-        if batch.samples.is_empty() || batch.samples.len() > 720 {
-            return error("每批应包含 1 至 720 个样本", 400);
-        }
-        let received_at = now();
-        for report in &batch.samples {
-            if report.timestamp <= 0 || (report.timestamp - received_at).abs() > 7200 {
-                return error("样本时间戳超出允许范围", 400);
-            }
-            if let Some(message) = validate_report(report) {
-                return error(message, 400);
-            }
-        }
-        let Some(row) = db::get_token_hash(&database, &batch.server_id).await? else {
-            return error("节点不存在", 404);
-        };
-        if sha256_hex(&token) != row.token_hash {
-            return error("探针凭据无效", 401);
-        }
-        let latency_results = batch
-            .samples
-            .iter()
-            .flat_map(|report| report.latency_results.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        if !latency_results.is_empty() {
-            let assigned: HashSet<String> = latency::tasks_for_server(&database, &batch.server_id)
-                .await?
-                .into_iter()
-                .map(|task| task.id)
-                .collect();
-            if latency_results
-                .iter()
-                .any(|result| !assigned.contains(&result.task_id))
-            {
-                return error("延迟结果包含未分配给该节点的任务", 400);
-            }
-        }
-        db::save_reports(&database, &batch.server_id, &batch.samples).await?;
-        latency::save_results(&database, &batch.server_id, &latency_results, received_at).await?;
-
-        let public_dashboard = db::settings(
-            &database,
-            &default_name,
-            default_threshold,
-            default_retention,
-            &default_username,
-        )
-        .await?
-        .public_dashboard;
-        if row.hidden == 0 && public_dashboard {
-            let latest = batch
-                .samples
-                .iter()
-                .max_by_key(|report| report.timestamp)
-                .expect("batch is non-empty");
-            let payload = serde_json::to_string(&serde_json::json!({
-                "type": "metrics",
-                "server_id": batch.server_id,
-                "timestamp": latest.timestamp,
-                "metrics": latest
-            }))?;
-            let server_id = batch.server_id.clone();
-            ctx.wait_until(async move {
-                let _ = live::broadcast(&env, &server_id, &payload).await;
-            });
-        }
-        let config = db::agent_config(&database, &batch.server_id).await?;
-        return json(
-            &serde_json::json!({ "success": true, "config": config }),
-            202,
-        );
     }
 
     let admin = is_admin(&req, &env, &settings.admin_password_hash);
@@ -772,10 +1250,9 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
         let servers: Vec<_> = raw_servers
             .into_iter()
-            .map(public_server)
             .map(|server| {
                 let samples = latency_by_server.remove(&server.id).unwrap_or_default();
-                server_json(server, samples)
+                public_server(server, samples)
             })
             .collect();
         return json(&serde_json::json!({ "servers": servers }), 200);
@@ -798,7 +1275,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                     .into_iter()
                     .filter(|sample| sample.server_id == id)
                     .collect();
-                json(&server_json(public_server(server), samples), 200)
+                json(&public_server(server, samples), 200)
             }
             None => error("节点不存在", 404),
         };
@@ -817,14 +1294,21 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if db::get_server(&database, &id, false).await?.is_none() {
             return error("节点不存在", 404);
         }
-        let hours = req
-            .url()?
-            .query_pairs()
-            .find(|(key, _)| key == "hours")
-            .and_then(|(_, value)| value.parse::<i64>().ok())
-            .unwrap_or(24);
+        let hours = requested_hours(&req, 24 * 30)?;
+        let cache_key = history_cache_key(
+            &req.url()?,
+            "metrics",
+            &id,
+            hours,
+            settings.history_cache_version,
+        );
+        if let Some(response) = cached_history_response(&cache_key).await {
+            return Ok(response);
+        }
         let points = db::history(&database, &id, hours).await?;
-        return json(&serde_json::json!({ "points": points }), 200);
+        let mut response = json(&serde_json::json!({ "points": points }), 200)?;
+        store_history_response(&cache_key, &mut response).await;
+        return Ok(response);
     }
 
     if method == Method::Get && path.starts_with("/api/latency/") {
@@ -840,18 +1324,25 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if db::get_server(&database, &id, false).await?.is_none() {
             return error("节点不存在", 404);
         }
-        let hours = req
-            .url()?
-            .query_pairs()
-            .find(|(key, _)| key == "hours")
-            .and_then(|(_, value)| value.parse::<i64>().ok())
-            .unwrap_or(24);
+        let hours = requested_hours(&req, 24 * 365)?;
+        let cache_key = history_cache_key(
+            &req.url()?,
+            "latency",
+            &id,
+            hours,
+            settings.history_cache_version,
+        );
+        if let Some(response) = cached_history_response(&cache_key).await {
+            return Ok(response);
+        }
         let tasks = latency::tasks_for_server(&database, &id).await?;
         let points = latency::history(&database, &id, hours).await?;
-        return json(
+        let mut response = json(
             &serde_json::json!({ "tasks": tasks, "points": points }),
             200,
-        );
+        )?;
+        store_history_response(&cache_key, &mut response).await;
+        return Ok(response);
     }
 
     if path.starts_with("/api/admin/") && !admin {
@@ -866,7 +1357,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     if method == Method::Post && path == "/api/admin/latency-tasks" {
-        let input: LatencyTaskInput = match req.json().await {
+        let input: LatencyTaskInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("延迟任务格式无效", 400),
         };
@@ -905,7 +1396,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 error("延迟任务不存在", 404)
             };
         }
-        let input: LatencyTaskInput = match req.json().await {
+        let input: LatencyTaskInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("延迟任务格式无效", 400),
         };
@@ -942,7 +1433,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if db::list_alert_rules(&database).await?.len() >= 20 {
             return error("最多可创建 20 条资源告警规则", 400);
         }
-        let input: AlertRuleInput = match req.json().await {
+        let input: AlertRuleInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("告警规则格式无效", 400),
         };
@@ -981,7 +1472,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 error("告警规则不存在", 404)
             };
         }
-        let input: AlertRuleInput = match req.json().await {
+        let input: AlertRuleInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("告警规则格式无效", 400),
         };
@@ -1013,7 +1504,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     if method == Method::Delete && path == "/api/admin/servers" {
-        let input: ServerBatchInput = match req.json().await {
+        let input: ServerBatchInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("批量删除格式无效", 400),
         };
@@ -1029,7 +1520,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     if method == Method::Patch && path == "/api/admin/servers/order" {
-        let input: ServerOrderInput = match req.json().await {
+        let input: ServerOrderInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("排序格式无效", 400),
         };
@@ -1051,7 +1542,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     if method == Method::Post && path == "/api/admin/servers" {
-        let input: ServerInput = match req.json().await {
+        let input: ServerInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("节点格式无效", 400),
         };
@@ -1099,7 +1590,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 error("节点不存在", 404)
             };
         }
-        let input: ServerInput = match req.json().await {
+        let input: ServerInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("节点格式无效", 400),
         };
@@ -1115,6 +1606,125 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
 
     if method == Method::Get && path == "/api/admin/settings" {
         return json(&settings, 200);
+    }
+
+    if method == Method::Get && path == "/api/admin/themes" {
+        let mut themes = vec![ThemeView {
+            id: theme::BUILTIN_THEME_ID.to_string(),
+            name: theme::BUILTIN_THEME_NAME.to_string(),
+            description: "NodeFlare 内置默认主题".to_string(),
+            url: String::new(),
+            builtin: true,
+            active: settings.active_theme_id == theme::BUILTIN_THEME_ID,
+        }];
+        themes.extend(db::list_themes(&database, &settings.active_theme_id).await?);
+        return json(&serde_json::json!({ "themes": themes }), 200);
+    }
+
+    if method == Method::Post && path == "/api/admin/themes" {
+        if db::list_themes(&database, &settings.active_theme_id)
+            .await?
+            .len()
+            >= 32
+        {
+            return error("最多可添加 32 个第三方主题", 400);
+        }
+        let input: ThemeInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
+            Ok(value) => value,
+            Err(_) => return error("主题格式无效", 400),
+        };
+        if let Some(message) = validate_theme(&input) {
+            return error(message, 400);
+        }
+        let resolved = match theme::resolve_url(&input.url) {
+            Ok(value) => value,
+            Err(err) => {
+                console_warn!("theme URL resolution failed: {err}");
+                return error("无法解析主题地址，请检查 URL", 422);
+            }
+        };
+        let digest = sha256_hex(&resolved.source_url);
+        let id = format!("theme-{}", &digest[..16]);
+        if db::theme_exists(&database, &id).await? {
+            return error("该主题 URL 已添加", 409);
+        }
+        if let Err(err) = theme::validate_remote(&resolved.resolved_url).await {
+            console_warn!(
+                "theme validation failed for {}: {err}",
+                resolved.resolved_url
+            );
+            return error("无法读取主题 index.html，请检查 URL 和主题构建产物", 422);
+        }
+        db::create_theme(&database, &id, &input, &resolved.source_url, now()).await?;
+        return json(&serde_json::json!({ "id": id }), 201);
+    }
+
+    if method == Method::Post
+        && path.starts_with("/api/admin/themes/")
+        && path.ends_with("/preview")
+    {
+        let id = path
+            .strip_prefix("/api/admin/themes/")
+            .and_then(|value| value.strip_suffix("/preview"))
+            .unwrap_or("")
+            .trim_matches('/');
+        if id.is_empty() || id.contains('/') || id.len() > 80 {
+            return error("主题 ID 无效", 400);
+        }
+        if id == theme::BUILTIN_THEME_ID || !db::theme_exists(&database, id).await? {
+            return error("远程主题不存在", 404);
+        }
+        let Some(proof) = create_theme_preview_proof(&env, &settings.admin_password_hash, id)
+        else {
+            return error("无法创建主题预览凭据", 503);
+        };
+        return json(
+            &serde_json::json!({
+                "preview_url": format!("/__theme-preview/{proof}/")
+            }),
+            200,
+        );
+    }
+
+    if method == Method::Post
+        && path.starts_with("/api/admin/themes/")
+        && path.ends_with("/activate")
+    {
+        let id = path
+            .strip_prefix("/api/admin/themes/")
+            .and_then(|value| value.strip_suffix("/activate"))
+            .unwrap_or("")
+            .trim_matches('/');
+        if id.is_empty() || id.contains('/') || id.len() > 80 {
+            return error("主题 ID 无效", 400);
+        }
+        if id != theme::BUILTIN_THEME_ID {
+            let Some(url) = db::theme_url(&database, id).await? else {
+                return error("主题不存在", 404);
+            };
+            if let Err(err) = theme::validate_remote(&url).await {
+                console_warn!("theme activation failed for {url}: {err}");
+                return error("主题当前不可访问，未切换主题", 422);
+            }
+        }
+        if !db::set_active_theme(&database, id).await? {
+            return error("主题不存在", 404);
+        }
+        return json(&Success { success: true }, 200);
+    }
+
+    if method == Method::Delete && path.starts_with("/api/admin/themes/") {
+        let Some(id) = server_id(&path, "/api/admin/themes/") else {
+            return error("主题 ID 无效", 400);
+        };
+        if id == theme::BUILTIN_THEME_ID {
+            return error("内置主题不能删除", 400);
+        }
+        return if db::delete_theme(&database, &id).await? {
+            json(&Success { success: true }, 200)
+        } else {
+            error("主题不存在", 404)
+        };
     }
 
     if method == Method::Get && path == "/api/admin/theme-settings" {
@@ -1167,6 +1777,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
 
     if method == Method::Delete && path == "/api/admin/history" {
         db::clear_history(&database).await?;
+        db::save_setting(&database, "history_cache_version", &now().to_string()).await?;
         return json(&Success { success: true }, 200);
     }
 
@@ -1183,7 +1794,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     if method == Method::Patch && path == "/api/admin/settings" {
-        let input: SettingsInput = match req.json().await {
+        let input: SettingsInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
             Err(_) => return error("设置格式无效", 400),
         };
@@ -1214,6 +1825,12 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             .is_some_and(|value| !matches!(value, "system" | "light" | "dark"))
         {
             return error("默认主题无效", 400);
+        }
+        if let Some(id) = input.active_theme_id.as_deref() {
+            let valid = id == theme::BUILTIN_THEME_ID || db::theme_exists(&database, id).await?;
+            if !valid {
+                return error("活动主题不存在", 400);
+            }
         }
         if input
             .background_url
@@ -1257,6 +1874,17 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         {
             return error("新密码长度应为 8 至 128 个字符", 400);
         }
+        if input
+            .new_password
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+            && input
+                .new_password_derived
+                .as_deref()
+                .is_none_or(|value| !valid_password_derived(value))
+        {
+            return error("新密码派生值无效", 400);
+        }
         let enabled = input
             .turnstile_enabled
             .unwrap_or(settings.turnstile_enabled);
@@ -1265,11 +1893,10 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             .as_deref()
             .unwrap_or(&settings.turnstile_site_key)
             .trim();
-        let configured_secret_key = input
-            .turnstile_secret_key
-            .as_deref()
-            .unwrap_or(&settings.turnstile_secret_key)
-            .trim();
+        let configured_secret_key = submitted_secret(
+            input.turnstile_secret_key.as_deref(),
+            &settings.turnstile_secret_key,
+        );
         let site_key = if configured_site_key.is_empty() {
             environment_turnstile_site_key.trim()
         } else {
@@ -1287,11 +1914,10 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             .notification_enabled
             .unwrap_or(settings.notification_enabled)
         {
-            let token = input
-                .notification_endpoint
-                .as_deref()
-                .unwrap_or(&settings.notification_endpoint)
-                .trim();
+            let token = submitted_secret(
+                input.notification_endpoint.as_deref(),
+                &settings.notification_endpoint,
+            );
             let chat_id = input
                 .notification_target
                 .as_deref()
@@ -1308,11 +1934,9 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         {
             return error("Cloudflare Account ID 应为 32 位十六进制字符", 400);
         }
-        if input
-            .cloudflare_api_token
-            .as_deref()
-            .is_some_and(|value| !valid_cloudflare_api_token(value))
-        {
+        if input.cloudflare_api_token.as_deref().is_some_and(|value| {
+            value.trim() != db::SECRET_MASK && !valid_cloudflare_api_token(value)
+        }) {
             return error("Cloudflare API Token 格式无效", 400);
         }
         if input
@@ -1330,13 +1954,16 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         }) {
             return error("站点图标必须使用 HTTPS 地址", 400);
         }
-        let password_hash = if let Some(password) = input
+        let password_hash = if input
             .new_password
-            .as_deref()
-            .filter(|value| !value.is_empty())
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
         {
-            let namespace = env.durable_object("LIVE_HUB")?;
-            Some(hash_password(password, &namespace.unique_id()?.to_string()))
+            let password_derived = input.new_password_derived.as_deref().unwrap_or_default();
+            let Some(salt) = random_salt() else {
+                return error("运行时随机源不可用，无法保存新密码", 503);
+            };
+            Some(hash_password(password_derived, &salt))
         } else {
             None
         };
@@ -1364,36 +1991,57 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         return error("接口不存在", 404);
     }
 
+    if method == Method::Get {
+        if let Some(preview_path) = path.strip_prefix("/__theme-preview/") {
+            let (proof, relative) = preview_path.split_once('/').unwrap_or((preview_path, ""));
+            let Some(theme_id) =
+                verify_theme_preview_proof(proof, &env, &settings.admin_password_hash)
+            else {
+                return secure_public_response(Response::error(
+                    "Theme preview link has expired",
+                    403,
+                )?);
+            };
+            let Some(url) = db::theme_url(&database, &theme_id).await? else {
+                return secure_public_response(Response::error("Theme not found", 404)?);
+            };
+            let prefix = format!("/__theme-preview/{proof}");
+            return remote_theme_preview_response(relative, &url, &prefix).await;
+        }
+    }
+
+    if settings.active_theme_id != theme::BUILTIN_THEME_ID {
+        if let Some(url) = db::theme_url(&database, &settings.active_theme_id).await? {
+            if let Some(response) = remote_theme_response(&path, &url).await? {
+                return Ok(response);
+            }
+        }
+    }
     let response = env.assets("ASSETS")?.fetch_request(req).await?;
-    let mut response = mutable_response(response)?;
-    let headers = response.headers_mut();
-    headers.set("X-Content-Type-Options", "nosniff")?;
-    headers.set("X-Frame-Options", "DENY")?;
-    headers.set("Referrer-Policy", "strict-origin-when-cross-origin")?;
-    headers.set(
-        "Permissions-Policy",
-        "camera=(), microphone=(), geolocation=()",
-    )?;
-    headers.set(
-        "Content-Security-Policy",
-        "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:; frame-src https://challenges.cloudflare.com; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
-    )?;
-    Ok(response)
+    secure_public_response(mutable_response(response)?)
 }
 
 #[event(fetch, respond_with_errors)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let method = req.method();
     let path = req.path();
     let request_url = req.url().ok();
     let origin = req.headers().get("Origin").ok().flatten();
 
-    if path == "/api/ws"
+    if path.starts_with("/api/")
         && origin
             .as_deref()
             .zip(request_url.as_ref())
             .is_some_and(|(origin, url)| !same_origin(origin, url))
     {
-        return error("WebSocket Origin 未获授权", 403);
+        return error("请求来源未获授权", 403);
+    }
+
+    if let Some(binding) = rate_limit_binding(method, &path) {
+        let key = rate_limit_key(&req);
+        if !request_within_rate_limit(&env, binding, key).await {
+            return rate_limited();
+        }
     }
 
     match handle(req, env, ctx).await {
@@ -1459,15 +2107,78 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 #[cfg(test)]
 mod tests {
     use super::{
-        valid_cloudflare_account_id, valid_cloudflare_api_token, valid_ping_target,
-        validate_latency_task, validate_server, ADMIN_HTML, ADMIN_SCRIPT, ADMIN_STYLE,
+        allow_on_rate_limit_failure, history_cache_key, rate_limit_binding, same_origin,
+        submitted_secret, valid_cloudflare_account_id, valid_cloudflare_api_token,
+        valid_password_derived, valid_ping_target, validate_latency_task, validate_server,
+        ADMIN_HTML, ADMIN_SCRIPT, ADMIN_STYLE,
     };
-    use crate::models::{LatencyTaskInput, ServerInput};
+    use crate::{
+        db::SECRET_MASK,
+        models::{AgentReport, LatencyTaskInput, ServerInput, SettingsInput},
+    };
+    use worker::{Method, Url};
 
     #[test]
-    fn defaults_new_servers_to_hidden_price_and_agent_updates() {
-        let mut server: ServerInput =
-            serde_json::from_value(serde_json::json!({ "name": "node" })).expect("server");
+    fn assigns_rate_limits_by_route() {
+        assert_eq!(
+            rate_limit_binding(Method::Post, "/api/admin/login"),
+            Some("AUTH_RATE_LIMITER")
+        );
+        assert_eq!(
+            rate_limit_binding(Method::Post, "/api/agent/report"),
+            Some("AGENT_RATE_LIMITER")
+        );
+        assert_eq!(
+            rate_limit_binding(Method::Get, "/api/history/node-a"),
+            Some("API_RATE_LIMITER")
+        );
+        assert_eq!(rate_limit_binding(Method::Get, "/"), None);
+        assert!(!allow_on_rate_limit_failure("AUTH_RATE_LIMITER"));
+        assert!(allow_on_rate_limit_failure("API_RATE_LIMITER"));
+    }
+
+    #[test]
+    fn builds_versioned_history_cache_keys() {
+        let request_url =
+            Url::parse("https://status.example/api/history/node-a?hours=1").expect("request URL");
+        assert_eq!(
+            history_cache_key(&request_url, "metrics", "node-a", 24, 7),
+            "https://status.example/__nodeflare-cache/metrics/node-a?hours=24&version=7"
+        );
+        assert!(same_origin("https://status.example", &request_url));
+        assert!(!same_origin("https://other.example", &request_url));
+    }
+
+    #[test]
+    fn requires_the_current_server_schema() {
+        assert!(
+            serde_json::from_value::<ServerInput>(serde_json::json!({ "name": "node" })).is_err()
+        );
+        let mut server: ServerInput = serde_json::from_value(serde_json::json!({
+            "name": "node",
+            "region": "",
+            "group_name": "默认",
+            "tags": "",
+            "note": "",
+            "hidden": false,
+            "expires_at": null,
+            "traffic_limit": 0,
+            "traffic_limit_type": "sum",
+            "price": 0,
+            "billing_cycle": 30,
+            "currency": "CNY",
+            "auto_renewal": false,
+            "public_remark": "",
+            "network_interface": "",
+            "reset_day": 1,
+            "report_interval": 60,
+            "collect_interval": 5,
+            "rx_correction": 0,
+            "tx_correction": 0,
+            "offline_notify_disabled": false,
+            "auto_update": true
+        }))
+        .expect("current server schema");
         assert_eq!(server.price, 0.0);
         assert!(server.auto_update);
         assert_eq!(validate_server(&server), None);
@@ -1479,24 +2190,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_incomplete_or_unknown_protocol_fields() {
+        assert!(serde_json::from_value::<AgentReport>(serde_json::json!({
+            "timestamp": 1,
+            "cpu": 1
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<SettingsInput>(serde_json::json!({
+            "unexpected": true
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn validates_latency_targets() {
         for target in [
-            "",
             "gd-ct-dualstack.ip.zstaticcdn.com",
-            "127.0.0.1",
+            "1.1.1.1",
             "example.com:443",
-            "router_1.local:80",
         ] {
             assert!(valid_ping_target(target), "expected valid target: {target}");
         }
 
         for target in [
+            "",
             "https://example.com",
             "example.com/path",
             "example.com:0",
             "example.com:65536",
             "example.com:abc",
             "999.1.1.1",
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "localhost",
+            "router.local",
+            "metadata.google.internal",
+            "Metadata.Google.INTERNAL",
+            "router_1.example.com",
             "[::1]:443",
             "bad host",
             "-example.com",
@@ -1542,6 +2279,20 @@ mod tests {
         assert!(valid_cloudflare_api_token(""));
         assert!(valid_cloudflare_api_token("token_abc-123"));
         assert!(!valid_cloudflare_api_token("token with spaces"));
+        assert_eq!(submitted_secret(Some(SECRET_MASK), "stored"), "stored");
+        assert_eq!(
+            submitted_secret(Some("replacement"), "stored"),
+            "replacement"
+        );
+        assert_eq!(submitted_secret(Some(""), "stored"), "");
+    }
+
+    #[test]
+    fn validates_client_password_derivations() {
+        assert!(valid_password_derived(&"a1".repeat(32)));
+        assert!(!valid_password_derived(&"A1".repeat(32)));
+        assert!(!valid_password_derived(&"a1".repeat(31)));
+        assert!(!valid_password_derived(&"zz".repeat(32)));
     }
 
     #[test]

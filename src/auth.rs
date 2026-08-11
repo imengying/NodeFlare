@@ -1,12 +1,18 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
+use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use worker::{Date, Env, Request};
+use worker::{
+    js_sys::{Function, Reflect, Uint8Array},
+    wasm_bindgen::{JsCast, JsValue},
+    Date, Env, Request,
+};
 
 const SESSION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const TURNSTILE_PROOF_SECONDS: i64 = 60 * 60;
-const PASSWORD_ROUNDS: usize = 10_000;
+const THEME_PREVIEW_SECONDS: i64 = 10 * 60;
+const SERVER_PASSWORD_ROUNDS: u32 = 10_000;
 const JWT_HEADER: &str = r#"{"alg":"HS256","typ":"JWT"}"#;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -47,24 +53,47 @@ pub fn admin_username(env: &Env, configured: &str) -> String {
         .unwrap_or_else(|_| "admin".to_string())
 }
 
-fn password_digest(password: &str, salt: &str) -> String {
-    let mut digest = Sha256::digest(format!("nodeflare:{salt}:{password}").as_bytes()).to_vec();
-    for _ in 1..PASSWORD_ROUNDS {
-        let mut hasher = Sha256::new();
-        hasher.update(&digest);
-        hasher.update(salt.as_bytes());
-        digest = hasher.finalize().to_vec();
-    }
+fn password_digest(password_derived: &str, salt: &str, rounds: u32) -> String {
+    let mut digest = [0_u8; 32];
+    pbkdf2_hmac::<Sha256>(
+        password_derived.as_bytes(),
+        salt.as_bytes(),
+        rounds,
+        &mut digest,
+    );
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub fn hash_password(password: &str, salt: &str) -> String {
-    format!("sha256${salt}${}", password_digest(password, salt))
+pub fn hash_password(password_derived: &str, salt: &str) -> String {
+    format!(
+        "pbkdf2_sha256_client_v1${SERVER_PASSWORD_ROUNDS}${salt}${}",
+        password_digest(password_derived, salt, SERVER_PASSWORD_ROUNDS)
+    )
 }
 
-fn verify_password_hash(password: &str, encoded: &str) -> bool {
+pub fn random_salt() -> Option<String> {
+    let global = worker::js_sys::global();
+    let crypto = Reflect::get(&global, &JsValue::from_str("crypto")).ok()?;
+    let get_random_values = Reflect::get(&crypto, &JsValue::from_str("getRandomValues"))
+        .ok()?
+        .dyn_into::<Function>()
+        .ok()?;
+    let salt = Uint8Array::new_with_length(16);
+    get_random_values.call1(&crypto, &salt).ok()?;
+    Some(
+        salt.to_vec()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn verify_password_hash(password_derived: &str, encoded: &str) -> bool {
     let mut parts = encoded.split('$');
     let Some(algorithm) = parts.next() else {
+        return false;
+    };
+    let Some(rounds) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
         return false;
     };
     let Some(salt) = parts.next() else {
@@ -73,10 +102,14 @@ fn verify_password_hash(password: &str, encoded: &str) -> bool {
     let Some(expected) = parts.next() else {
         return false;
     };
-    if algorithm != "sha256" || salt.is_empty() || parts.next().is_some() {
+    if algorithm != "pbkdf2_sha256_client_v1"
+        || rounds != SERVER_PASSWORD_ROUNDS
+        || salt.len() < 32
+        || parts.next().is_some()
+    {
         return false;
     }
-    secure_eq(&password_digest(password, salt), expected)
+    secure_eq(&password_digest(password_derived, salt, rounds), expected)
 }
 
 pub fn verify_credentials(
@@ -85,6 +118,7 @@ pub fn verify_credentials(
     password_hash: &str,
     username: &str,
     password: &str,
+    password_derived: &str,
 ) -> bool {
     let expected_username = admin_username(env, configured_username);
     let username_valid = secure_eq(&expected_username, username.trim());
@@ -93,7 +127,7 @@ pub fn verify_credentials(
             .map(|expected| secure_eq(&expected, password))
             .unwrap_or(false)
     } else {
-        verify_password_hash(password, password_hash)
+        verify_password_hash(password_derived, password_hash)
     };
     username_valid && password_valid
 }
@@ -198,6 +232,43 @@ pub fn verify_turnstile_proof(value: &str, env: &Env, password_hash: &str) -> bo
     secure_eq(&expected, signature)
 }
 
+pub fn create_theme_preview_proof(
+    env: &Env,
+    password_hash: &str,
+    theme_id: &str,
+) -> Option<String> {
+    let secret = signing_secret(env, password_hash)?;
+    let expires = Date::now().as_millis() as i64 / 1000 + THEME_PREVIEW_SECONDS;
+    let payload = format!("{theme_id}.{expires}");
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(format!("nodeflare-theme-preview:{payload}").as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Some(format!("{payload}.{signature}"))
+}
+
+pub fn verify_theme_preview_proof(value: &str, env: &Env, password_hash: &str) -> Option<String> {
+    let secret = signing_secret(env, password_hash)?;
+    let mut parts = value.split('.');
+    let (Some(theme_id), Some(expires), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if theme_id.is_empty() || theme_id.len() > 80 || theme_id.contains('/') {
+        return None;
+    }
+    let expires = expires.parse::<i64>().ok()?;
+    let current = Date::now().as_millis() as i64 / 1000;
+    if expires < current || expires > current + THEME_PREVIEW_SECONDS + 60 {
+        return None;
+    }
+    let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(format!("nodeflare-theme-preview:{theme_id}.{expires}").as_bytes());
+    mac.verify_slice(&signature).ok()?;
+    Some(theme_id.to_string())
+}
+
 pub fn bearer_token(req: &Request) -> Option<String> {
     req.headers()
         .get("Authorization")
@@ -208,7 +279,28 @@ pub fn bearer_token(req: &Request) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_admin_jwt_with_secret, verify_admin_jwt, SESSION_SECONDS};
+    use super::{
+        create_admin_jwt_with_secret, hash_password, verify_admin_jwt, verify_password_hash,
+        SESSION_SECONDS,
+    };
+
+    #[test]
+    fn hashes_passwords_with_pbkdf2() {
+        let encoded = hash_password(
+            "correct horse battery staple",
+            "0123456789abcdef0123456789abcdef",
+        );
+        assert!(encoded.starts_with("pbkdf2_sha256_client_v1$10000$"));
+        assert!(verify_password_hash(
+            "correct horse battery staple",
+            &encoded
+        ));
+        assert!(!verify_password_hash("wrong", &encoded));
+        assert!(!verify_password_hash(
+            "correct horse battery staple",
+            "sha256$0123456789abcdef0123456789abcdef$invalid"
+        ));
+    }
 
     #[test]
     fn signs_and_verifies_admin_jwt() {

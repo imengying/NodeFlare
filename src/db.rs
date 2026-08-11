@@ -1,28 +1,28 @@
 use std::collections::{BTreeMap, HashMap};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use worker::{wasm_bindgen::JsValue, D1Database, Date, Result};
 
 use crate::models::{
     AgentConfigView, AgentReport, AlertRuleInput, AlertRuleView, HistoryPoint, ServerInput,
-    ServerView, SettingsInput, TokenHashRow,
+    ServerView, SettingsInput, ThemeInput, ThemeView, TokenHashRow,
 };
 
 const SERVER_SELECT: &str = r#"
 SELECT
   s.id, s.name, s.region, s.group_name, s.tags, s.note, s.hidden,
-  s.sort_order, s.expires_at, s.traffic_limit, s.traffic_limit_type,
+  s.expires_at, s.traffic_limit, s.traffic_limit_type,
   s.price, s.billing_cycle, s.currency, s.auto_renewal, s.public_remark,
   s.network_interface, s.reset_day, s.report_interval, s.collect_interval,
   s.rx_correction, s.tx_correction, s.offline_notify_disabled, s.auto_update,
-  s.created_at, s.updated_at,
+  s.created_at,
   m.timestamp, m.cpu, m.load1, m.load5, m.load15, m.mem_used, m.mem_total,
   m.swap_used, m.swap_total, m.disk_used, m.disk_total, m.net_in, m.net_out,
   CASE WHEN m.net_rx_total IS NULL THEN NULL ELSE m.net_rx_total + s.rx_correction END AS net_rx_total,
   CASE WHEN m.net_tx_total IS NULL THEN NULL ELSE m.net_tx_total + s.tx_correction END AS net_tx_total,
   m.uptime, m.processes, m.tcp_connections,
   m.udp_connections, m.cpu_cores, m.cpu_model, m.os, m.kernel, m.arch,
-  m.virtualization, m.ipv4, m.ipv6, m.gpu_usage, m.gpu_model, m.agent_version,
+  m.virtualization, m.gpu_usage, m.gpu_model, m.agent_version,
   m.disk_read_bps, m.disk_write_bps, m.disk_read_iops, m.disk_write_iops,
   m.disk_await_ms, m.disk_utilization, m.disk_info, m.gpu_info,
   m.message
@@ -30,10 +30,43 @@ FROM servers s
 LEFT JOIN latest_metrics m ON m.server_id = s.id
 "#;
 
+pub const SECRET_MASK: &str = "********";
+
+fn secret_for_api(value: &str) -> &str {
+    if value.is_empty() {
+        ""
+    } else {
+        SECRET_MASK
+    }
+}
+
+fn serialize_secret<S>(value: &str, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(secret_for_api(value))
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SettingRow {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThemeRow {
+    id: String,
+    name: String,
+    description: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentConfigRow {
+    report_interval: i64,
+    collect_interval: i64,
+    network_interface: String,
+    auto_update: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,7 +79,10 @@ pub struct SettingsView {
     pub public_dashboard: bool,
     pub offline_threshold_seconds: i64,
     pub history_retention_days: i64,
+    #[serde(skip_serializing)]
+    pub history_cache_version: i64,
     pub default_theme: String,
+    pub active_theme_id: String,
     pub background_url: String,
     pub theme_options: serde_json::Value,
     pub show_search: bool,
@@ -63,16 +99,21 @@ pub struct SettingsView {
     pub admin_password_configured: bool,
     #[serde(skip_serializing)]
     pub admin_password_hash: String,
+    #[serde(skip_serializing)]
+    pub password_client_salt: String,
     pub turnstile_enabled: bool,
     pub turnstile_login_enabled: bool,
     pub turnstile_site_key: String,
+    #[serde(serialize_with = "serialize_secret")]
     pub turnstile_secret_key: String,
     pub notification_enabled: bool,
+    #[serde(serialize_with = "serialize_secret")]
     pub notification_endpoint: String,
     pub notification_target: String,
     pub offline_alert_minutes: i64,
     pub expiry_alert_days: i64,
     pub cloudflare_account_id: String,
+    #[serde(serialize_with = "serialize_secret")]
     pub cloudflare_api_token: String,
 }
 
@@ -104,8 +145,6 @@ struct AlertRuleRow {
     duration_minutes: i64,
     aggregation: String,
     enabled: i64,
-    created_at: i64,
-    updated_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +157,10 @@ pub struct AlertMetricRow {
     pub server_id: String,
     pub name: String,
     pub value: f64,
+    pub sample_count: i64,
+    pub first_timestamp: i64,
+    pub last_timestamp: i64,
+    pub report_interval: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,7 +213,7 @@ pub async fn get_token_hash(db: &D1Database, id: &str) -> Result<Option<TokenHas
 }
 
 pub async fn agent_config(db: &D1Database, id: &str) -> Result<Option<AgentConfigView>> {
-    let mut config: Option<AgentConfigView> = db
+    let row: Option<AgentConfigRow> = db
         .prepare(
             "SELECT report_interval, collect_interval, network_interface, auto_update \
              FROM servers WHERE id = ?1",
@@ -178,11 +221,16 @@ pub async fn agent_config(db: &D1Database, id: &str) -> Result<Option<AgentConfi
         .bind(&[text(id)])?
         .first(None)
         .await?;
-    if let Some(config) = config.as_mut() {
-        config.network_interface = config.network_interface.trim().to_string();
-        config.latency_tasks = crate::latency::tasks_for_server(db, id).await?;
-    }
-    Ok(config)
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(AgentConfigView {
+        report_interval: row.report_interval,
+        collect_interval: row.collect_interval,
+        network_interface: row.network_interface.trim().to_string(),
+        auto_update: row.auto_update,
+        latency_tasks: crate::latency::tasks_for_server(db, id).await?,
+    }))
 }
 
 pub async fn create_server(
@@ -329,8 +377,8 @@ pub async fn reorder_servers(db: &D1Database, ids: &[String]) -> Result<()> {
 pub async fn list_alert_rules(db: &D1Database) -> Result<Vec<AlertRuleView>> {
     let rows: Vec<AlertRuleRow> = db
         .prepare(
-            "SELECT id, name, metric, threshold, duration_minutes, aggregation, enabled, \
-             created_at, updated_at FROM alert_rules ORDER BY created_at ASC",
+            "SELECT id, name, metric, threshold, duration_minutes, aggregation, enabled \
+             FROM alert_rules ORDER BY created_at ASC",
         )
         .all()
         .await?
@@ -355,8 +403,6 @@ pub async fn list_alert_rules(db: &D1Database) -> Result<Vec<AlertRuleView>> {
             aggregation: row.aggregation,
             enabled: row.enabled,
             server_ids: servers.into_iter().map(|row| row.server_id).collect(),
-            created_at: row.created_at,
-            updated_at: row.updated_at,
         });
     }
     Ok(rules)
@@ -453,20 +499,41 @@ pub async fn alert_metric_values(
         "AVG"
     };
     let since = current_time - rule.duration_minutes.clamp(1, 1440) * 60;
-    let minimum_samples = rule.duration_minutes.clamp(1, 1440);
     let query = format!(
-        "SELECT s.id AS server_id, s.name, {aggregate}({metric}) AS value \
+        "SELECT s.id AS server_id, s.name, {aggregate}({metric}) AS value, \
+           COUNT(*) AS sample_count, MIN(h.timestamp) AS first_timestamp, \
+           MAX(h.timestamp) AS last_timestamp, s.report_interval \
          FROM servers s JOIN metric_history h ON h.server_id=s.id \
          WHERE h.timestamp >= ?1 AND s.hidden=0 AND (\
            NOT EXISTS(SELECT 1 FROM alert_rule_servers ars WHERE ars.rule_id=?2) OR \
            EXISTS(SELECT 1 FROM alert_rule_servers ars WHERE ars.rule_id=?2 AND ars.server_id=s.id)\
-         ) GROUP BY s.id, s.name HAVING COUNT(*) >= ?3"
+         ) GROUP BY s.id, s.name, s.report_interval"
     );
-    db.prepare(query)
-        .bind(&[number(since), text(&rule.id), number(minimum_samples)])?
+    let rows: Vec<AlertMetricRow> = db
+        .prepare(query)
+        .bind(&[number(since), text(&rule.id)])?
         .all()
         .await?
-        .results()
+        .results()?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| alert_window_covered(row, rule.duration_minutes, current_time))
+        .collect())
+}
+
+fn alert_window_covered(row: &AlertMetricRow, duration_minutes: i64, current_time: i64) -> bool {
+    let window_seconds = duration_minutes.clamp(1, 1440) * 60;
+    let report_interval = row.report_interval.clamp(15, 3600).max(60);
+    let expected_samples = ((window_seconds + report_interval - 1) / report_interval).max(1);
+    let required_samples = if expected_samples == 1 {
+        1
+    } else {
+        ((expected_samples * 3 + 4) / 5).max(2)
+    };
+    let fresh_within = (report_interval * 2).max(120);
+    row.sample_count >= required_samples
+        && row.first_timestamp <= row.last_timestamp
+        && current_time.saturating_sub(row.last_timestamp) <= fresh_within
 }
 
 pub async fn active_alert_states(db: &D1Database) -> Result<std::collections::HashSet<String>> {
@@ -481,16 +548,25 @@ pub async fn active_alert_states(db: &D1Database) -> Result<std::collections::Ha
         .collect())
 }
 
-pub async fn replace_active_alert_states(
+pub async fn sync_active_alert_states(
     db: &D1Database,
-    keys: &std::collections::HashSet<String>,
+    previous: &std::collections::HashSet<String>,
+    current: &std::collections::HashSet<String>,
 ) -> Result<()> {
-    let mut statements = vec![db.prepare("DELETE FROM alert_states")];
+    let mut statements = Vec::new();
+    let delete = db.prepare("DELETE FROM alert_states WHERE rule_id=?1 AND server_id=?2");
     let insert = db.prepare(
-        "INSERT INTO alert_states(rule_id, server_id, active, updated_at) VALUES (?1, ?2, 1, ?3)",
+        "INSERT INTO alert_states(rule_id, server_id, active, updated_at) VALUES (?1, ?2, 1, ?3) \
+         ON CONFLICT(rule_id, server_id) DO UPDATE SET active=1, updated_at=excluded.updated_at",
     );
     let timestamp = now();
-    for key in keys {
+    for key in previous.difference(current) {
+        let Some((rule_id, server_id)) = key.split_once(':') else {
+            continue;
+        };
+        statements.push(delete.clone().bind(&[text(rule_id), text(server_id)])?);
+    }
+    for key in current.difference(previous) {
         let Some((rule_id, server_id)) = key.split_once(':') else {
             continue;
         };
@@ -500,7 +576,9 @@ pub async fn replace_active_alert_states(
             number(timestamp),
         ])?);
     }
-    db.batch(statements).await?;
+    if !statements.is_empty() {
+        db.batch(statements).await?;
+    }
     Ok(())
 }
 
@@ -568,14 +646,13 @@ pub async fn save_reports(db: &D1Database, server_id: &str, reports: &[AgentRepo
               swap_used, swap_total, disk_used, disk_total, net_in, net_out,
               net_rx_total, net_tx_total, uptime, processes, tcp_connections,
               udp_connections, cpu_cores, cpu_model, os, kernel, arch,
-              virtualization, ipv4, ipv6, gpu_usage, gpu_model, agent_version,
+              virtualization, gpu_usage, gpu_model, agent_version,
               disk_read_bps, disk_write_bps, disk_read_iops, disk_write_iops,
               disk_await_ms, disk_utilization, disk_info, gpu_info, message
             ) VALUES (
               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
               ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
-              ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38,
-              ?39, ?40
+              ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38
             ) ON CONFLICT(server_id) DO UPDATE SET
               timestamp=excluded.timestamp, cpu=excluded.cpu, load1=excluded.load1,
               load5=excluded.load5, load15=excluded.load15, mem_used=excluded.mem_used,
@@ -587,8 +664,7 @@ pub async fn save_reports(db: &D1Database, server_id: &str, reports: &[AgentRepo
               tcp_connections=excluded.tcp_connections, udp_connections=excluded.udp_connections,
               cpu_cores=excluded.cpu_cores, cpu_model=excluded.cpu_model, os=excluded.os,
               kernel=excluded.kernel, arch=excluded.arch,
-              virtualization=excluded.virtualization, ipv4=excluded.ipv4, ipv6=excluded.ipv6,
-              gpu_usage=excluded.gpu_usage, gpu_model=excluded.gpu_model,
+              virtualization=excluded.virtualization, gpu_usage=excluded.gpu_usage, gpu_model=excluded.gpu_model,
               agent_version=excluded.agent_version,
               disk_read_bps=excluded.disk_read_bps, disk_write_bps=excluded.disk_write_bps,
               disk_read_iops=excluded.disk_read_iops, disk_write_iops=excluded.disk_write_iops,
@@ -676,8 +752,6 @@ fn report_values(server_id: &str, report: &AgentReport, timestamp: i64) -> Vec<J
         text(&report.kernel),
         text(&report.arch),
         text(&report.virtualization),
-        text(&report.ipv4),
-        text(&report.ipv6),
         number(report.gpu_usage),
         text(&report.gpu_model),
         text(&report.agent_version),
@@ -778,7 +852,9 @@ pub async fn settings(
             "history_retention_days",
             default_retention.clamp(1, 365),
         ),
+        history_cache_version: integer_setting(&values, "history_cache_version", 0),
         default_theme: string_setting(&values, "default_theme", "system"),
+        active_theme_id: string_setting(&values, "active_theme_id", crate::theme::BUILTIN_THEME_ID),
         background_url: string_setting(&values, "background_url", ""),
         theme_options: values
             .get("theme_options")
@@ -800,6 +876,7 @@ pub async fn settings(
             .get("admin_password_hash")
             .is_some_and(|value| !value.is_empty()),
         admin_password_hash: string_setting(&values, "admin_password_hash", ""),
+        password_client_salt: string_setting(&values, "password_client_salt", ""),
         turnstile_enabled: bool_setting(&values, "turnstile_enabled", false),
         turnstile_login_enabled: bool_setting(&values, "turnstile_login_enabled", true),
         turnstile_site_key: string_setting(&values, "turnstile_site_key", ""),
@@ -863,6 +940,9 @@ pub async fn update_settings(
     if let Some(value) = input.default_theme.as_deref() {
         push_setting!("default_theme", value);
     }
+    if let Some(value) = input.active_theme_id.as_deref() {
+        push_setting!("active_theme_id", value.trim());
+    }
     if let Some(value) = input.background_url.as_deref() {
         push_setting!("background_url", value.trim());
     }
@@ -918,13 +998,21 @@ pub async fn update_settings(
     if let Some(value) = input.turnstile_site_key.as_deref() {
         push_setting!("turnstile_site_key", value.trim());
     }
-    if let Some(value) = input.turnstile_secret_key.as_deref() {
+    if let Some(value) = input
+        .turnstile_secret_key
+        .as_deref()
+        .filter(|value| value.trim() != SECRET_MASK)
+    {
         push_setting!("turnstile_secret_key", value.trim());
     }
     if let Some(value) = input.notification_enabled {
         push_setting!("notification_enabled", if value { "true" } else { "false" });
     }
-    if let Some(value) = input.notification_endpoint.as_deref() {
+    if let Some(value) = input
+        .notification_endpoint
+        .as_deref()
+        .filter(|value| value.trim() != SECRET_MASK)
+    {
         push_setting!("notification_endpoint", value.trim());
     }
     if let Some(value) = input.notification_target.as_deref() {
@@ -946,11 +1034,102 @@ pub async fn update_settings(
         };
     }
     push_trimmed!(input.cloudflare_account_id, "cloudflare_account_id");
-    push_trimmed!(input.cloudflare_api_token, "cloudflare_api_token");
+    if let Some(value) = input
+        .cloudflare_api_token
+        .as_deref()
+        .filter(|value| value.trim() != SECRET_MASK)
+    {
+        push_setting!("cloudflare_api_token", value.trim());
+    }
     if !statements.is_empty() {
         db.batch(statements).await?;
     }
     Ok(())
+}
+
+pub async fn list_themes(db: &D1Database, active_id: &str) -> Result<Vec<ThemeView>> {
+    let rows: Vec<ThemeRow> = db
+        .prepare("SELECT id, name, description, url FROM themes ORDER BY created_at DESC")
+        .all()
+        .await?
+        .results()?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let active = row.id == active_id;
+            ThemeView {
+                id: row.id,
+                name: row.name,
+                description: row.description,
+                url: row.url,
+                builtin: false,
+                active,
+            }
+        })
+        .collect())
+}
+
+pub async fn create_theme(
+    db: &D1Database,
+    id: &str,
+    input: &ThemeInput,
+    source_url: &str,
+    timestamp: i64,
+) -> Result<()> {
+    db.prepare(
+        "INSERT INTO themes(id, name, description, url, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(&[
+        text(id),
+        text(input.name.trim()),
+        text(input.description.trim()),
+        text(source_url),
+        number(timestamp),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn theme_exists(db: &D1Database, id: &str) -> Result<bool> {
+    let row: Option<ThemeRow> = db
+        .prepare("SELECT id, name, description, url FROM themes WHERE id = ?1")
+        .bind(&[text(id)])?
+        .first(None)
+        .await?;
+    Ok(row.is_some())
+}
+
+pub async fn theme_url(db: &D1Database, id: &str) -> Result<Option<String>> {
+    let row: Option<ThemeRow> = db
+        .prepare("SELECT id, name, description, url FROM themes WHERE id = ?1")
+        .bind(&[text(id)])?
+        .first(None)
+        .await?;
+    row.map(|theme| crate::theme::resolve_url(&theme.url).map(|resolved| resolved.resolved_url))
+        .transpose()
+}
+
+pub async fn set_active_theme(db: &D1Database, id: &str) -> Result<bool> {
+    if id != crate::theme::BUILTIN_THEME_ID && !theme_exists(db, id).await? {
+        return Ok(false);
+    }
+    save_setting(db, "active_theme_id", id).await?;
+    Ok(true)
+}
+
+pub async fn delete_theme(db: &D1Database, id: &str) -> Result<bool> {
+    let result = db
+        .prepare("DELETE FROM themes WHERE id = ?1")
+        .bind(&[text(id)])?
+        .run()
+        .await?;
+    let deleted = result.meta()?.and_then(|meta| meta.changes).unwrap_or(0) > 0;
+    if deleted && get_setting(db, "active_theme_id").await?.as_deref() == Some(id) {
+        save_setting(db, "active_theme_id", crate::theme::BUILTIN_THEME_ID).await?;
+    }
+    Ok(deleted)
 }
 
 pub async fn cleanup_history(db: &D1Database, retention_days: i64) -> Result<()> {
@@ -1119,4 +1298,48 @@ pub async fn update_expiry(db: &D1Database, id: &str, expires_at: i64) -> Result
         .run()
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{alert_window_covered, secret_for_api, AlertMetricRow, SECRET_MASK};
+
+    fn row(samples: i64, last_timestamp: i64, report_interval: i64) -> AlertMetricRow {
+        AlertMetricRow {
+            server_id: "server".to_string(),
+            name: "Server".to_string(),
+            value: 90.0,
+            sample_count: samples,
+            first_timestamp: last_timestamp - samples.saturating_sub(1) * 60,
+            last_timestamp,
+            report_interval,
+        }
+    }
+
+    #[test]
+    fn alert_coverage_tracks_report_interval_and_freshness() {
+        let current = 10_000;
+        assert!(alert_window_covered(&row(6, current - 30, 60), 10, current));
+        assert!(!alert_window_covered(
+            &row(5, current - 30, 60),
+            10,
+            current
+        ));
+        assert!(alert_window_covered(
+            &row(2, current - 60, 300),
+            10,
+            current
+        ));
+        assert!(!alert_window_covered(
+            &row(2, current - 700, 300),
+            10,
+            current
+        ));
+    }
+
+    #[test]
+    fn masks_stored_secrets_in_api_responses() {
+        assert_eq!(secret_for_api(""), "");
+        assert_eq!(secret_for_api("stored-secret"), SECRET_MASK);
+    }
 }

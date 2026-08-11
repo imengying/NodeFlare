@@ -19,6 +19,30 @@ binding = "DB"
 # Wrangler 4.45+ provisions and binds this database when database_id is omitted.
 database_name = "nodeflare"
 
+[[ratelimits]]
+name = "API_RATE_LIMITER"
+namespace_id = "73120401"
+
+  [ratelimits.simple]
+  limit = 300
+  period = 60
+
+[[ratelimits]]
+name = "AUTH_RATE_LIMITER"
+namespace_id = "73120402"
+
+  [ratelimits.simple]
+  limit = 20
+  period = 60
+
+[[ratelimits]]
+name = "AGENT_RATE_LIMITER"
+namespace_id = "73120403"
+
+  [ratelimits.simple]
+  limit = 120
+  period = 60
+
 [[durable_objects.bindings]]
 name = "LIVE_HUB"
 class_name = "LiveHub"

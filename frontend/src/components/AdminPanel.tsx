@@ -23,11 +23,14 @@ import {
   SlidersHorizontal,
   Sun,
   Trash2,
+  Check,
+  ExternalLink,
 } from "lucide-react";
 import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError, getToken, setToken } from "../api";
 import { formatBytes, isOnline } from "../format";
-import { ASSET_CURRENCIES, type AgentInstallTarget, type CloudflareUsage, type Config, type DatabaseStats, type ExchangeRates, type Server, type ServerInput, type Settings, type ThemeSettingField, type ThemeSettingsSchema, type ThemeSettingValue } from "../types";
+import { derivePassword } from "../password";
+import { ASSET_CURRENCIES, type AdminServer, type AgentInstallTarget, type CloudflareUsage, type Config, type DatabaseStats, type ExchangeRates, type ServerInput, type Settings, type Theme, type ThemeSettingField, type ThemeSettingsSchema, type ThemeSettingValue } from "../types";
 import { Checkbox } from "./Checkbox";
 import { TurnstileWidget } from "./TurnstileWidget";
 import { LatencyManager } from "./LatencyManager";
@@ -40,7 +43,7 @@ const adminPages: Record<AdminTab, { title: string; description: string }> = {
   servers: { title: "服务器", description: "管理监控节点、Agent 密钥和运行参数" },
   latency: { title: "延迟监测", description: "配置分配给各服务器的 TCP 与 ICMP 延迟任务" },
   appearance: { title: "站点设置", description: "调整站点信息、公开内容和前台显示项目" },
-  themes: { title: "主题管理", description: "管理内置前端主题和公开访问" },
+  themes: { title: "主题商店", description: "选择内置主题或安装远程主题" },
   themeSettings: { title: "主题设置", description: "调整当前前端主题提供的显示选项" },
   alerts: { title: "通知", description: "配置 Telegram 通知和资源告警阈值" },
   security: { title: "登录与安全", description: "管理管理员账号和 Cloudflare Turnstile 防护" },
@@ -73,7 +76,7 @@ const emptyServer: ServerInput = {
   auto_update: true,
 };
 
-function toInput(server: Server): ServerInput {
+function toInput(server: AdminServer): ServerInput {
   return {
     ...emptyServer,
     name: server.name,
@@ -139,15 +142,19 @@ export function AdminPanel({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [tab, setTab] = useState<AdminTab>("servers");
-  const [servers, setServers] = useState<Server[]>([]);
+  const [servers, setServers] = useState<AdminServer[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [draggingId, setDraggingId] = useState("");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [database, setDatabase] = useState<DatabaseStats | null>(null);
   const [cloudflareUsage, setCloudflareUsage] = useState<CloudflareUsage | null>(null);
   const [exchangeRates, setExchangeRates] = useState<ExchangeRates | null>(null);
+  const [themes, setThemes] = useState<Theme[]>([]);
+  const [themeName, setThemeName] = useState("");
+  const [themeDescription, setThemeDescription] = useState("");
+  const [themeUrl, setThemeUrl] = useState("");
   const [themeSettingsSchema, setThemeSettingsSchema] = useState<ThemeSettingsSchema | null>(null);
-  const [editing, setEditing] = useState<Server | "new" | null>(null);
+  const [editing, setEditing] = useState<AdminServer | "new" | null>(null);
   const [form, setForm] = useState<ServerInput>(emptyServer);
   const [install, setInstall] = useState<AgentInstallTarget[]>([]);
   const [installPlatform, setInstallPlatform] = useState<AgentPlatform>("linux");
@@ -157,8 +164,9 @@ export function AdminPanel({
     setBusy(true);
     setError("");
     try {
-      const [serverResult, settingsResult] = await Promise.all([api.servers(true), api.settings()]);
+      const [serverResult, settingsResult, themesResult] = await Promise.all([api.adminServers(), api.settings(), api.themes()]);
       setServers(serverResult.servers);
+      setThemes(themesResult.themes);
       setSettings({
         ...settingsResult,
         site_announcement: settingsResult.site_announcement || "",
@@ -193,7 +201,8 @@ export function AdminPanel({
     setBusy(true);
     setError("");
     try {
-      const result = await api.login(username.trim(), password, turnstileToken);
+      const passwordDerived = await derivePassword(password, config.password_client_salt);
+      const result = await api.login(username.trim(), password, passwordDerived, turnstileToken);
       setToken(result.token);
       setPassword("");
       setTurnstileToken("");
@@ -206,7 +215,7 @@ export function AdminPanel({
     } finally { setBusy(false); }
   }
 
-  function openEditor(server?: Server) {
+  function openEditor(server?: AdminServer) {
     setEditing(server ?? "new");
     setForm(server ? toInput(server) : { ...emptyServer });
     setError("");
@@ -243,13 +252,13 @@ export function AdminPanel({
     finally { setBusy(false); }
   }
 
-  async function remove(server: Server) {
+  async function remove(server: AdminServer) {
     if (!window.confirm(`确认删除“${server.name}”及其全部历史数据？`)) return;
     try { await api.deleteServer(server.id); await load(); onChanged(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "删除失败"); }
   }
 
-  async function rotate(server: Server) {
+  async function rotate(server: AdminServer) {
     if (!window.confirm(`重置“${server.name}”的 Agent 密钥？旧 Agent 将立即失效。`)) return;
     try {
       const result = await api.rotateToken(server.id);
@@ -296,9 +305,15 @@ export function AdminPanel({
     setBusy(true);
     setError("");
     setNotice("");
-    const payload = { ...settings };
-    if (!payload.new_password) delete payload.new_password;
+    const payload: Partial<Settings> = { ...settings };
+    delete payload.admin_password_configured;
     try {
+      if (payload.new_password) {
+        payload.new_password_derived = await derivePassword(payload.new_password, config.password_client_salt);
+      } else {
+        delete payload.new_password;
+        delete payload.new_password_derived;
+      }
       const result = await api.saveSettings(payload);
       if (result.token) setToken(result.token);
       setSettings(result.settings);
@@ -347,6 +362,59 @@ export function AdminPanel({
     setBusy(true); setError("");
     try { setThemeSettingsSchema(await api.themeSettings()); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "读取主题设置失败"); }
+    finally { setBusy(false); }
+  }
+
+  async function addTheme(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true); setError(""); setNotice("");
+    try {
+      await api.addTheme({ name: themeName.trim(), description: themeDescription.trim(), url: themeUrl.trim() });
+      setThemeName(""); setThemeDescription(""); setThemeUrl("");
+      await load();
+      setNotice("主题已添加");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "添加主题失败"); }
+    finally { setBusy(false); }
+  }
+
+  async function activateTheme(theme: Theme) {
+    if (theme.active) return;
+    setBusy(true); setError(""); setNotice("");
+    try {
+      await api.activateTheme(theme.id);
+      await load();
+      setNotice(`已启用主题：${theme.name}`);
+      onChanged();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "启用主题失败"); }
+    finally { setBusy(false); }
+  }
+
+  async function previewTheme(theme: Theme) {
+    if (theme.builtin) return;
+    const previewWindow = window.open("", "_blank");
+    setBusy(true); setError("");
+    try {
+      const { preview_url } = await api.previewTheme(theme.id);
+      if (previewWindow) {
+        previewWindow.opener = null;
+        previewWindow.location.replace(preview_url);
+      } else {
+        window.open(preview_url, "_blank", "noopener,noreferrer");
+      }
+    } catch (reason) {
+      previewWindow?.close();
+      setError(reason instanceof Error ? reason.message : "创建主题预览失败");
+    } finally { setBusy(false); }
+  }
+
+  async function removeTheme(theme: Theme) {
+    if (theme.builtin || !window.confirm(`确认删除主题“${theme.name}”？`)) return;
+    setBusy(true); setError(""); setNotice("");
+    try {
+      await api.deleteTheme(theme.id);
+      await load();
+      setNotice("主题已删除");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "删除主题失败"); }
     finally { setBusy(false); }
   }
 
@@ -431,7 +499,7 @@ export function AdminPanel({
                 <button className={tab === "servers" ? "active" : ""} onClick={() => selectTab("servers")}><ServerCog size={19} />服务器</button>
                 <button className={tab === "latency" ? "active" : ""} onClick={() => selectTab("latency")}><RadioTower size={19} />延迟监测</button>
                 <button className={tab === "appearance" ? "active" : ""} onClick={() => selectTab("appearance")}><Eye size={19} />站点设置</button>
-                <button className={tab === "themes" ? "active" : ""} onClick={() => selectTab("themes")}><Palette size={19} />主题管理</button>
+                <button className={tab === "themes" ? "active" : ""} onClick={() => selectTab("themes")}><Palette size={19} />主题商店</button>
                 <button className={tab === "themeSettings" ? "active" : ""} onClick={() => { selectTab("themeSettings"); void loadThemeSettings(); }}><SlidersHorizontal size={19} />主题设置</button>
                 <button className={tab === "alerts" ? "active" : ""} onClick={() => selectTab("alerts")}><AlertTriangle size={19} />通知</button>
                 <button className={tab === "security" ? "active" : ""} onClick={() => selectTab("security")}><ShieldCheck size={19} />登录与安全</button>
@@ -463,14 +531,40 @@ export function AdminPanel({
               ) : tab === "latency" ? (
                 <LatencyManager servers={servers} onError={setError} onNotice={setNotice} />
               ) : tab === "themes" && settings ? (
-                <form className="settings-form" onSubmit={saveSite}>
-                  <div className="section-title"><Palette size={15} />内置主题</div>
-                  <div className="builtin-theme-row"><div><strong>Komari Glass</strong><span>内置前端主题</span></div><b>使用中</b></div>
-                  <div className="section-subtitle">公开访问</div>
-                  <Toggle label="公开仪表盘" checked={settings.public_dashboard} onChange={(value) => updateSettings("public_dashboard", value)} />
-                  <p className="settings-hint">关闭后，未登录访客无法读取节点和历史数据。</p>
-                  <div className="form-actions"><button className="primary-btn" disabled={busy}><Save size={16} />保存主题管理设置</button></div>
-                </form>
+                <div className="theme-store-page">
+                  <section className="admin-section">
+                    <div className="section-head"><div><h3>主题列表</h3><span>内置主题始终可用，远程主题由 Worker 代理前台页面和资源。</span></div></div>
+                    <div className="theme-store-grid">
+                      {themes.map((theme) => <article className={`theme-store-card ${theme.active ? "active" : ""}`} key={theme.id}>
+                        <div className="theme-card-icon"><Palette size={20} /></div>
+                        <div className="theme-card-main">
+                          <div className="theme-card-title"><strong>{theme.name}</strong><span className={`theme-badge ${theme.builtin ? "builtin" : "remote"}`}>{theme.builtin ? "默认主题" : "远程主题"}</span></div>
+                          <p>{theme.description || "暂无主题说明"}</p>
+                          {!theme.builtin ? <a href={theme.url} target="_blank" rel="noreferrer"><span>{theme.url}</span><ExternalLink size={13} /></a> : <small>NodeFlare 内置 Komari Glass</small>}
+                        </div>
+                        <div className="theme-card-actions">
+                          {!theme.builtin ? <button type="button" className="secondary-btn compact" disabled={busy} onClick={() => void previewTheme(theme)}><Eye size={14} />预览</button> : null}
+                          <button type="button" className={theme.active ? "theme-active-btn" : "primary-btn compact"} disabled={busy || theme.active} onClick={() => void activateTheme(theme)}>{theme.active ? <><Check size={14} />使用中</> : "启用"}</button>
+                          {!theme.builtin ? <button type="button" className="icon-btn danger" disabled={busy} title="删除主题" onClick={() => void removeTheme(theme)}><Trash2 size={15} /></button> : null}
+                        </div>
+                      </article>)}
+                    </div>
+                  </section>
+                  <form className="admin-section theme-add-form" onSubmit={addTheme}>
+                    <div className="section-title"><Plus size={15} />添加远程主题</div>
+                    <p className="settings-hint">填写 GitHub <code>tree</code> 地址，对应目录需包含 <code>index.html</code> 和 <code>assets/</code> 目录。</p>
+                    <div className="form-grid"><label><span>主题名称</span><input required maxLength={80} value={themeName} onChange={(event) => setThemeName(event.target.value)} placeholder="例如：Ocean" /></label><label><span>主题 URL</span><input required type="url" maxLength={2048} value={themeUrl} onChange={(event) => setThemeUrl(event.target.value)} placeholder="https://github.com/user/theme/tree/main" /></label></div>
+                    <label><span>主题说明（可选）</span><textarea rows={2} maxLength={300} value={themeDescription} onChange={(event) => setThemeDescription(event.target.value)} placeholder="简短描述主题风格和来源" /></label>
+                    <div className="theme-risk-note">远程主题包含第三方 HTML、JavaScript 和 CSS。仅添加你信任的主题仓库。</div>
+                    <div className="form-actions"><button className="primary-btn" disabled={busy}><Plus size={16} />添加主题</button></div>
+                  </form>
+                  <form className="admin-section" onSubmit={saveSite}>
+                    <div className="section-title"><Eye size={15} />公开访问</div>
+                    <Toggle label="公开仪表盘" checked={settings.public_dashboard} onChange={(value) => updateSettings("public_dashboard", value)} />
+                    <p className="settings-hint">关闭后，未登录访客无法读取节点和历史数据。</p>
+                    <div className="form-actions"><button className="primary-btn" disabled={busy}><Save size={16} />保存公开设置</button></div>
+                  </form>
+                </div>
               ) : settings ? (
                 <form className="settings-form" onSubmit={saveSite}>
                   {tab === "appearance" ? <>
@@ -492,7 +586,7 @@ export function AdminPanel({
 
                   {tab === "alerts" ? <>
                     <div className="section-title"><AlertTriangle size={15} />通知与告警</div>
-                    <div className="form-grid"><label><span>Telegram Bot Token</span><input autoComplete="off" value={settings.notification_endpoint} onChange={(event) => updateSettings("notification_endpoint", event.target.value)} placeholder="123456789:AA..." /></label><label><span>Telegram Chat ID</span><input value={settings.notification_target} onChange={(event) => updateSettings("notification_target", event.target.value)} placeholder="个人、群组或频道 ID" /></label></div>
+                    <div className="form-grid"><label><span>Telegram Bot Token</span><input autoComplete="off" type="password" value={settings.notification_endpoint} onChange={(event) => updateSettings("notification_endpoint", event.target.value)} placeholder="123456789:AA..." /></label><label><span>Telegram Chat ID</span><input value={settings.notification_target} onChange={(event) => updateSettings("notification_target", event.target.value)} placeholder="个人、群组或频道 ID" /></label></div>
                     <Toggle label="启用通知与告警" checked={settings.notification_enabled} onChange={(value) => updateSettings("notification_enabled", value)} />
                     <div className="form-grid three"><label><span>离线告警延迟（分钟）</span><input type="number" min="2" max="1440" value={settings.offline_alert_minutes} onChange={(event) => updateSettings("offline_alert_minutes", Number(event.target.value))} /></label><label><span>到期提醒（天）</span><input type="number" min="0" max="365" value={settings.expiry_alert_days} onChange={(event) => updateSettings("expiry_alert_days", Number(event.target.value))} /></label><label><span>通知测试</span><button type="button" className="secondary-btn" disabled={busy} onClick={() => void testNotification()}>发送测试通知</button></label></div>
                     <p className="settings-hint">通过 Telegram Bot 发送告警；告警状态会记录在 D1，同一故障和恢复只发送一次。</p>

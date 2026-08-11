@@ -8,6 +8,7 @@ export interface Config {
   offline_threshold_seconds: number;
   history_retention_days: number;
   default_theme: "system" | "light" | "dark";
+  active_theme_id: string;
   background_url: string;
   theme_options: Record<string, ThemeSettingValue>;
   show_search: boolean;
@@ -23,6 +24,7 @@ export interface Config {
   turnstile_enabled: boolean;
   turnstile_login_enabled: boolean;
   turnstile_site_key: string;
+  password_client_salt: string;
   websocket: boolean;
 }
 
@@ -54,6 +56,15 @@ export interface ThemeSettingsSchema {
   schema: number;
   source: "builtin";
   settings: ThemeSettingField[];
+}
+
+export interface Theme {
+  id: string;
+  name: string;
+  description: string;
+  url: string;
+  builtin: boolean;
+  active: boolean;
 }
 
 export interface ExchangeRates {
@@ -113,10 +124,7 @@ export interface LatencyTask {
   target: string;
   interval_seconds: number;
   default_enabled: boolean;
-  sort_order: number;
   server_ids: string[];
-  created_at: number;
-  updated_at: number;
 }
 
 export type LatencyTaskInput = Pick<LatencyTask, "name" | "task_type" | "target" | "interval_seconds" | "default_enabled" | "server_ids">;
@@ -127,9 +135,6 @@ export interface Server {
   region: string;
   group_name: string;
   tags: string;
-  note: string;
-  hidden: number;
-  sort_order: number;
   expires_at: number | null;
   traffic_limit: number;
   traffic_limit_type: TrafficLimitType;
@@ -138,16 +143,7 @@ export interface Server {
   currency: string;
   auto_renewal: number;
   public_remark: string;
-  network_interface: string;
   reset_day: number;
-  report_interval: number;
-  collect_interval: number;
-  rx_correction: number;
-  tx_correction: number;
-  offline_notify_disabled: number;
-  auto_update: number;
-  created_at: number;
-  updated_at: number;
   timestamp: number | null;
   cpu: number | null;
   load1: number | null;
@@ -173,8 +169,6 @@ export interface Server {
   kernel: string | null;
   arch: string | null;
   virtualization: string | null;
-  ipv4: string | null;
-  ipv6: string | null;
   gpu_usage: number | null;
   gpu_model: string | null;
   agent_version: string | null;
@@ -188,6 +182,18 @@ export interface Server {
   gpus?: GpuMetric[];
   message: string | null;
   latency?: LatencySample[];
+}
+
+export interface AdminServer extends Server {
+  note: string;
+  hidden: number;
+  network_interface: string;
+  report_interval: number;
+  collect_interval: number;
+  rx_correction: number;
+  tx_correction: number;
+  offline_notify_disabled: number;
+  auto_update: number;
 }
 
 export interface HistoryPoint {
@@ -243,10 +249,11 @@ export interface ServerInput {
   auto_update: boolean;
 }
 
-export interface Settings extends Omit<Config, "websocket"> {
+export interface Settings extends Omit<Config, "websocket" | "password_client_salt"> {
   admin_username: string;
   admin_password_configured: boolean;
   new_password?: string;
+  new_password_derived?: string;
   turnstile_secret_key: string;
   notification_enabled: boolean;
   notification_endpoint: string;
@@ -269,11 +276,9 @@ export interface AlertRule {
   aggregation: AlertAggregation;
   enabled: number;
   server_ids: string[];
-  created_at: number;
-  updated_at: number;
 }
 
-export interface AlertRuleInput extends Omit<AlertRule, "id" | "enabled" | "created_at" | "updated_at"> {
+export interface AlertRuleInput extends Omit<AlertRule, "id" | "enabled"> {
   enabled: boolean;
 }
 

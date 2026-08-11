@@ -63,8 +63,6 @@ CREATE TABLE IF NOT EXISTS latest_metrics (
   kernel TEXT NOT NULL DEFAULT '',
   arch TEXT NOT NULL DEFAULT '',
   virtualization TEXT NOT NULL DEFAULT '',
-  ipv4 TEXT NOT NULL DEFAULT '',
-  ipv6 TEXT NOT NULL DEFAULT '',
   gpu_usage REAL NOT NULL DEFAULT 0,
   gpu_model TEXT NOT NULL DEFAULT '',
   agent_version TEXT NOT NULL DEFAULT '',
@@ -152,7 +150,9 @@ INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES
   ('favicon_url', '', unixepoch()),
   ('locale', 'zh-CN', unixepoch()),
   ('public_dashboard', 'true', unixepoch()),
+  ('history_cache_version', '0', unixepoch()),
   ('default_theme', 'system', unixepoch()),
+  ('active_theme_id', 'builtin-komari-glass', unixepoch()),
   ('background_url', '', unixepoch()),
   ('theme_options', '{}', unixepoch()),
   ('show_search', 'true', unixepoch()),
@@ -167,6 +167,7 @@ INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES
   ('show_uptime', 'true', unixepoch()),
   ('admin_username', '', unixepoch()),
   ('admin_password_hash', '', unixepoch()),
+  ('password_client_salt', lower(hex(randomblob(16))), unixepoch()),
   ('turnstile_enabled', 'false', unixepoch()),
   ('turnstile_login_enabled', 'true', unixepoch()),
   ('turnstile_site_key', '', unixepoch()),
@@ -187,6 +188,17 @@ CREATE TABLE IF NOT EXISTS exchange_rate_snapshots (
   fetched_at INTEGER NOT NULL,
   attempted_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS themes (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_themes_created
+  ON themes(created_at DESC);
 
 INSERT OR IGNORE INTO exchange_rate_snapshots (
   base_currency, rates_json, source, rate_date, fetched_at, attempted_at

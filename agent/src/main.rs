@@ -2,9 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::net::UdpSocket;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -50,10 +48,12 @@ struct RuntimeConfig {
     report_interval: u64,
     collect_interval: u64,
     network_interface: String,
+    auto_update: bool,
     latency_tasks: Vec<LatencyTask>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct LatencyTask {
     id: String,
     name: String,
@@ -70,16 +70,13 @@ struct LatencyResult {
     packet_loss: f64,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RemoteConfig {
-    #[serde(default)]
     report_interval: u64,
-    #[serde(default)]
     collect_interval: u64,
-    #[serde(default)]
     network_interface: String,
     auto_update: i64,
-    #[serde(default)]
     latency_tasks: Vec<LatencyTask>,
 }
 
@@ -96,8 +93,15 @@ struct GithubReleaseAsset {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReportResponse {
+    success: bool,
+    config: RemoteConfig,
+}
+
+struct SubmitResult {
     config: Option<RemoteConfig>,
+    config_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,7 +124,7 @@ struct DiskMetric {
     utilization: f64,
 }
 
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct GpuMetric {
     model: String,
     usage: f64,
@@ -155,8 +159,6 @@ struct Report {
     kernel: String,
     arch: String,
     virtualization: String,
-    ipv4: String,
-    ipv6: String,
     gpu_usage: f64,
     gpu_model: String,
     agent_version: String,
@@ -392,17 +394,6 @@ fn cpu_model() -> String {
         .unwrap_or_default()
 }
 
-#[cfg(target_os = "linux")]
-fn ip_address(family: &str) -> String {
-    command("ip", &["-o", family, "addr", "show", "scope", "global"])
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().find(|value| value.contains('/')))
-        .and_then(|value| value.split('/').next())
-        .unwrap_or("")
-        .to_string()
-}
-
 fn valid_probe_host(host: &str) -> bool {
     if host.is_empty() || host.len() > 50 || host.starts_with('.') || host.ends_with('.') {
         return false;
@@ -413,22 +404,74 @@ fn valid_probe_host(host: &str) -> bool {
             .iter()
             .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()));
     if ipv4_like {
-        return labels.iter().all(|label| label.parse::<u8>().is_ok());
+        return host
+            .parse()
+            .is_ok_and(|address| is_public_probe_ip(IpAddr::V4(address)));
+    }
+    let lower = host.to_ascii_lowercase();
+    if labels.len() < 2
+        || ["local", "localhost", "internal", "lan", "localdomain"]
+            .iter()
+            .any(|suffix| lower == *suffix || lower.ends_with(&format!(".{suffix}")))
+        || lower == "home.arpa"
+        || lower.ends_with(".home.arpa")
+    {
+        return false;
     }
     labels.iter().all(|label| {
         !label.is_empty()
-            && label.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
-            })
+            && label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
             && label
                 .chars()
                 .next()
-                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+                .is_some_and(|character| character.is_ascii_alphanumeric())
             && label
                 .chars()
                 .last()
-                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+                .is_some_and(|character| character.is_ascii_alphanumeric())
     })
+}
+
+fn is_public_probe_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [a, b, c, _] = address.octets();
+            !(a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 168)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224)
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_public_probe_ip(IpAddr::V4(mapped));
+            }
+            address.segments()[0] & 0xe000 == 0x2000
+        }
+    }
+}
+
+fn resolve_public_probe_address(host: &str, port: u16) -> Option<SocketAddr> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .ok()?
+        .filter(|address| is_public_probe_ip(address.ip()))
+        .collect::<Vec<_>>();
+    addresses
+        .iter()
+        .find(|address| address.is_ipv4())
+        .or_else(|| addresses.first())
+        .copied()
 }
 
 fn parse_probe_target(value: &str) -> Option<(String, u16)> {
@@ -466,23 +509,17 @@ fn tcp_latency_probe(target: &str) -> (f64, f64) {
     let Some((host, port)) = parse_probe_target(target) else {
         return (-1.0, 100.0);
     };
-    let Ok(addresses) = (host.as_str(), port).to_socket_addrs() else {
+    let Some(address) = resolve_public_probe_address(&host, port) else {
         return (-1.0, 100.0);
     };
-    let addresses = addresses.collect::<Vec<_>>();
-    let Some(address) = addresses
-        .iter()
-        .find(|address| address.is_ipv4())
-        .or_else(|| addresses.first())
-        .copied()
-    else {
-        return (-1.0, 100.0);
-    };
+    tcp_latency_probe_address(&address)
+}
 
+fn tcp_latency_probe_address(address: &SocketAddr) -> (f64, f64) {
     let mut latencies = Vec::with_capacity(PROBE_ATTEMPTS);
     for _ in 0..PROBE_ATTEMPTS {
         let started = Instant::now();
-        if TcpStream::connect_timeout(&address, PROBE_TIMEOUT).is_ok() {
+        if TcpStream::connect_timeout(address, PROBE_TIMEOUT).is_ok() {
             latencies.push(started.elapsed().as_secs_f64() * 1000.0);
         }
     }
@@ -511,19 +548,26 @@ fn ping_latency(output: &str) -> Option<f64> {
 
 fn icmp_latency_probe(target: &str) -> (f64, f64) {
     let host = target.trim();
-    if host.contains(':') || !valid_probe_host(host) {
+    if host.contains(':') {
         return (-1.0, 100.0);
     }
+    let Some((host, _)) = parse_probe_target(host) else {
+        return (-1.0, 100.0);
+    };
+    let Some(address) = resolve_public_probe_address(&host, 443) else {
+        return (-1.0, 100.0);
+    };
+    let destination = address.ip().to_string();
     let mut latencies = Vec::with_capacity(PROBE_ATTEMPTS);
     for _ in 0..PROBE_ATTEMPTS {
         let started = Instant::now();
         let mut ping = Command::new("ping");
         #[cfg(target_os = "linux")]
-        ping.args(["-n", "-c", "1", "-W", "1", host]);
+        ping.args(["-n", "-c", "1", "-W", "1", destination.as_str()]);
         #[cfg(target_os = "macos")]
-        ping.args(["-n", "-c", "1", "-W", "1000", host]);
+        ping.args(["-n", "-c", "1", "-W", "1000", destination.as_str()]);
         #[cfg(target_os = "windows")]
-        ping.args(["-n", "1", "-w", "1000", host]);
+        ping.args(["-n", "1", "-w", "1000", destination.as_str()]);
         let output = ping.output();
         if let Ok(output) = output {
             if output.status.success() {
@@ -609,17 +653,6 @@ fn gpu_info() -> Vec<GpuMetric> {
             })
         })
         .collect()
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn local_ip(bind: &str, destination: &str) -> String {
-    UdpSocket::bind(bind)
-        .and_then(|socket| {
-            socket.connect(destination)?;
-            socket.local_addr()
-        })
-        .map(|address| address.ip().to_string())
-        .unwrap_or_default()
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -720,8 +753,6 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
         kernel: command("uname", &["-r"]),
         arch: env::consts::ARCH.to_string(),
         virtualization: command("systemd-detect-virt", &[]),
-        ipv4: ip_address("-4"),
-        ipv6: ip_address("-6"),
         gpu_usage,
         gpu_model,
         agent_version: VERSION.to_string(),
@@ -840,8 +871,6 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
         kernel: System::kernel_version().unwrap_or_default(),
         arch: env::consts::ARCH.to_string(),
         virtualization: String::new(),
-        ipv4: local_ip("0.0.0.0:0", "1.1.1.1:80"),
-        ipv6: local_ip("[::]:0", "[2606:4700:4700::1111]:80"),
         gpu_usage,
         gpu_model,
         agent_version: VERSION.to_string(),
@@ -886,7 +915,9 @@ fn runtime_config() -> Result<RuntimeConfig> {
         return Err("SERVER_ID or AGENT_TOKEN is invalid".into());
     }
     if !valid_worker_url(&worker_url) {
-        return Err("WORKER_URL must be an http(s) URL without whitespace".into());
+        return Err(
+            "WORKER_URL must use HTTPS; HTTP is only allowed for loopback development".into(),
+        );
     }
     Ok(RuntimeConfig {
         server_id,
@@ -895,6 +926,7 @@ fn runtime_config() -> Result<RuntimeConfig> {
         report_interval: interval,
         collect_interval,
         network_interface: env::var("NETWORK_INTERFACE").unwrap_or_default(),
+        auto_update: true,
         latency_tasks: Vec::new(),
     })
 }
@@ -903,17 +935,38 @@ fn submit(
     agent: &ureq::Agent,
     config: &RuntimeConfig,
     reports: &[Report],
-) -> Result<Option<RemoteConfig>> {
+    config_hash: &str,
+) -> Result<SubmitResult> {
     let batch = ReportBatch {
         server_id: &config.server_id,
         samples: reports,
     };
-    let response = agent
+    let mut response = agent
         .post(&format!("{}/api/agent/report", config.worker_url))
-        .set("Authorization", &format!("Bearer {}", config.token))
-        .set("User-Agent", &format!("nodeflare-agent/{VERSION}"))
+        .header("Authorization", format!("Bearer {}", config.token))
+        .header("User-Agent", format!("nodeflare-agent/{VERSION}"))
+        .header("X-Agent-Config-Schema", "1")
+        .header("X-Agent-Config-Sha256", config_hash)
         .send_json(batch)?;
-    Ok(response.into_json::<ReportResponse>()?.config)
+    let next_hash = response
+        .headers()
+        .get("X-Agent-Config-Sha256")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(config_hash)
+        .to_string();
+    let remote = if response.status().as_u16() == 204 {
+        None
+    } else {
+        let payload = response.body_mut().read_json::<ReportResponse>()?;
+        if !payload.success {
+            return Err("Worker rejected the report".into());
+        }
+        Some(payload.config)
+    };
+    Ok(SubmitResult {
+        config: remote,
+        config_hash: next_hash,
+    })
 }
 
 fn apply_remote(config: &mut RuntimeConfig, remote: &RemoteConfig) -> bool {
@@ -926,6 +979,7 @@ fn apply_remote(config: &mut RuntimeConfig, remote: &RemoteConfig) -> bool {
     config
         .network_interface
         .clone_from(&remote.network_interface);
+    config.auto_update = remote.auto_update == 1;
     let tasks = sanitize_latency_tasks(&remote.latency_tasks);
     let changed = config.latency_tasks != tasks;
     config.latency_tasks = tasks;
@@ -954,15 +1008,32 @@ fn sanitize_latency_tasks(tasks: &[LatencyTask]) -> Vec<LatencyTask> {
 
 fn valid_worker_url(value: &str) -> bool {
     let value = value.trim_end_matches('/');
-    let authority = value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"))
-        .and_then(|remainder| remainder.split('/').next());
-    value.len() <= 2048
-        && authority.is_some_and(|authority| !authority.is_empty() && !authority.contains('@'))
-        && !value
-            .chars()
-            .any(|character| character.is_whitespace() || matches!(character, '?' | '#'))
+    if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(value) else {
+        return false;
+    };
+    if parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    if parsed.scheme() == "https" {
+        return true;
+    }
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 fn report_retry_delay(failures: u32, report_interval: u64) -> Duration {
@@ -1037,7 +1108,11 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn parse_checksum(contents: &str, artifact: &str) -> Option<String> {
@@ -1058,6 +1133,7 @@ fn release_checksum(agent: &ureq::Agent, url: &str, artifact: &str) -> Result<St
     agent
         .get(url)
         .call()?
+        .into_body()
         .into_reader()
         .take(1024 * 1024)
         .read_to_string(&mut contents)?;
@@ -1075,7 +1151,7 @@ fn download_agent(
     let Ok(response) = agent.get(url).call() else {
         return Ok(false);
     };
-    let response = response.into_reader();
+    let response = response.into_body().into_reader();
     let mut file = fs::File::create(destination)?;
     let copied = io::copy(&mut response.take(MAX_AGENT_BINARY_BYTES + 1), &mut file)?;
     file.flush()?;
@@ -1105,12 +1181,12 @@ fn download_agent(
 }
 
 fn update(agent: &ureq::Agent) -> Result<bool> {
-    let release = agent
+    let mut response = agent
         .get(LATEST_RELEASE_API)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", &format!("nodeflare-agent/{VERSION}"))
-        .call()?
-        .into_json::<GithubRelease>()?;
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", format!("nodeflare-agent/{VERSION}"))
+        .call()?;
+    let release = response.body_mut().read_json::<GithubRelease>()?;
     let Some(remote_version) = version_triplet(&release.tag_name) else {
         return Ok(false);
     };
@@ -1199,9 +1275,10 @@ fn update(agent: &ureq::Agent) -> Result<bool> {
 
 fn run(once: bool, print_only: bool) -> Result<()> {
     let mut config = runtime_config()?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(20))
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .build()
+        .into();
     let mut next_report = Instant::now();
     let mut next_collect = Instant::now();
     let mut next_latency: HashMap<String, Instant> = HashMap::new();
@@ -1209,6 +1286,7 @@ fn run(once: bool, print_only: bool) -> Result<()> {
     let mut pending_samples = Vec::new();
     let mut report_failures = 0_u32;
     let mut next_update_check = Instant::now();
+    let mut config_hash = String::new();
     loop {
         let current = Instant::now();
         let due = config
@@ -1252,25 +1330,26 @@ fn run(once: bool, print_only: bool) -> Result<()> {
         }
 
         if Instant::now() >= next_report && !pending_samples.is_empty() {
-            match submit(&agent, &config, &pending_samples) {
-                Ok(remote) => {
+            match submit(&agent, &config, &pending_samples, &config_hash) {
+                Ok(result) => {
                     pending_samples.clear();
                     report_failures = 0;
-                    if let Some(remote) = remote {
-                        if !once && remote.auto_update == 1 && Instant::now() >= next_update_check {
-                            match update(&agent) {
-                                Ok(true) => return Ok(()),
-                                Ok(false) => {
-                                    next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
-                                }
-                                Err(error) => {
-                                    eprintln!("agent update failed: {error}");
-                                    next_update_check = Instant::now() + UPDATE_RETRY_INTERVAL;
-                                }
-                            }
-                        }
+                    config_hash = result.config_hash;
+                    if let Some(remote) = result.config {
                         if apply_remote(&mut config, &remote) {
                             next_latency.clear();
+                        }
+                    }
+                    if !once && config.auto_update && Instant::now() >= next_update_check {
+                        match update(&agent) {
+                            Ok(true) => return Ok(()),
+                            Ok(false) => {
+                                next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
+                            }
+                            Err(error) => {
+                                eprintln!("agent update failed: {error}");
+                                next_update_check = Instant::now() + UPDATE_RETRY_INTERVAL;
+                            }
                         }
                     }
                 }
@@ -1329,10 +1408,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_artifact_name, executable_format_valid, median, normalized_version, parse_checksum,
-        parse_probe_target, ping_latency, prune_report_samples, report_retry_delay,
-        sanitize_latency_tasks, selected_interface, tcp_latency_probe, valid_worker_url,
-        version_triplet, LatencyTask, Report, MAX_LATENCY_TASKS, PROBE_ATTEMPTS,
+        agent_artifact_name, executable_format_valid, is_public_probe_ip, median,
+        normalized_version, parse_checksum, parse_probe_target, ping_latency, prune_report_samples,
+        report_retry_delay, sanitize_latency_tasks, selected_interface, tcp_latency_probe_address,
+        valid_worker_url, version_triplet, LatencyTask, Report, MAX_LATENCY_TASKS, PROBE_ATTEMPTS,
     };
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1380,6 +1459,10 @@ mod tests {
     fn validates_worker_urls() {
         assert!(valid_worker_url("https://monitor.example.com/"));
         assert!(valid_worker_url("http://127.0.0.1:8787"));
+        assert!(valid_worker_url("http://localhost:8787"));
+        assert!(valid_worker_url("http://[::1]:8787"));
+        assert!(!valid_worker_url("http://monitor.example.com"));
+        assert!(!valid_worker_url("http://127.0.0.2:8787"));
         assert!(!valid_worker_url("monitor.example.com"));
         assert!(!valid_worker_url("https://"));
         assert!(!valid_worker_url("https://user@example.com"));
@@ -1475,8 +1558,8 @@ mod tests {
             Some(("example.com".to_string(), 443))
         );
         assert_eq!(
-            parse_probe_target("127.0.0.1:8080"),
-            Some(("127.0.0.1".to_string(), 8080))
+            parse_probe_target("1.1.1.1:8080"),
+            Some(("1.1.1.1".to_string(), 8080))
         );
         for target in [
             "",
@@ -1484,10 +1567,38 @@ mod tests {
             "example.com:0",
             "example.com:65536",
             "999.1.1.1",
+            "127.0.0.1:8080",
+            "169.254.169.254",
+            "192.168.1.1",
+            "router.local",
+            "localhost",
             "[::1]:443",
             "bad host",
         ] {
             assert_eq!(parse_probe_target(target), None, "target: {target}");
+        }
+    }
+
+    #[test]
+    fn accepts_only_public_probe_addresses() {
+        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(is_public_probe_ip(address.parse().expect("IP address")));
+        }
+        for address in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "::1",
+            "fe80::1",
+            "fd00:ec2::254",
+        ] {
+            assert!(!is_public_probe_ip(address.parse().expect("IP address")));
         }
     }
 
@@ -1506,11 +1617,10 @@ mod tests {
                 listener.accept().expect("accept probe connection");
             }
         });
-        let (latency, loss) = tcp_latency_probe(&address.to_string());
+        let (latency, loss) = tcp_latency_probe_address(&address);
         accepter.join().expect("join listener");
         assert!(latency >= 0.0);
         assert_eq!(loss, 0.0);
-        assert_eq!(tcp_latency_probe(""), (-1.0, -1.0));
     }
 
     #[test]
