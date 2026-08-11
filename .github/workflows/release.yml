@@ -173,16 +173,8 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-      - name: Stage installer scripts
-        shell: bash
-        run: |
-          mkdir -p release-package
-          cp release-assets/* release-package/
-          cp agent/agent.sh release-package/install-agent.sh
-          cp agent/install.ps1 release-package/install-agent.ps1
-          cp agent/install-macos.sh release-package/install-agent-macos.sh
-          (cd release-package && sha256sum * > SHA256SUMS)
       - uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
         with:
           body_path: CHANGELOG.md
-          files: release-package/**
+          files: release-assets/*
+          fail_on_unmatched_files: true

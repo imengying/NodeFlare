@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SERVICE_NAME="nodeflare-agent"
+SERVICE_NAME="nodeflare"
 INSTALL_DIR="/opt/nodeflare"
 AGENT_FILE="$INSTALL_DIR/agent"
 CONFIG_FILE="$INSTALL_DIR/agent.env"
@@ -53,12 +53,34 @@ install_agent() {
   temporary="$INSTALL_DIR/.agent.$$.download"
   trap 'rm -f "$temporary"' EXIT HUP INT TERM
   artifact="agent-linux-$arch"
+  release_api="https://api.github.com/repos/imengying/NodeFlare/releases/latest"
+  release_json=$(curl --fail --location --silent --show-error --max-time 30 \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'User-Agent: nodeflare-installer' \
+    "$release_api")
+  expected=$(printf '%s\n' "$release_json" | tr '{' '\n' | awk -v name="$artifact" '
+    {
+      compact = $0
+      gsub(/[[:space:]]/, "", compact)
+      if (index(compact, "\"name\":\"" name "\"") > 0) selected = 1
+      else if (index(compact, "\"name\":") > 0) selected = 0
+    }
+    selected {
+      marker = "\"digest\":\"sha256:"
+      position = index(compact, marker)
+      if (position == 0) next
+      digest = substr(compact, position + length(marker), 64)
+      if (length(digest) == 64 && digest !~ /[^0-9a-fA-F]/) {
+        print tolower(digest)
+        exit
+      }
+    }
+  ')
+  [ -n "$expected" ] || { echo "GitHub release does not contain a SHA-256 digest for $artifact" >&2; exit 1; }
   release_base="https://github.com/imengying/NodeFlare/releases/latest/download"
   curl --fail --location --silent --show-error --max-time 120 \
     "$release_base/$artifact" \
     -o "$temporary"
-  checksums=$(curl --fail --location --silent --show-error --max-time 30 "$release_base/SHA256SUMS")
-  expected=$(printf '%s\n' "$checksums" | awk -v name="$artifact" '$2 == name { print $1; exit }')
   actual=$(sha256sum "$temporary" | awk '{ print $1 }')
   [ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo "Agent checksum verification failed" >&2; exit 1; }
   chmod 755 "$temporary"

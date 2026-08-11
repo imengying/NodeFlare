@@ -90,6 +90,7 @@ struct GithubRelease {
 struct GithubReleaseAsset {
     name: String,
     browser_download_url: String,
+    digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1115,30 +1116,13 @@ fn sha256_file(path: &Path) -> Result<String> {
         .collect())
 }
 
-fn parse_checksum(contents: &str, artifact: &str) -> Option<String> {
-    contents.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        let hash = fields.next()?;
-        let name = fields.next()?.trim_start_matches('*');
-        (name == artifact
-            && fields.next().is_none()
-            && hash.len() == 64
-            && hash.chars().all(|character| character.is_ascii_hexdigit()))
-        .then(|| hash.to_ascii_lowercase())
-    })
-}
-
-fn release_checksum(agent: &ureq::Agent, url: &str, artifact: &str) -> Result<String> {
-    let mut contents = String::new();
-    agent
-        .get(url)
-        .call()?
-        .into_body()
-        .into_reader()
-        .take(1024 * 1024)
-        .read_to_string(&mut contents)?;
-    parse_checksum(&contents, artifact)
-        .ok_or_else(|| format!("SHA256SUMS does not contain a valid entry for {artifact}").into())
+fn release_asset_sha256(asset: &GithubReleaseAsset) -> Option<String> {
+    let digest = asset.digest.as_deref()?.strip_prefix("sha256:")?;
+    (digest.len() == 64
+        && digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()))
+    .then(|| digest.to_ascii_lowercase())
 }
 
 fn download_agent(
@@ -1209,26 +1193,17 @@ fn update(agent: &ureq::Agent) -> Result<bool> {
             ""
         }
     ));
-    let Some(download_url) = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == artifact)
-        .map(|asset| asset.browser_download_url.as_str())
-    else {
+    let Some(release_asset) = release.assets.iter().find(|asset| asset.name == artifact) else {
         return Err(format!("latest release does not contain {artifact}").into());
     };
-    let Some(checksum_url) = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == "SHA256SUMS")
-        .map(|asset| asset.browser_download_url.as_str())
-    else {
-        return Err("latest release does not contain SHA256SUMS".into());
+    let Some(expected_sha256) = release_asset_sha256(release_asset) else {
+        return Err(
+            format!("latest release does not contain a SHA-256 digest for {artifact}").into(),
+        );
     };
-    let expected_sha256 = release_checksum(agent, checksum_url, artifact)?;
     if !download_agent(
         agent,
-        download_url,
+        &release_asset.browser_download_url,
         &temporary,
         &release.tag_name,
         &expected_sha256,
@@ -1409,9 +1384,10 @@ mod tests {
 
     use super::{
         agent_artifact_name, executable_format_valid, is_public_probe_ip, median,
-        normalized_version, parse_checksum, parse_probe_target, ping_latency, prune_report_samples,
-        report_retry_delay, sanitize_latency_tasks, selected_interface, tcp_latency_probe_address,
-        valid_worker_url, version_triplet, LatencyTask, Report, MAX_LATENCY_TASKS, PROBE_ATTEMPTS,
+        normalized_version, parse_probe_target, ping_latency, prune_report_samples,
+        release_asset_sha256, report_retry_delay, sanitize_latency_tasks, selected_interface,
+        tcp_latency_probe_address, valid_worker_url, version_triplet, GithubReleaseAsset,
+        LatencyTask, Report, MAX_LATENCY_TASKS, PROBE_ATTEMPTS,
     };
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1445,14 +1421,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_release_checksums() {
-        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let checksums = format!("{hash}  agent-linux-x86_64\ninvalid  other\n");
+    fn validates_release_asset_digests() {
+        let hash = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        let mut asset = GithubReleaseAsset {
+            name: "agent-linux-x86_64".to_string(),
+            browser_download_url: "https://example.com/agent".to_string(),
+            digest: Some(format!("sha256:{hash}")),
+        };
+        let expected = hash.to_ascii_lowercase();
         assert_eq!(
-            parse_checksum(&checksums, "agent-linux-x86_64").as_deref(),
-            Some(hash)
+            release_asset_sha256(&asset).as_deref(),
+            Some(expected.as_str())
         );
-        assert_eq!(parse_checksum(&checksums, "other"), None);
+        asset.digest = Some("sha512:0123".to_string());
+        assert_eq!(release_asset_sha256(&asset), None);
+        asset.digest = None;
+        assert_eq!(release_asset_sha256(&asset), None);
     }
 
     #[test]

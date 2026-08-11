@@ -432,22 +432,22 @@ export function AdminPanel({
 
   const commands = useMemo(() => install.map((server) => {
     const origin = window.location.origin;
-    const release = "https://github.com/imengying/NodeFlare/releases/latest/download";
+    const installer = "https://raw.githubusercontent.com/imengying/NodeFlare/main/agent";
     if (installPlatform === "windows") {
       return {
         ...server,
-        command: `Invoke-WebRequest -Uri "${release}/install-agent.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" install -ServerId ${powershellLiteral(server.id)} -Token ${powershellLiteral(server.agent_token)} -Url ${powershellLiteral(origin)}`,
+        command: `Invoke-WebRequest -Uri "${installer}/install.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" install -ServerId ${powershellLiteral(server.id)} -Token ${powershellLiteral(server.agent_token)} -Url ${powershellLiteral(origin)}`,
       };
     }
     if (installPlatform === "macos") {
       return {
         ...server,
-        command: `curl -fsSL ${release}/install-agent-macos.sh | sudo sh -s -- install --server-id ${shellLiteral(server.id)} --token ${shellLiteral(server.agent_token)} --url ${shellLiteral(origin)}`,
+        command: `curl -fsSL ${installer}/install-macos.sh | sudo sh -s -- install --server-id ${shellLiteral(server.id)} --token ${shellLiteral(server.agent_token)} --url ${shellLiteral(origin)}`,
       };
     }
     return {
       ...server,
-      command: `curl -fsSL ${release}/install-agent.sh | sudo sh -s -- install --server-id ${shellLiteral(server.id)} --token ${shellLiteral(server.agent_token)} --url ${shellLiteral(origin)}`,
+      command: `curl -fsSL ${installer}/agent.sh | sudo sh -s -- install --server-id ${shellLiteral(server.id)} --token ${shellLiteral(server.agent_token)} --url ${shellLiteral(origin)}`,
     };
   }), [install, installPlatform]);
 

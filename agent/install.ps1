@@ -74,17 +74,17 @@ $CollectInterval = [Math]::Min($CollectInterval, $Interval)
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 & icacls.exe $InstallDir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' | Out-Null
 $Temporary = "$AgentFile.$PID.download.exe"
-$ReleaseBase = "https://github.com/imengying/NodeFlare/releases/latest/download"
+$ReleaseApi = "https://api.github.com/repos/imengying/NodeFlare/releases/latest"
 $Artifact = "agent-windows-x86_64.exe"
-$ReleaseDownload = "$ReleaseBase/$Artifact"
 try {
-  Invoke-WebRequest -Uri $ReleaseDownload -OutFile $Temporary -TimeoutSec 120
-  $Checksums = (Invoke-WebRequest -Uri "$ReleaseBase/SHA256SUMS" -TimeoutSec 30).Content
-  $ChecksumMatch = [regex]::Match($Checksums, "(?m)^([0-9a-fA-F]{64})\s+\*?agent-windows-x86_64\.exe\s*$")
-  if (-not $ChecksumMatch.Success) {
-    throw "SHA256SUMS does not contain $Artifact"
+  $Release = Invoke-RestMethod -Uri $ReleaseApi -Headers @{ Accept = "application/vnd.github+json"; "User-Agent" = "nodeflare-installer" } -TimeoutSec 30
+  $ReleaseAsset = $Release.assets | Where-Object { $_.name -eq $Artifact } | Select-Object -First 1
+  $DigestMatch = [regex]::Match([string]$ReleaseAsset.digest, '^sha256:([0-9a-fA-F]{64})$')
+  if ($null -eq $ReleaseAsset -or -not $DigestMatch.Success) {
+    throw "GitHub release does not contain a SHA-256 digest for $Artifact"
   }
-  $ExpectedChecksum = $ChecksumMatch.Groups[1].Value
+  $ExpectedChecksum = $DigestMatch.Groups[1].Value
+  Invoke-WebRequest -Uri $ReleaseAsset.browser_download_url -OutFile $Temporary -TimeoutSec 120
   $ActualChecksum = (Get-FileHash -LiteralPath $Temporary -Algorithm SHA256).Hash
   if ($ActualChecksum -ne $ExpectedChecksum) {
     throw "Agent checksum verification failed"
