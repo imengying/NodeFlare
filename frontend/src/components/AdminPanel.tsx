@@ -19,17 +19,15 @@ import {
   RotateCw,
   Save,
   ServerCog,
-  Settings2,
   ShieldCheck,
   SlidersHorizontal,
   Sun,
   Trash2,
-  Undo2,
 } from "lucide-react";
 import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError, getToken, setToken } from "../api";
 import { formatBytes, isOnline } from "../format";
-import { ASSET_CURRENCIES, type AgentInstallTarget, type CloudflareUsage, type Config, type DatabaseStats, type ExchangeRates, type FederationSite, type Server, type ServerInput, type Settings, type ThirdPartyTheme, type ThemeSettingField, type ThemeSettingsSchema, type ThemeSettingValue, type ThemeStore } from "../types";
+import { ASSET_CURRENCIES, type AgentInstallTarget, type CloudflareUsage, type Config, type DatabaseStats, type ExchangeRates, type Server, type ServerInput, type Settings, type ThemeSettingField, type ThemeSettingsSchema, type ThemeSettingValue } from "../types";
 import { Checkbox } from "./Checkbox";
 import { TurnstileWidget } from "./TurnstileWidget";
 import { LatencyManager } from "./LatencyManager";
@@ -42,7 +40,7 @@ const adminPages: Record<AdminTab, { title: string; description: string }> = {
   servers: { title: "服务器", description: "管理监控节点、Agent 密钥和运行参数" },
   latency: { title: "延迟监测", description: "配置分配给各服务器的 TCP 与 ICMP 延迟任务" },
   appearance: { title: "站点设置", description: "调整站点信息、公开内容和前台显示项目" },
-  themes: { title: "主题管理", description: "选择内置或第三方前端主题" },
+  themes: { title: "主题管理", description: "管理内置前端主题和公开访问" },
   themeSettings: { title: "主题设置", description: "调整当前前端主题提供的显示选项" },
   alerts: { title: "通知", description: "配置 Telegram 通知和资源告警阈值" },
   security: { title: "登录与安全", description: "管理管理员账号和 Cloudflare Turnstile 防护" },
@@ -60,7 +58,7 @@ const emptyServer: ServerInput = {
   expires_at: null,
   traffic_limit: 0,
   traffic_limit_type: "sum",
-  price: -2,
+  price: 0,
   billing_cycle: 30,
   currency: "CNY",
   auto_renewal: false,
@@ -72,7 +70,7 @@ const emptyServer: ServerInput = {
   rx_correction: 0,
   tx_correction: 0,
   offline_notify_disabled: false,
-  auto_update: false,
+  auto_update: true,
 };
 
 function toInput(server: Server): ServerInput {
@@ -119,18 +117,6 @@ function powershellLiteral(value: string) {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-function federationText(sites: FederationSite[]) {
-  return sites.map((site) => `${site.name}|${site.url}`).join("\n");
-}
-
-function parseFederationSites(value: string): FederationSite[] {
-  return value.split("\n").map((line) => line.trim()).filter(Boolean).flatMap((line) => {
-    const separator = line.indexOf("|");
-    if (separator < 1) return [];
-    return [{ name: line.slice(0, separator).trim(), url: line.slice(separator + 1).trim() }];
-  });
-}
-
 export function AdminPanel({
   config,
   dark,
@@ -160,10 +146,7 @@ export function AdminPanel({
   const [database, setDatabase] = useState<DatabaseStats | null>(null);
   const [cloudflareUsage, setCloudflareUsage] = useState<CloudflareUsage | null>(null);
   const [exchangeRates, setExchangeRates] = useState<ExchangeRates | null>(null);
-  const [themeStore, setThemeStore] = useState<ThemeStore | null>(null);
   const [themeSettingsSchema, setThemeSettingsSchema] = useState<ThemeSettingsSchema | null>(null);
-  const [themeVersions, setThemeVersions] = useState<Record<string, string>>({});
-  const [customThemeUrl, setCustomThemeUrl] = useState("");
   const [editing, setEditing] = useState<Server | "new" | null>(null);
   const [form, setForm] = useState<ServerInput>(emptyServer);
   const [install, setInstall] = useState<AgentInstallTarget[]>([]);
@@ -184,9 +167,6 @@ export function AdminPanel({
         cloudflare_api_token: settingsResult.cloudflare_api_token || "",
         favicon_url: settingsResult.favicon_url || "",
         locale: settingsResult.locale || "zh-CN",
-        federation_sites: settingsResult.federation_sites || [],
-        cors_allowed_origins: settingsResult.cors_allowed_origins || "",
-        csp_asset_origins: settingsResult.csp_asset_origins || "",
       });
       setAuthenticated(true);
     } catch (reason) {
@@ -363,58 +343,10 @@ export function AdminPanel({
     finally { setBusy(false); }
   }
 
-  async function loadThemes() {
-    if (themeStore) return;
-    setBusy(true); setError("");
-    try {
-      const result = await api.themes();
-      const themes = Array.isArray(result.themes) ? result.themes : [];
-      setThemeStore({ ...result, themes });
-      setThemeVersions(Object.fromEntries(themes.flatMap((theme) => {
-        const version = theme.versions?.[0];
-        const reference = theme.branch || version?.commitid || version?.commitId || version?.theme_url || "";
-        return reference ? [[theme.id, reference]] : [];
-      })));
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "读取主题商店失败"); }
-    finally { setBusy(false); }
-  }
-
   async function loadThemeSettings() {
     setBusy(true); setError("");
     try { setThemeSettingsSchema(await api.themeSettings()); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "读取主题设置失败"); }
-    finally { setBusy(false); }
-  }
-
-  function themeUrl(theme: ThirdPartyTheme) {
-    const selected = themeVersions[theme.id];
-    if (selected?.startsWith("https://github.com/")) return selected;
-    const first = theme.versions?.[0];
-    const reference = selected || first?.commitid || first?.commitId || theme.branch;
-    return reference ? `${theme.url.replace(/\/$/, "")}/tree/${reference}` : first?.theme_url || "";
-  }
-
-  async function previewTheme(themeUrl: string) {
-    if (!themeUrl.trim()) return;
-    setBusy(true); setError(""); setNotice("");
-    try {
-      const result = await api.previewTheme(themeUrl.trim());
-      const query = new URLSearchParams({ theme_url: result.theme_url, theme_proof: result.proof });
-      window.open(`${window.location.origin}/?${query}`, "_blank", "noopener,noreferrer");
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "主题预览失败"); }
-    finally { setBusy(false); }
-  }
-
-  async function applyTheme(themeUrl: string) {
-    setBusy(true); setError(""); setNotice("");
-    try {
-      const result = await api.saveSettings({ theme_url: themeUrl.trim(), theme_options: {} });
-      if (result.token) setToken(result.token);
-      setSettings(result.settings);
-      setThemeSettingsSchema(null);
-      setNotice(themeUrl ? "第三方主题已应用" : "已恢复内置主题");
-      onChanged();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "应用主题失败"); }
     finally { setBusy(false); }
   }
 
@@ -432,21 +364,22 @@ export function AdminPanel({
 
   const commands = useMemo(() => install.map((server) => {
     const origin = window.location.origin;
+    const release = "https://github.com/imengying/NodeFlare/releases/latest/download";
     if (installPlatform === "windows") {
       return {
         ...server,
-        command: `Invoke-WebRequest -Uri "${origin}/agent.ps1" -OutFile "$env:TEMP\\cf-monitor-install.ps1"\n& "$env:TEMP\\cf-monitor-install.ps1" install -ServerId ${powershellLiteral(server.id)} -Token ${powershellLiteral(server.agent_token)} -Url ${powershellLiteral(origin)}`,
+        command: `Invoke-WebRequest -Uri "${release}/install-agent.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" install -ServerId ${powershellLiteral(server.id)} -Token ${powershellLiteral(server.agent_token)} -Url ${powershellLiteral(origin)}`,
       };
     }
     if (installPlatform === "macos") {
       return {
         ...server,
-        command: `curl -fsSL ${origin}/agent-macos.sh | sudo sh -s -- install --server-id ${shellLiteral(server.id)} --token ${shellLiteral(server.agent_token)} --url ${shellLiteral(origin)}`,
+        command: `curl -fsSL ${release}/install-agent-macos.sh | sudo sh -s -- install --server-id ${shellLiteral(server.id)} --token ${shellLiteral(server.agent_token)} --url ${shellLiteral(origin)}`,
       };
     }
     return {
       ...server,
-      command: `curl -fsSL ${origin}/agent.sh | sudo bash -s -- install --server-id ${server.id} --token ${server.agent_token} --url ${origin}`,
+      command: `curl -fsSL ${release}/install-agent.sh | sudo sh -s -- install --server-id ${shellLiteral(server.id)} --token ${shellLiteral(server.agent_token)} --url ${shellLiteral(origin)}`,
     };
   }), [install, installPlatform]);
 
@@ -498,7 +431,7 @@ export function AdminPanel({
                 <button className={tab === "servers" ? "active" : ""} onClick={() => selectTab("servers")}><ServerCog size={19} />服务器</button>
                 <button className={tab === "latency" ? "active" : ""} onClick={() => selectTab("latency")}><RadioTower size={19} />延迟监测</button>
                 <button className={tab === "appearance" ? "active" : ""} onClick={() => selectTab("appearance")}><Eye size={19} />站点设置</button>
-                <button className={tab === "themes" ? "active" : ""} onClick={() => { selectTab("themes"); void loadThemes(); }}><Palette size={19} />主题管理</button>
+                <button className={tab === "themes" ? "active" : ""} onClick={() => selectTab("themes")}><Palette size={19} />主题管理</button>
                 <button className={tab === "themeSettings" ? "active" : ""} onClick={() => { selectTab("themeSettings"); void loadThemeSettings(); }}><SlidersHorizontal size={19} />主题设置</button>
                 <button className={tab === "alerts" ? "active" : ""} onClick={() => selectTab("alerts")}><AlertTriangle size={19} />通知</button>
                 <button className={tab === "security" ? "active" : ""} onClick={() => selectTab("security")}><ShieldCheck size={19} />登录与安全</button>
@@ -530,25 +463,14 @@ export function AdminPanel({
               ) : tab === "latency" ? (
                 <LatencyManager servers={servers} onError={setError} onNotice={setNotice} />
               ) : tab === "themes" && settings ? (
-                <div className="admin-section theme-section">
-                  <div className="section-head"><div><h3>第三方主题</h3><span>{settings.theme_url ? "已启用" : "当前使用内置主题"}</span></div>{settings.theme_url ? <button className="secondary-btn compact" disabled={busy} onClick={() => void applyTheme("")}><Undo2 size={14} />恢复内置</button> : null}</div>
-                  <div className="theme-grid">
-                    {themeStore?.themes.map((theme) => {
-                      const url = themeUrl(theme);
-                      const description = typeof theme.description === "string" ? theme.description : theme.description?.["zh-CN"] || theme.description?.en || "";
-                      return <article className={`theme-card ${settings.theme_url === url ? "active" : ""}`} key={theme.id}>
-                        <img src={theme.cover} alt={`${theme.title} 预览`} loading="lazy" />
-                        <div className="theme-card-body"><div className="theme-card-title"><div><strong>{theme.title}</strong><span>{theme.author || "第三方作者"}</span></div>{settings.theme_url === url ? <b>使用中</b> : null}</div><p>{description}</p>
-                          {theme.versions?.length ? <label><span>版本</span><select value={themeVersions[theme.id] || theme.branch || theme.versions[0].commitid || theme.versions[0].commitId || theme.versions[0].theme_url || ""} onChange={(event) => setThemeVersions((current) => ({ ...current, [theme.id]: event.target.value }))}>{theme.branch ? <option value={theme.branch}>最新 · {theme.branch}</option> : null}{theme.versions.map((version) => { const value = version.commitid || version.commitId || version.theme_url || ""; return <option value={value} key={value}>{version.version || version.short_version || value.slice(0, 7)}{version.releaseDate ? ` · ${version.releaseDate}` : ""}</option>; })}</select></label> : <span className="theme-branch">{theme.branch || "main"}</span>}
-                          <div className="theme-actions"><button className="secondary-btn compact" disabled={busy || !url} onClick={() => void previewTheme(url)}><Eye size={14} />预览</button><button className="primary-btn compact" disabled={busy || !url || settings.theme_url === url} onClick={() => void applyTheme(url)}><Palette size={14} />应用</button></div>
-                        </div>
-                      </article>;
-                    })}
-                    {themeStore && !themeStore.themes.length ? <div className="theme-empty">主题商店暂时不可用</div> : null}
-                    {!themeStore ? <div className="theme-empty">正在读取主题商店</div> : null}
-                  </div>
-                  <div className="custom-theme"><div className="section-title"><Settings2 size={15} />自定义主题</div><div className="custom-theme-controls"><input type="url" value={customThemeUrl} onChange={(event) => setCustomThemeUrl(event.target.value)} placeholder="https://github.com/owner/repo/tree/build" /><button className="secondary-btn" disabled={busy || !customThemeUrl.trim()} onClick={() => void previewTheme(customThemeUrl)}><Eye size={15} />预览</button><button className="primary-btn" disabled={busy || !customThemeUrl.trim()} onClick={() => void applyTheme(customThemeUrl)}><Palette size={15} />应用</button></div></div>
-                </div>
+                <form className="settings-form" onSubmit={saveSite}>
+                  <div className="section-title"><Palette size={15} />内置主题</div>
+                  <div className="builtin-theme-row"><div><strong>Komari Glass</strong><span>内置前端主题</span></div><b>使用中</b></div>
+                  <div className="section-subtitle">公开访问</div>
+                  <Toggle label="公开仪表盘" checked={settings.public_dashboard} onChange={(value) => updateSettings("public_dashboard", value)} />
+                  <p className="settings-hint">关闭后，未登录访客无法读取节点和历史数据。</p>
+                  <div className="form-actions"><button className="primary-btn" disabled={busy}><Save size={16} />保存主题管理设置</button></div>
+                </form>
               ) : settings ? (
                 <form className="settings-form" onSubmit={saveSite}>
                   {tab === "appearance" ? <>
@@ -557,9 +479,6 @@ export function AdminPanel({
                     <label><span>站点公告</span><textarea rows={3} maxLength={1000} value={settings.site_announcement} onChange={(event) => updateSettings("site_announcement", event.target.value)} /></label>
                     <div className="form-grid"><label><span>界面语言</span><select value={settings.locale} onChange={(event) => updateSettings("locale", event.target.value as Settings["locale"])}><option value="zh-CN">简体中文</option><option value="en">English</option></select></label><label><span>站点图标地址</span><input type="url" value={settings.favicon_url} onChange={(event) => updateSettings("favicon_url", event.target.value)} placeholder="https://example.com/favicon.png" /></label></div>
                     <div className="form-grid"><label><span>离线判定（秒）</span><input type="number" min="30" max="3600" value={settings.offline_threshold_seconds} onChange={(event) => updateSettings("offline_threshold_seconds", Number(event.target.value))} /></label><label><span>历史保留（天）</span><input type="number" min="1" max="365" value={settings.history_retention_days} onChange={(event) => updateSettings("history_retention_days", Number(event.target.value))} /></label></div>
-                    <label><span>聚合站点</span><textarea rows={4} value={federationText(settings.federation_sites)} onChange={(event) => updateSettings("federation_sites", parseFederationSites(event.target.value))} placeholder={'香港站|https://hk.example.com\n欧洲站|https://eu.example.com'} /></label>
-                    <p className="settings-hint">每行“名称|HTTPS 地址”。远端站点需在 CORS 允许来源中加入本站地址。</p>
-                    <div className="settings-toggles"><Toggle label="公开仪表盘" checked={settings.public_dashboard} onChange={(value) => updateSettings("public_dashboard", value)} /></div>
                   </> : null}
 
                   {tab === "themeSettings" ? <>
@@ -586,10 +505,7 @@ export function AdminPanel({
                     <div className="security-note">当前密码状态：{settings.admin_password_configured ? "已使用 D1 加盐哈希" : "使用 ADMIN_PASSWORD 初始化密钥"}</div>
                     <div className="form-grid"><Toggle label="保护公开仪表盘" checked={settings.turnstile_enabled} onChange={(value) => updateSettings("turnstile_enabled", value)} /><Toggle label="保护管理员登录" checked={settings.turnstile_login_enabled} onChange={(value) => updateSettings("turnstile_login_enabled", value)} /></div>
                     <div className="form-grid"><label><span>Turnstile Site Key</span><input value={settings.turnstile_site_key} onChange={(event) => updateSettings("turnstile_site_key", event.target.value)} /></label><label><span>Turnstile Secret Key</span><input type="password" value={settings.turnstile_secret_key} onChange={(event) => updateSettings("turnstile_secret_key", event.target.value)} /></label></div>
-                    <div className="section-subtitle">跨域与第三方主题</div>
-                    <label><span>CORS 允许来源</span><textarea rows={3} value={settings.cors_allowed_origins} onChange={(event) => updateSettings("cors_allowed_origins", event.target.value)} placeholder="https://dashboard.example.com" /></label>
-                    <label><span>CSP 外部资源来源</span><textarea rows={3} value={settings.csp_asset_origins} onChange={(event) => updateSettings("csp_asset_origins", event.target.value)} placeholder="https://cdn.example.com" /></label>
-                    <p className="settings-hint">每行一个完整 Origin，不要填写路径。WebSocket 会使用相同的 CORS 来源列表校验。</p>
+                    <p className="settings-hint">留空时读取 Worker 的 TURNSTILE_SITE_KEY 和 TURNSTILE_SECRET_KEY，后台配置优先。</p>
                   </> : null}
 
                   {tab === "data" ? <>
@@ -620,7 +536,7 @@ export function AdminPanel({
         <header><div><span className="eyebrow">节点配置</span><h3>{editing === "new" ? "添加节点" : `编辑 · ${editing.name}`}</h3></div></header>
         <div className="form-grid"><label><span>名称</span><input autoFocus required value={form.name} onChange={(event) => updateForm("name", event.target.value)} /></label><label><span>地区代码</span><input maxLength={16} placeholder="CN / JP / DE" value={form.region} onChange={(event) => updateForm("region", event.target.value.toUpperCase())} /></label><label><span>分组</span><input value={form.group_name} onChange={(event) => updateForm("group_name", event.target.value)} /></label><label><span>标签</span><input placeholder="主力, 线路:BGP" value={form.tags} onChange={(event) => updateForm("tags", event.target.value)} /></label></div>
         <div className="form-grid three"><label><span>流量限额（GB）</span><input min="0" type="number" value={Math.round(form.traffic_limit / 1024 ** 3)} onChange={(event) => updateForm("traffic_limit", Number(event.target.value) * 1024 ** 3)} /></label><label><span>流量口径</span><select value={form.traffic_limit_type} onChange={(event) => updateForm("traffic_limit_type", event.target.value as ServerInput["traffic_limit_type"])}><option value="sum">上下行合计</option><option value="max">取较大值</option><option value="min">取较小值</option><option value="up">仅上行</option><option value="down">仅下行</option></select></label><label><span>流量重置日</span><input min="1" max="31" type="number" value={form.reset_day} onChange={(event) => updateForm("reset_day", Number(event.target.value))} /></label></div>
-        <div className="form-grid three"><label><span>价格</span><input min="-2" step="0.01" type="number" value={form.price} onChange={(event) => updateForm("price", Number(event.target.value))} /></label><label><span>币种</span><select value={form.currency} onChange={(event) => updateForm("currency", event.target.value)}>{ASSET_CURRENCIES.map((code) => <option key={code}>{code}</option>)}</select></label><label><span>计费周期（天）</span><input min="1" max="3650" type="number" value={form.billing_cycle} onChange={(event) => updateForm("billing_cycle", Number(event.target.value))} /></label></div>
+        <div className="form-grid three"><label><span>价格（0 隐藏，-1 免费）</span><input min="-1" step="0.01" type="number" value={form.price} onChange={(event) => updateForm("price", Number(event.target.value))} /></label><label><span>币种</span><select value={form.currency} onChange={(event) => updateForm("currency", event.target.value)}>{ASSET_CURRENCIES.map((code) => <option key={code}>{code}</option>)}</select></label><label><span>计费周期（天）</span><input min="1" max="3650" type="number" value={form.billing_cycle} onChange={(event) => updateForm("billing_cycle", Number(event.target.value))} /></label></div>
         <div className="form-grid three"><label><span>到期日期</span><input type="date" value={formatDate(form.expires_at)} onChange={(event) => updateForm("expires_at", event.target.value ? Math.floor(new Date(`${event.target.value}T00:00:00Z`).getTime() / 1000) : null)} /></label><label><span>Agent 上报间隔（秒）</span><input min="15" max="3600" type="number" value={form.report_interval} onChange={(event) => updateForm("report_interval", Number(event.target.value))} /></label><label><span>指标采样间隔（秒）</span><input min="2" max="60" type="number" value={form.collect_interval} onChange={(event) => updateForm("collect_interval", Number(event.target.value))} /></label></div>
         <div className="form-grid"><label><span>统计网卡（逗号分隔，留空自动）</span><input value={form.network_interface} onChange={(event) => updateForm("network_interface", event.target.value)} placeholder="eth0,ens3" /></label><label><span>下行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.rx_correction / 1024 ** 3} onChange={(event) => updateForm("rx_correction", Number(event.target.value) * 1024 ** 3)} /></label><label><span>上行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.tx_correction / 1024 ** 3} onChange={(event) => updateForm("tx_correction", Number(event.target.value) * 1024 ** 3)} /></label></div>
         <label><span>公开备注</span><textarea rows={2} value={form.public_remark} onChange={(event) => updateForm("public_remark", event.target.value)} /></label><label><span>管理备注</span><textarea rows={2} value={form.note} onChange={(event) => updateForm("note", event.target.value)} /></label>

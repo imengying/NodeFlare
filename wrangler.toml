@@ -1,7 +1,9 @@
-name = "cf-monitor"
+name = "nodeflare"
 main = "build/index.js"
 compatibility_date = "2026-08-07"
 keep_vars = true
+workers_dev = true
+preview_urls = false
 
 [build]
 command = "sh scripts/build-worker.sh"
@@ -15,7 +17,7 @@ run_worker_first = true
 [[d1_databases]]
 binding = "DB"
 # Wrangler 4.45+ provisions and binds this database when database_id is omitted.
-database_name = "cf-monitor-db"
+database_name = "nodeflare"
 
 [[durable_objects.bindings]]
 name = "LIVE_HUB"

@@ -4,13 +4,11 @@ export interface Config {
   site_announcement: string;
   favicon_url: string;
   locale: "zh-CN" | "en";
-  federation_sites: FederationSite[];
   public_dashboard: boolean;
   offline_threshold_seconds: number;
   history_retention_days: number;
   default_theme: "system" | "light" | "dark";
   background_url: string;
-  theme_url: string;
   theme_options: Record<string, ThemeSettingValue>;
   show_search: boolean;
   show_groups: boolean;
@@ -54,7 +52,7 @@ export interface ThemeSettingField {
 
 export interface ThemeSettingsSchema {
   schema: number;
-  source: "builtin" | "third-party";
+  source: "builtin";
   settings: ThemeSettingField[];
 }
 
@@ -65,12 +63,6 @@ export interface ExchangeRates {
   date: string;
   fetched_at: number;
   stale: boolean;
-  cny?: Record<string, number>;
-}
-
-export interface FederationSite {
-  name: string;
-  url: string;
 }
 
 interface DiskMetric {
@@ -194,9 +186,6 @@ export interface Server {
   disk_utilization: number | null;
   disks?: DiskMetric[];
   gpus?: GpuMetric[];
-  source_url?: string;
-  source_name?: string;
-  source_id?: string;
   message: string | null;
   latency?: LatencySample[];
 }
@@ -266,8 +255,6 @@ export interface Settings extends Omit<Config, "websocket"> {
   expiry_alert_days: number;
   cloudflare_account_id: string;
   cloudflare_api_token: string;
-  cors_allowed_origins: string;
-  csp_asset_origins: string;
 }
 
 type AlertMetric = "cpu" | "memory" | "disk" | "net_in" | "net_out";
@@ -313,31 +300,4 @@ export interface AgentInstallTarget {
   id: string;
   name: string;
   agent_token: string;
-}
-
-interface ThemeVersion {
-  version?: string;
-  short_version?: string;
-  commitid?: string;
-  commitId?: string;
-  theme_url?: string;
-  releaseDate?: string;
-  changelog?: string;
-}
-
-export interface ThirdPartyTheme {
-  id: string;
-  title: string;
-  cover: string;
-  tags?: string[];
-  description?: string | Record<string, string>;
-  url: string;
-  branch?: string;
-  author?: string;
-  versions?: ThemeVersion[];
-}
-
-export interface ThemeStore {
-  schema: number;
-  themes: ThirdPartyTheme[];
 }

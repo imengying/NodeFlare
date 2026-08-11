@@ -5,7 +5,7 @@ import { AdminPanel } from "./components/AdminPanel";
 import type { Config } from "./types";
 import "./styles.css";
 
-const THEME_KEY = "cf-monitor-admin-theme";
+const THEME_KEY = "nodeflare-admin-theme";
 
 function initialAppearance(): "light" | "dark" | null {
   const stored = localStorage.getItem(THEME_KEY);

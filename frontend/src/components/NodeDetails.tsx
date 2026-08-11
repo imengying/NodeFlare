@@ -92,14 +92,12 @@ export function NodeDetails({ server, threshold, retentionDays, locale, demo = f
       return;
     }
     let active = true;
-    const serverId = server.source_id || server.id;
-    const baseUrl = server.source_url || "";
-    Promise.all([api.history(serverId, requestHours, baseUrl), api.latencyHistory(serverId, requestHours, baseUrl)])
+    Promise.all([api.history(server.id, requestHours), api.latencyHistory(server.id, requestHours)])
       .then(([history, latency]) => { if (active) { setPoints(history.points); setLatencyTasks(latency.tasks); setLatencyPoints(latency.points); } })
       .catch((reason) => { if (active) { setPoints([]); setLatencyTasks([]); setLatencyPoints([]); setError(reason instanceof Error ? reason.message : ui(locale, "历史数据加载失败", "Unable to load history")); } })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [server.id, server.source_id, server.source_url, hours, demo, locale]);
+  }, [server.id, hours, demo, locale]);
 
   const online = isOnline(server, threshold);
   const loadRanges = [
@@ -160,7 +158,7 @@ export function NodeDetails({ server, threshold, retentionDays, locale, demo = f
         <Flag region={server.region} size={24} className="detail-flag" locale={locale} />
         <div className="detail-title">
           <div><h1>{server.name}</h1><span className={`status-chip ${online ? "online" : ""}`}>{online ? ui(locale, "在线", "Online") : ui(locale, "离线", "Offline")}</span></div>
-          <p><OSIcon os={server.os} size={14} />{regionDisplayName(server.region, locale)}{server.group_name ? ` · ${server.group_name}` : ""}{server.source_name && server.source_url ? ` · ${server.source_name}` : ""}</p>
+          <p><OSIcon os={server.os} size={14} />{regionDisplayName(server.region, locale)}{server.group_name ? ` · ${server.group_name}` : ""}</p>
         </div>
       </section>
 

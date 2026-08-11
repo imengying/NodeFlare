@@ -3,13 +3,13 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "cf-monitor",
+      "name": "nodeflare",
       "devDependencies": {
         "wrangler": "^4.120.0",
       },
     },
     "frontend": {
-      "name": "cf-monitor-ui",
+      "name": "nodeflare-ui",
       "version": "0.0.1",
       "dependencies": {
         "lucide-react": "^0.525.0",
@@ -307,7 +307,7 @@
 
     "caniuse-lite": ["caniuse-lite@1.0.30001809", "", {}, "sha512-xxWVywk6a6Arlk+hymeycyn/VgqEfLDxupvhH/xiY5SJ/18kmi9o6MiO320DCUzypORHLtvh0I4i04tUhCNHNQ=="],
 
-    "cf-monitor-ui": ["cf-monitor-ui@workspace:frontend"],
+    "nodeflare-ui": ["nodeflare-ui@workspace:frontend"],
 
     "clsx": ["clsx@2.1.1", "", {}, "sha512-eYm0QWBtUrBWZWG0d386OGAw16Z995PiOVo2B7bjWSbHedGl5e0ZWaq65kOGgUSNesEIDkB9ISbTg/JK9dhCZA=="],
 

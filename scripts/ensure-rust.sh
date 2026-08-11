@@ -1,13 +1,24 @@
 #!/bin/sh
 set -eu
 
+rust_bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
+case ":$PATH:" in
+  *":$rust_bin_dir:"*) ;;
+  *) PATH="$rust_bin_dir:$PATH"; export PATH ;;
+esac
+
 wasm_target_ready() {
   command -v rustc >/dev/null 2>&1 || return 1
   target_libdir=$(rustc --print target-libdir --target wasm32-unknown-unknown 2>/dev/null) || return 1
   test -d "$target_libdir"
 }
 
-if ! command -v cargo >/dev/null 2>&1 || ! wasm_target_ready; then
+rust_ready() {
+  command -v cargo >/dev/null 2>&1 || return 1
+  [ "${NODEFLARE_NATIVE_RUST_ONLY:-0}" = "1" ] || wasm_target_ready
+}
+
+if ! rust_ready; then
   if ! command -v rustup >/dev/null 2>&1; then
     rustup_install_url="https://sh.rustup.rs"
     rustup_installer=$(mktemp)
@@ -26,16 +37,16 @@ if ! command -v cargo >/dev/null 2>&1 || ! wasm_target_ready; then
     trap - 0 HUP INT TERM
   fi
 
-  rust_bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
-  export PATH="$rust_bin_dir:$PATH"
   if ! command -v cargo >/dev/null 2>&1; then
     rustup toolchain install stable --profile minimal
     rustup default stable
   fi
-  rustup target add wasm32-unknown-unknown
+  if [ "${NODEFLARE_NATIVE_RUST_ONLY:-0}" != "1" ]; then
+    rustup target add wasm32-unknown-unknown
+  fi
 fi
 
-if ! command -v cargo >/dev/null 2>&1 || ! wasm_target_ready; then
-  echo "Rust Cargo or wasm32-unknown-unknown target is unavailable" >&2
+if ! rust_ready; then
+  echo "Required Rust toolchain is unavailable" >&2
   exit 1
 fi

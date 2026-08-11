@@ -1,7 +1,7 @@
-import type { AlertRule, AlertRuleInput, CloudflareUsage, Config, DatabaseStats, ExchangeRates, HistoryPoint, LatencySample, LatencyTask, LatencyTaskInput, LatencyTestPoint, Server, ServerInput, Settings, ThemeSettingsSchema, ThemeStore } from "./types";
+import type { AlertRule, AlertRuleInput, CloudflareUsage, Config, DatabaseStats, ExchangeRates, HistoryPoint, LatencySample, LatencyTask, LatencyTaskInput, LatencyTestPoint, Server, ServerInput, Settings, ThemeSettingsSchema } from "./types";
 
-const TOKEN_KEY = "cf-monitor-admin-token";
-const TURNSTILE_KEY = "cf-monitor-turnstile-verified";
+const TOKEN_KEY = "nodeflare-admin-token";
+const TURNSTILE_KEY = "nodeflare-turnstile-verified";
 
 export class ApiError extends Error {
   constructor(message: string, public status: number) {
@@ -10,12 +10,12 @@ export class ApiError extends Error {
 }
 
 export function getToken() {
-  return sessionStorage.getItem(TOKEN_KEY) ?? "";
+  return localStorage.getItem(TOKEN_KEY) ?? "";
 }
 
 export function setToken(token: string) {
-  if (token) sessionStorage.setItem(TOKEN_KEY, token);
-  else sessionStorage.removeItem(TOKEN_KEY);
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
 }
 
 export function getTurnstileProof() {
@@ -27,12 +27,12 @@ export function setTurnstileProof(value: string) {
   else localStorage.removeItem(TURNSTILE_KEY);
 }
 
-async function request<T>(path: string, init: RequestInit = {}, admin = false, baseUrl = ""): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}, admin = false): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body) headers.set("Content-Type", "application/json");
-  if (!baseUrl && getToken()) headers.set("Authorization", `Bearer ${getToken()}`);
-  if (!baseUrl && getTurnstileProof()) headers.set("X-Turnstile-Verified", getTurnstileProof());
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}${path}`, { ...init, headers });
+  if (getToken()) headers.set("Authorization", `Bearer ${getToken()}`);
+  if (getTurnstileProof()) headers.set("X-Turnstile-Verified", getTurnstileProof());
+  const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
     if (response.status === 401 && admin) setToken("");
@@ -42,16 +42,16 @@ async function request<T>(path: string, init: RequestInit = {}, admin = false, b
 }
 
 export const api = {
-  config: (baseUrl = "") => request<Config>("/api/config", {}, false, baseUrl),
-  exchangeRates: (baseUrl = "") => request<ExchangeRates>("/api/exchange-rates", {}, false, baseUrl),
+  config: () => request<Config>("/api/config"),
+  exchangeRates: () => request<ExchangeRates>("/api/exchange-rates"),
   refreshExchangeRates: () => request<ExchangeRates>("/api/admin/exchange-rates/refresh", { method: "POST" }, true),
-  servers: (admin = false, baseUrl = "") =>
-    request<{ servers: Server[]; server_time?: number }>(admin ? "/api/admin/servers" : "/api/servers", {}, admin, baseUrl),
-  server: (id: string, baseUrl = "") => request<Server>(`/api/servers/${encodeURIComponent(id)}`, {}, false, baseUrl),
-  history: (id: string, hours: number, baseUrl = "") =>
-    request<{ points: HistoryPoint[] }>(`/api/history/${encodeURIComponent(id)}?hours=${hours}`, {}, false, baseUrl),
-  latencyHistory: (id: string, hours: number, baseUrl = "") =>
-    request<{ tasks: LatencyTestPoint[]; points: LatencySample[] }>(`/api/latency/${encodeURIComponent(id)}?hours=${hours}`, {}, false, baseUrl),
+  servers: (admin = false) =>
+    request<{ servers: Server[] }>(admin ? "/api/admin/servers" : "/api/servers", {}, admin),
+  server: (id: string) => request<Server>(`/api/servers/${encodeURIComponent(id)}`),
+  history: (id: string, hours: number) =>
+    request<{ points: HistoryPoint[] }>(`/api/history/${encodeURIComponent(id)}?hours=${hours}`),
+  latencyHistory: (id: string, hours: number) =>
+    request<{ tasks: LatencyTestPoint[]; points: LatencySample[] }>(`/api/latency/${encodeURIComponent(id)}?hours=${hours}`),
   verifyTurnstile: (token: string) =>
     request<{ verification: string }>("/api/turnstile/verify", { method: "POST", body: JSON.stringify({ token }) }),
   login: (username: string, password: string, turnstileToken: string) =>
@@ -74,13 +74,7 @@ export const api = {
     request<{ success: boolean }>(`/api/admin/alert-rules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }, true),
   deleteAlertRule: (id: string) =>
     request<{ success: boolean }>(`/api/admin/alert-rules/${encodeURIComponent(id)}`, { method: "DELETE" }, true),
-  themes: () => request<ThemeStore>("/api/themes"),
   themeSettings: () => request<ThemeSettingsSchema>("/api/admin/theme-settings", {}, true),
-  previewTheme: (themeUrl: string) =>
-    request<{ theme_url: string; proof: string }>("/api/admin/themes/preview", {
-      method: "POST",
-      body: JSON.stringify({ theme_url: themeUrl }),
-    }, true),
   saveSettings: (input: Partial<Settings>) =>
     request<{ settings: Settings; token: string | null }>("/api/admin/settings", { method: "PATCH", body: JSON.stringify(input) }, true),
   createServer: (input: ServerInput) =>

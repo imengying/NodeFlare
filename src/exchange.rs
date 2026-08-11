@@ -23,8 +23,6 @@ struct FetchedRates {
 pub struct ExchangeRatesView {
     pub base: String,
     pub rates: BTreeMap<String, f64>,
-    // Compatibility with themes using the fawazahmed0 CNY response shape.
-    pub cny: BTreeMap<String, f64>,
     pub source: String,
     pub date: String,
     pub fetched_at: i64,
@@ -137,7 +135,7 @@ async fn fetch_json(url: &str) -> Result<Value> {
     request.headers().set("Accept", "application/json")?;
     request
         .headers()
-        .set("User-Agent", "CF-Monitor-Exchange-Rates")?;
+        .set("User-Agent", "NodeFlare-Exchange-Rates")?;
     let controller = AbortController::default();
     let signal = controller.signal();
     worker::wasm_bindgen_futures::spawn_local(async move {
@@ -202,7 +200,6 @@ fn view_from_snapshot(
         snapshot.fetched_at <= 0 || current.saturating_sub(snapshot.fetched_at) >= REFRESH_INTERVAL;
     ExchangeRatesView {
         base: snapshot.base_currency,
-        cny: rates.clone(),
         rates,
         source: snapshot.source,
         date: snapshot.rate_date,

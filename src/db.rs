@@ -48,7 +48,6 @@ pub struct SettingsView {
     pub history_retention_days: i64,
     pub default_theme: String,
     pub background_url: String,
-    pub theme_url: String,
     pub theme_options: serde_json::Value,
     pub show_search: bool,
     pub show_groups: bool,
@@ -75,9 +74,6 @@ pub struct SettingsView {
     pub expiry_alert_days: i64,
     pub cloudflare_account_id: String,
     pub cloudflare_api_token: String,
-    pub cors_allowed_origins: String,
-    pub csp_asset_origins: String,
-    pub federation_sites: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -173,18 +169,13 @@ pub async fn get_token_hash(db: &D1Database, id: &str) -> Result<Option<TokenHas
         .await
 }
 
-pub async fn agent_config(
-    db: &D1Database,
-    id: &str,
-    latest_agent_version: &str,
-    _settings: &SettingsView,
-) -> Result<Option<AgentConfigView>> {
+pub async fn agent_config(db: &D1Database, id: &str) -> Result<Option<AgentConfigView>> {
     let mut config: Option<AgentConfigView> = db
         .prepare(
-            "SELECT report_interval, collect_interval, network_interface, auto_update, \
-             ?2 AS latest_agent_version FROM servers WHERE id = ?1",
+            "SELECT report_interval, collect_interval, network_interface, auto_update \
+             FROM servers WHERE id = ?1",
         )
-        .bind(&[text(id), text(latest_agent_version)])?
+        .bind(&[text(id)])?
         .first(None)
         .await?;
     if let Some(config) = config.as_mut() {
@@ -789,7 +780,6 @@ pub async fn settings(
         ),
         default_theme: string_setting(&values, "default_theme", "system"),
         background_url: string_setting(&values, "background_url", ""),
-        theme_url: string_setting(&values, "theme_url", ""),
         theme_options: values
             .get("theme_options")
             .and_then(|value| serde_json::from_str(value).ok())
@@ -811,7 +801,7 @@ pub async fn settings(
             .is_some_and(|value| !value.is_empty()),
         admin_password_hash: string_setting(&values, "admin_password_hash", ""),
         turnstile_enabled: bool_setting(&values, "turnstile_enabled", false),
-        turnstile_login_enabled: bool_setting(&values, "turnstile_login_enabled", false),
+        turnstile_login_enabled: bool_setting(&values, "turnstile_login_enabled", true),
         turnstile_site_key: string_setting(&values, "turnstile_site_key", ""),
         turnstile_secret_key: string_setting(&values, "turnstile_secret_key", ""),
         notification_enabled: bool_setting(&values, "notification_enabled", false),
@@ -821,13 +811,6 @@ pub async fn settings(
         expiry_alert_days: integer_setting(&values, "expiry_alert_days", 7),
         cloudflare_account_id: string_setting(&values, "cloudflare_account_id", ""),
         cloudflare_api_token: string_setting(&values, "cloudflare_api_token", ""),
-        cors_allowed_origins: string_setting(&values, "cors_allowed_origins", ""),
-        csp_asset_origins: string_setting(&values, "csp_asset_origins", ""),
-        federation_sites: values
-            .get("federation_sites")
-            .and_then(|value| serde_json::from_str(value).ok())
-            .filter(serde_json::Value::is_array)
-            .unwrap_or_else(|| serde_json::json!([])),
     })
 }
 
@@ -882,9 +865,6 @@ pub async fn update_settings(
     }
     if let Some(value) = input.background_url.as_deref() {
         push_setting!("background_url", value.trim());
-    }
-    if let Some(value) = input.theme_url.as_deref() {
-        push_setting!("theme_url", value.trim());
     }
     if let Some(value) = input.theme_options.as_ref() {
         let serialized = value.to_string();
@@ -967,12 +947,6 @@ pub async fn update_settings(
     }
     push_trimmed!(input.cloudflare_account_id, "cloudflare_account_id");
     push_trimmed!(input.cloudflare_api_token, "cloudflare_api_token");
-    push_trimmed!(input.cors_allowed_origins, "cors_allowed_origins");
-    push_trimmed!(input.csp_asset_origins, "csp_asset_origins");
-    if let Some(value) = input.federation_sites.as_ref() {
-        let serialized = value.to_string();
-        push_setting!("federation_sites", &serialized);
-    }
     if !statements.is_empty() {
         db.batch(statements).await?;
     }

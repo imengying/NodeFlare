@@ -1,10 +1,22 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use worker::{Date, Env, Request};
 
 const SESSION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const TURNSTILE_PROOF_SECONDS: i64 = 60 * 60;
-const THEME_PREVIEW_SECONDS: i64 = 10 * 60;
 const PASSWORD_ROUNDS: usize = 10_000;
+const JWT_HEADER: &str = r#"{"alg":"HS256","typ":"JWT"}"#;
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AdminClaims {
+    sub: String,
+    iat: i64,
+    exp: i64,
+}
 
 pub fn sha256_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
@@ -36,7 +48,7 @@ pub fn admin_username(env: &Env, configured: &str) -> String {
 }
 
 fn password_digest(password: &str, salt: &str) -> String {
-    let mut digest = Sha256::digest(format!("cf-monitor:{salt}:{password}").as_bytes()).to_vec();
+    let mut digest = Sha256::digest(format!("nodeflare:{salt}:{password}").as_bytes()).to_vec();
     for _ in 1..PASSWORD_ROUNDS {
         let mut hasher = Sha256::new();
         hasher.update(&digest);
@@ -87,20 +99,64 @@ pub fn verify_credentials(
 }
 
 fn signing_secret(env: &Env, password_hash: &str) -> Option<String> {
-    if let Ok(secret) = env.secret("SESSION_SECRET") {
-        return Some(secret.to_string());
-    }
     if !password_hash.is_empty() {
         return Some(password_hash.to_string());
     }
     admin_secret(env)
 }
 
-pub fn create_session(env: &Env, password_hash: &str) -> Option<String> {
+fn create_admin_jwt_with_secret(secret: &str, issued_at: i64) -> Option<String> {
+    let header = URL_SAFE_NO_PAD.encode(JWT_HEADER);
+    let claims = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&AdminClaims {
+            sub: "admin".to_string(),
+            iat: issued_at,
+            exp: issued_at + SESSION_SECONDS,
+        })
+        .ok()?,
+    );
+    let unsigned = format!("{header}.{claims}");
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(unsigned.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Some(format!("{unsigned}.{signature}"))
+}
+
+fn verify_admin_jwt(token: &str, secret: &str, now: i64) -> bool {
+    let mut parts = token.split('.');
+    let (Some(header), Some(claims), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if header != URL_SAFE_NO_PAD.encode(JWT_HEADER) {
+        return false;
+    }
+    let Ok(signature) = URL_SAFE_NO_PAD.decode(signature) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(format!("{header}.{claims}").as_bytes());
+    if mac.verify_slice(&signature).is_err() {
+        return false;
+    }
+    let Ok(payload) = URL_SAFE_NO_PAD.decode(claims) else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<AdminClaims>(&payload) else {
+        return false;
+    };
+    claims.sub == "admin"
+        && claims.iat <= now + 60
+        && claims.exp >= now
+        && claims.exp == claims.iat + SESSION_SECONDS
+}
+
+pub fn create_admin_jwt(env: &Env, password_hash: &str) -> Option<String> {
     let secret = signing_secret(env, password_hash)?;
-    let expires = Date::now().as_millis() as i64 / 1000 + SESSION_SECONDS;
-    let signature = sha256_hex(&format!("cf-monitor:{expires}:{secret}"));
-    Some(format!("{expires}.{signature}"))
+    create_admin_jwt_with_secret(&secret, Date::now().as_millis() as i64 / 1000)
 }
 
 pub fn is_admin(req: &Request, env: &Env, password_hash: &str) -> bool {
@@ -113,24 +169,14 @@ pub fn is_admin(req: &Request, env: &Env, password_hash: &str) -> bool {
     let Some(token) = header.strip_prefix("Bearer ") else {
         return false;
     };
-    let Some((expires_raw, signature)) = token.split_once('.') else {
-        return false;
-    };
-    let Ok(expires) = expires_raw.parse::<i64>() else {
-        return false;
-    };
     let now = Date::now().as_millis() as i64 / 1000;
-    if expires < now || expires > now + SESSION_SECONDS + 60 {
-        return false;
-    }
-    let expected = sha256_hex(&format!("cf-monitor:{expires}:{secret}"));
-    secure_eq(&expected, signature)
+    verify_admin_jwt(token, &secret, now)
 }
 
 pub fn create_turnstile_proof(env: &Env, password_hash: &str) -> Option<String> {
     let secret = signing_secret(env, password_hash)?;
     let expires = Date::now().as_millis() as i64 / 1000 + TURNSTILE_PROOF_SECONDS;
-    let signature = sha256_hex(&format!("cf-monitor-turnstile:{expires}:{secret}"));
+    let signature = sha256_hex(&format!("nodeflare-turnstile:{expires}:{secret}"));
     Some(format!("{expires}.{signature}"))
 }
 
@@ -148,34 +194,7 @@ pub fn verify_turnstile_proof(value: &str, env: &Env, password_hash: &str) -> bo
     if expires < current || expires > current + TURNSTILE_PROOF_SECONDS + 60 {
         return false;
     }
-    let expected = sha256_hex(&format!("cf-monitor-turnstile:{expires}:{secret}"));
-    secure_eq(&expected, signature)
-}
-
-pub fn create_theme_preview(env: &Env, password_hash: &str, theme_url: &str) -> Option<String> {
-    let secret = signing_secret(env, password_hash)?;
-    let expires = Date::now().as_millis() as i64 / 1000 + THEME_PREVIEW_SECONDS;
-    let theme_hash = sha256_hex(theme_url);
-    let signature = sha256_hex(&format!("cf-monitor-theme:{expires}:{theme_hash}:{secret}"));
-    Some(format!("{expires}.{signature}"))
-}
-
-pub fn verify_theme_preview(value: &str, env: &Env, password_hash: &str, theme_url: &str) -> bool {
-    let Some(secret) = signing_secret(env, password_hash) else {
-        return false;
-    };
-    let Some((expires_raw, signature)) = value.split_once('.') else {
-        return false;
-    };
-    let Ok(expires) = expires_raw.parse::<i64>() else {
-        return false;
-    };
-    let current = Date::now().as_millis() as i64 / 1000;
-    if expires < current || expires > current + THEME_PREVIEW_SECONDS + 60 {
-        return false;
-    }
-    let theme_hash = sha256_hex(theme_url);
-    let expected = sha256_hex(&format!("cf-monitor-theme:{expires}:{theme_hash}:{secret}"));
+    let expected = sha256_hex(&format!("nodeflare-turnstile:{expires}:{secret}"));
     secure_eq(&expected, signature)
 }
 
@@ -185,4 +204,36 @@ pub fn bearer_token(req: &Request) -> Option<String> {
         .ok()
         .flatten()
         .and_then(|value| value.strip_prefix("Bearer ").map(ToOwned::to_owned))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{create_admin_jwt_with_secret, verify_admin_jwt, SESSION_SECONDS};
+
+    #[test]
+    fn signs_and_verifies_admin_jwt() {
+        let issued_at = 1_800_000_000;
+        let token = create_admin_jwt_with_secret("d1-password-hash", issued_at).expect("jwt");
+        assert_eq!(token.split('.').count(), 3);
+        assert!(verify_admin_jwt(&token, "d1-password-hash", issued_at + 1));
+        assert!(verify_admin_jwt(
+            &token,
+            "d1-password-hash",
+            issued_at + SESSION_SECONDS
+        ));
+        assert!(!verify_admin_jwt(
+            &token,
+            "d1-password-hash",
+            issued_at + SESSION_SECONDS + 1
+        ));
+        assert!(!verify_admin_jwt(&token, "different-secret", issued_at));
+    }
+
+    #[test]
+    fn rejects_tampered_admin_jwt() {
+        let issued_at = 1_800_000_000;
+        let token = create_admin_jwt_with_secret("d1-password-hash", issued_at).expect("jwt");
+        let tampered = format!("{}x", token);
+        assert!(!verify_admin_jwt(&tampered, "d1-password-hash", issued_at));
+    }
 }

@@ -96,14 +96,13 @@ report_response=$(request -H "Authorization: Bearer $agent_token" -H 'Content-Ty
   --data "$report" "$MONITOR_BASE_URL/api/agent/report")
 printf '%s' "$report_response" | jq -e \
   --arg task_id "$latency_task_id" \
-  --arg agent_version "$agent_version" \
-  '.success == true and .config.collect_interval == 5 and .config.latest_agent_version == $agent_version and (.config.latency_tasks | any(.id == $task_id and .task_type == "tcp" and .target == "example.com:443"))' >/dev/null
+  '.success == true and .config.collect_interval == 5 and .config.auto_update == 1 and (.config.latency_tasks | any(.id == $task_id and .task_type == "tcp" and .target == "example.com:443"))' >/dev/null
 
 latency_report=$(printf '%s' "$report" | jq --arg task_id "$latency_task_id" '.samples[0].timestamp=(now|floor) | .samples[0].latency_results=[{task_id:$task_id,timestamp:(now|floor),latency_ms:28.4,packet_loss:25}]')
 request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
   --data "$latency_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.success == true' >/dev/null
 
-request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/servers/$server_id" | jq -e --arg task_id "$latency_task_id" '.cpu == 18.5 and .gpu_usage == 32.5 and .disk_await_ms == 1.4 and (.gpus | length) == 1 and (.disks | length) == 1 and .price == 9.9 and .note == "" and .public_remark == "public" and (.latency | any(.task_id == $task_id and .latency_ms == 28.4 and .packet_loss == 25))' >/dev/null
+request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/servers/$server_id" | jq -e --arg task_id "$latency_task_id" '.cpu == 18.5 and .gpu_usage == 32.5 and .disk_await_ms == 1.4 and (.gpus | length) == 1 and (.disks | length) == 1 and .disk_used == 21474836480 and .traffic_limit == 107374182400 and .price == 9.9 and .note == "" and .public_remark == "public" and (.latency | any(.task_id == $task_id and .latency_ms == 28.4 and .packet_loss == 25))' >/dev/null
 request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/history/$server_id?hours=1" | jq -e '.points | length >= 1 and any(.gpu_usage == 32.5)' >/dev/null
 request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/latency/$server_id?hours=1" | jq -e --arg task_id "$latency_task_id" '(.tasks | any(.id == $task_id)) and (.points | any(.task_id == $task_id and .latency_ms == 28.4))' >/dev/null
 alert_rule_json=$(request -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' \

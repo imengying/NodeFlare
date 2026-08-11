@@ -15,19 +15,15 @@ use serde::Serialize;
 use worker::*;
 
 use crate::auth::{
-    bearer_token, create_session, create_theme_preview, create_turnstile_proof, hash_password,
-    is_admin, sha256_hex, verify_credentials, verify_theme_preview, verify_turnstile_proof,
+    bearer_token, create_admin_jwt, create_turnstile_proof, hash_password, is_admin, sha256_hex,
+    verify_credentials, verify_turnstile_proof,
 };
 use crate::models::{
-    AgentReport, AgentReportBatch, AlertRuleInput, ApiError, HistoryPoint, LatencyTaskInput,
-    LoginRequest, ServerBatchInput, ServerInput, ServerOrderInput, ServerView, SettingsInput,
-    ThemePreviewInput, TurnstileVerifyRequest,
+    AgentReport, AgentReportBatch, AlertRuleInput, ApiError, LatencyTaskInput, LoginRequest,
+    ServerBatchInput, ServerInput, ServerOrderInput, ServerView, SettingsInput,
+    TurnstileVerifyRequest,
 };
 
-const AGENT_SCRIPT: &str = include_str!("../agent/agent.sh");
-const AGENT_WINDOWS_SCRIPT: &str = include_str!("../agent/install.ps1");
-const AGENT_MACOS_SCRIPT: &str = include_str!("../agent/install-macos.sh");
-const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ADMIN_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.html"));
 const ADMIN_SCRIPT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.js"));
 const ADMIN_STYLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.css"));
@@ -53,6 +49,13 @@ fn env_number(env: &Env, key: &str, fallback: i64) -> i64 {
     env_text(env, key, &fallback.to_string())
         .parse()
         .unwrap_or(fallback)
+}
+
+fn env_secret_text(env: &Env, key: &str) -> String {
+    env.secret(key)
+        .or_else(|_| env.var(key))
+        .map(|value| value.to_string())
+        .unwrap_or_default()
 }
 
 fn json<T: Serialize>(value: &T, status: u16) -> Result<Response> {
@@ -170,84 +173,8 @@ fn valid_cloudflare_api_token(value: &str) -> bool {
     value.chars().count() <= 512 && !value.chars().any(char::is_whitespace)
 }
 
-fn configured_origins(value: &str) -> Option<Vec<String>> {
-    let mut origins = Vec::new();
-    for raw in value.split(|character: char| character == ',' || character.is_whitespace()) {
-        let raw = raw.trim().trim_end_matches('/');
-        if raw.is_empty() {
-            continue;
-        }
-        if raw == "*" {
-            origins.push(raw.to_string());
-            continue;
-        }
-        let Ok(url) = Url::parse(raw) else {
-            return None;
-        };
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || url.path() != "/"
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return None;
-        }
-        origins.push(url.origin().ascii_serialization());
-    }
-    origins.sort();
-    origins.dedup();
-    Some(origins)
-}
-
-fn origin_allowed(origin: &str, request_url: &Url, configured: &str) -> bool {
-    let normalized = origin.trim().trim_end_matches('/');
-    normalized == request_url.origin().ascii_serialization()
-        || configured_origins(configured).is_some_and(|origins| {
-            origins
-                .iter()
-                .any(|allowed| allowed == "*" || allowed == normalized)
-        })
-}
-
-fn valid_federation_sites(value: &serde_json::Value) -> bool {
-    let Some(sites) = value.as_array() else {
-        return false;
-    };
-    sites.len() <= 16
-        && sites.iter().all(|site| {
-            let Some(object) = site.as_object() else {
-                return false;
-            };
-            let name = object
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim();
-            let url = object
-                .get("url")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .trim_end_matches('/');
-            !name.is_empty()
-                && name.chars().count() <= 80
-                && Url::parse(url).ok().is_some_and(|parsed| {
-                    parsed.scheme() == "https"
-                        && parsed.host_str().is_some()
-                        && parsed.path() == "/"
-                        && parsed.query().is_none()
-                        && parsed.fragment().is_none()
-                })
-        })
-}
-
-fn csp_sources(value: &str) -> String {
-    configured_origins(value)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|origin| origin != "*")
-        .collect::<Vec<_>>()
-        .join(" ")
+fn same_origin(origin: &str, request_url: &Url) -> bool {
+    origin.trim().trim_end_matches('/') == request_url.origin().ascii_serialization()
 }
 
 fn validate_latency_task(input: &LatencyTaskInput) -> Option<&'static str> {
@@ -342,7 +269,7 @@ fn validate_server(input: &ServerInput) -> Option<&'static str> {
     ) {
         return Some("流量计算方式无效");
     }
-    if !input.price.is_finite() || !(-2.0..=1_000_000_000.0).contains(&input.price) {
+    if !input.price.is_finite() || !(-1.0..=1_000_000_000.0).contains(&input.price) {
         return Some("价格无效");
     }
     if !(1..=3650).contains(&input.billing_cycle) {
@@ -481,23 +408,7 @@ fn public_server(mut server: ServerView) -> ServerView {
     server
 }
 
-fn server_json(
-    server: ServerView,
-    offline_threshold: i64,
-    latency: Vec<latency::LatencySample>,
-) -> serde_json::Value {
-    let timestamp = server.timestamp.unwrap_or(0);
-    let uptime = server.uptime.unwrap_or(0);
-    let expires_at = server
-        .expires_at
-        .map(|value| cloudflare::date_from_unix_days(value.div_euclid(86_400)))
-        .unwrap_or_default();
-    let traffic_limit = if server.traffic_limit > 0 {
-        format!("{:.3}GB", server.traffic_limit as f64 / 1024_f64.powi(3))
-    } else {
-        String::new()
-    };
-    let mib = |value: Option<i64>| value.unwrap_or(0) as f64 / 1024_f64.powi(2);
+fn server_json(server: ServerView, latency: Vec<latency::LatencySample>) -> serde_json::Value {
     let mut value = serde_json::to_value(&server).unwrap_or_else(|_| serde_json::json!({}));
     let disks = server
         .disk_info
@@ -510,77 +421,16 @@ fn server_json(
         .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
         .unwrap_or_else(|| serde_json::json!([]));
     if let Some(object) = value.as_object_mut() {
-        object.extend(
-            serde_json::json!({
-                "server_group": server.group_name,
-                "is_hidden": server.hidden,
-                "is_online": timestamp > 0 && now() - timestamp <= offline_threshold,
-                "last_updated": timestamp * 1000,
-                "report_timestamp": timestamp * 1000,
-                "boot_time": (timestamp - uptime.max(0)) * 1000,
-                "cpu_info": server.cpu_model.clone().unwrap_or_default(),
-                "kernel_version": server.kernel.clone().unwrap_or_default(),
-                "gpu": server.gpu_usage.unwrap_or(0.0),
-                "gpu_info": gpus.clone(),
-                "disks": disks,
-                "gpus": gpus,
-                "ip_v4": server.ipv4.clone().unwrap_or_default(),
-                "ip_v6": server.ipv6.clone().unwrap_or_default(),
-                "ram_used": mib(server.mem_used),
-                "ram_total": mib(server.mem_total),
-                "swap_used": mib(server.swap_used),
-                "swap_total": mib(server.swap_total),
-                "disk_used": mib(server.disk_used),
-                "disk_total": mib(server.disk_total),
-                "net_in_speed": server.net_in.unwrap_or(0.0),
-                "net_out_speed": server.net_out.unwrap_or(0.0),
-                "net_rx": server.net_rx_total.unwrap_or(0),
-                "net_tx": server.net_tx_total.unwrap_or(0),
-                "tcp_conn": server.tcp_connections.unwrap_or(0),
-                "udp_conn": server.udp_connections.unwrap_or(0),
-                "load_avg": format!("{} {} {}", server.load1.unwrap_or(0.0), server.load5.unwrap_or(0.0), server.load15.unwrap_or(0.0)),
-                "expire_date": expires_at,
-                "expired_at": expires_at,
-                "traffic_limit": traffic_limit,
-                "traffic_calc_type": server.traffic_limit_type,
-                "interface": server.network_interface,
-                "latency": latency,
-            })
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
+        object.remove("disk_info");
+        object.remove("gpu_info");
+        object.insert("disks".to_string(), disks);
+        object.insert("gpus".to_string(), gpus);
+        object.insert(
+            "latency".to_string(),
+            serde_json::to_value(latency).unwrap_or_else(|_| serde_json::json!([])),
         );
     }
     value
-}
-
-fn history_json(point: HistoryPoint) -> serde_json::Value {
-    let mib = |value: i64| value as f64 / 1024_f64.powi(2);
-    serde_json::json!({
-        "timestamp": point.timestamp * 1000,
-        "cpu": point.cpu,
-        "load_avg": format!("{} {} {}", point.load1, point.load5, point.load15),
-        "ram_used": mib(point.mem_used),
-        "ram_total": mib(point.mem_total),
-        "swap_used": mib(point.swap_used),
-        "swap_total": mib(point.swap_total),
-        "disk_used": mib(point.disk_used),
-        "disk_total": mib(point.disk_total),
-        "net_in_speed": point.net_in,
-        "net_out_speed": point.net_out,
-        "net_rx": point.net_rx_total,
-        "net_tx": point.net_tx_total,
-        "processes": point.processes,
-        "tcp_conn": point.tcp_connections,
-        "udp_conn": point.udp_connections,
-        "gpu": point.gpu_usage,
-        "disk_read_bps": point.disk_read_bps,
-        "disk_write_bps": point.disk_write_bps,
-        "disk_read_iops": point.disk_read_iops,
-        "disk_write_iops": point.disk_write_iops,
-        "disk_await_ms": point.disk_await_ms,
-        "disk_utilization": point.disk_utilization,
-    })
 }
 
 fn request_cookie(req: &Request, name: &str) -> Option<String> {
@@ -589,59 +439,6 @@ fn request_cookie(req: &Request, name: &str) -> Option<String> {
         let (key, value) = entry.trim().split_once('=')?;
         (key == name).then(|| value.to_string())
     })
-}
-
-fn query_value(req: &Request, name: &str) -> Option<String> {
-    req.url()
-        .ok()?
-        .query_pairs()
-        .find_map(|(key, value)| (key == name).then(|| value.to_string()))
-}
-
-fn theme_html_response(
-    html: String,
-    preview: Option<(&str, &str)>,
-    extra_sources: &str,
-) -> Result<Response> {
-    let mut response = Response::ok(html)?;
-    response
-        .headers_mut()
-        .set("Content-Type", "text/html; charset=utf-8")?;
-    response
-        .headers_mut()
-        .set("X-Content-Type-Options", "nosniff")?;
-    response.headers_mut().set("X-Frame-Options", "DENY")?;
-    response.headers_mut().set("Cache-Control", "no-store")?;
-    response.headers_mut().set("Content-Security-Policy", &format!(
-        "default-src 'self'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com {extra_sources}; style-src 'self' 'unsafe-inline' {extra_sources}; img-src 'self' data: https:; connect-src 'self' ws: wss: {extra_sources}; frame-src https://challenges.cloudflare.com; font-src 'self' data: {extra_sources}; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
-    ))?;
-    if let Some((theme_url, proof)) = preview {
-        response.headers_mut().append(
-            "Set-Cookie",
-            &format!("cf_monitor_theme_preview={theme_url}; Path=/; Max-Age=600; HttpOnly; SameSite=Strict"),
-        )?;
-        response.headers_mut().append(
-            "Set-Cookie",
-            &format!(
-                "cf_monitor_theme_proof={proof}; Path=/; Max-Age=600; HttpOnly; SameSite=Strict"
-            ),
-        )?;
-    }
-    Ok(response)
-}
-
-fn preview_theme(req: &Request, env: &Env, password_hash: &str) -> Option<(String, String)> {
-    let query_theme = query_value(req, "theme_url");
-    let query_proof = query_value(req, "theme_proof");
-    if let (Some(theme_url), Some(proof)) = (query_theme, query_proof) {
-        let normalized = theme::parse_theme_url(&theme_url)?.normalized;
-        return verify_theme_preview(&proof, env, password_hash, &normalized)
-            .then_some((normalized, proof));
-    }
-    let theme_url = request_cookie(req, "cf_monitor_theme_preview")?;
-    let proof = request_cookie(req, "cf_monitor_theme_proof")?;
-    let normalized = theme::parse_theme_url(&theme_url)?.normalized;
-    verify_theme_preview(&proof, env, password_hash, &normalized).then_some((normalized, proof))
 }
 
 fn client_ip(req: &Request) -> Option<String> {
@@ -659,7 +456,7 @@ fn request_turnstile_proof(req: &Request) -> Option<String> {
         .get("X-Turnstile-Verified")
         .ok()
         .flatten()
-        .or_else(|| request_cookie(req, "cf_monitor_turnstile"))
+        .or_else(|| request_cookie(req, "nodeflare_turnstile"))
         .or_else(|| {
             req.url()
                 .ok()?
@@ -699,40 +496,9 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
     }
 
-    if method == Method::Get && path == "/agent.sh" {
-        let mut response = Response::ok(AGENT_SCRIPT)?;
-        response
-            .headers_mut()
-            .set("Content-Type", "text/x-shellscript; charset=utf-8")?;
-        response
-            .headers_mut()
-            .set("Cache-Control", "public, max-age=3600")?;
-        return Ok(response);
-    }
-    if method == Method::Get && path == "/agent.ps1" {
-        let mut response = Response::ok(AGENT_WINDOWS_SCRIPT)?;
-        response
-            .headers_mut()
-            .set("Content-Type", "text/plain; charset=utf-8")?;
-        response
-            .headers_mut()
-            .set("Cache-Control", "public, max-age=3600")?;
-        return Ok(response);
-    }
-    if method == Method::Get && path == "/agent-macos.sh" {
-        let mut response = Response::ok(AGENT_MACOS_SCRIPT)?;
-        response
-            .headers_mut()
-            .set("Content-Type", "text/x-shellscript; charset=utf-8")?;
-        response
-            .headers_mut()
-            .set("Cache-Control", "public, max-age=3600")?;
-        return Ok(response);
-    }
-
     let database = env.d1("DB")?;
 
-    let default_name = env_text(&env, "SITE_NAME", "CF Monitor");
+    let default_name = env_text(&env, "SITE_NAME", "NodeFlare");
     let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180).clamp(30, 3600);
     let default_retention = env_number(&env, "HISTORY_RETENTION_DAYS", 30).clamp(1, 365);
     let default_username = env_text(&env, "ADMIN_USERNAME", "admin");
@@ -744,52 +510,37 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         &default_username,
     )
     .await?;
+    let environment_turnstile_site_key = env_secret_text(&env, "TURNSTILE_SITE_KEY");
+    let environment_turnstile_secret_key = env_secret_text(&env, "TURNSTILE_SECRET_KEY");
+    let turnstile_site_key = if settings.turnstile_site_key.trim().is_empty() {
+        environment_turnstile_site_key.as_str()
+    } else {
+        settings.turnstile_site_key.as_str()
+    };
+    let turnstile_secret_key = if settings.turnstile_secret_key.trim().is_empty() {
+        environment_turnstile_secret_key.as_str()
+    } else {
+        settings.turnstile_secret_key.as_str()
+    };
+    let turnstile_configured =
+        !turnstile_site_key.trim().is_empty() && !turnstile_secret_key.trim().is_empty();
+    let public_turnstile_enabled = settings.turnstile_enabled && turnstile_configured;
+    let login_protection_enabled = settings.turnstile_login_enabled && turnstile_configured;
 
     if method == Method::Get && path == "/api/config" {
-        let authorized = is_admin(&req, &env, &settings.admin_password_hash);
-        let existing_proof = request_turnstile_proof(&req)
-            .filter(|value| verify_turnstile_proof(value, &env, &settings.admin_password_hash));
-        let mut issued_proof = None;
-        if settings.turnstile_enabled && existing_proof.is_none() && !authorized {
-            if let Some(token) = req.headers().get("X-Turnstile-Token").ok().flatten() {
-                if turnstile::verify(
-                    &token,
-                    &settings.turnstile_secret_key,
-                    client_ip(&req).as_deref(),
-                )
-                .await
-                .unwrap_or(false)
-                {
-                    issued_proof = create_turnstile_proof(&env, &settings.admin_password_hash);
-                }
-            }
-        }
-        let verified = !settings.turnstile_enabled
-            || authorized
-            || existing_proof.is_some()
-            || issued_proof.is_some();
-        let cookie_proof = issued_proof.clone();
-        let returned_proof = issued_proof.or(existing_proof);
-        let mut response = json(
+        return json(
             &serde_json::json!({
                 "site_name": settings.site_name,
-                "site_title": settings.site_name,
                 "site_description": settings.site_description,
                 "site_announcement": settings.site_announcement,
                 "favicon_url": settings.favicon_url,
                 "locale": settings.locale,
                 "public_dashboard": settings.public_dashboard,
-                "is_public": settings.public_dashboard,
-                "authorization": authorized,
                 "offline_threshold_seconds": settings.offline_threshold_seconds,
                 "history_retention_days": settings.history_retention_days,
-                "long_history_points": 120,
                 "default_theme": settings.default_theme,
-                "display_mode": "bar",
                 "background_url": settings.background_url,
-                "theme_url": settings.theme_url,
                 "theme_options": settings.theme_options,
-                "federation_sites": settings.federation_sites,
                 "show_search": settings.show_search,
                 "show_groups": settings.show_groups,
                 "show_stats": settings.show_stats,
@@ -800,34 +551,13 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "show_expiry": settings.show_expiry,
                 "show_latency": settings.show_latency,
                 "show_uptime": settings.show_uptime,
-                "turnstile_enabled": settings.turnstile_enabled,
-                "turnstile_login_enabled": settings.turnstile_login_enabled || settings.turnstile_enabled,
-                "turnstile_site_key": settings.turnstile_site_key,
-                "verified": verified,
-                "turnstile_verified": returned_proof,
+                "turnstile_enabled": public_turnstile_enabled,
+                "turnstile_login_enabled": login_protection_enabled || public_turnstile_enabled,
+                "turnstile_site_key": turnstile_site_key,
                 "websocket": true
             }),
             200,
-        )?;
-        if let Some(proof) = cookie_proof {
-            response.headers_mut().append(
-                "Set-Cookie",
-                &format!(
-                    "cf_monitor_turnstile={proof}; Path=/; Max-Age=3600; HttpOnly; SameSite=Strict"
-                ),
-            )?;
-        }
-        return Ok(response);
-    }
-
-    if method == Method::Get && (path == "/api/themes" || path == "/theme") {
-        return match theme::store().await {
-            Ok(store) => json(&store, 200),
-            Err(err) => {
-                console_error!("theme store request failed: {err}");
-                json(&serde_json::json!({ "schema": 1, "themes": [] }), 200)
-            }
-        };
+        );
     }
 
     if method == Method::Post && path == "/api/admin/login" {
@@ -841,13 +571,11 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if input.username.trim().is_empty() || input.password.is_empty() {
             return error("请输入用户名和密码", 400);
         }
-        if settings.turnstile_enabled || settings.turnstile_login_enabled {
-            if settings.turnstile_secret_key.is_empty() {
-                return error("Turnstile 密钥未配置", 503);
-            }
+        let login_turnstile_enabled = public_turnstile_enabled || login_protection_enabled;
+        if login_turnstile_enabled {
             let verified = turnstile::verify(
                 &input.turnstile_token,
-                &settings.turnstile_secret_key,
+                turnstile_secret_key,
                 client_ip(&req).as_deref(),
             )
             .await
@@ -865,14 +593,22 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         ) {
             return error("用户名或密码错误", 401);
         }
-        let Some(token) = create_session(&env, &settings.admin_password_hash) else {
+        let session_password_hash = if settings.admin_password_hash.is_empty() {
+            let namespace = env.durable_object("LIVE_HUB")?;
+            let password_hash = hash_password(&input.password, &namespace.unique_id()?.to_string());
+            db::save_setting(&database, "admin_password_hash", &password_hash).await?;
+            password_hash
+        } else {
+            settings.admin_password_hash.clone()
+        };
+        let Some(token) = create_admin_jwt(&env, &session_password_hash) else {
             return error("会话密钥未配置", 503);
         };
         return json(&serde_json::json!({ "token": token }), 200);
     }
 
     if method == Method::Post && path == "/api/turnstile/verify" {
-        if !settings.turnstile_enabled {
+        if !public_turnstile_enabled {
             return error("全站人机验证未启用", 400);
         }
         let input: TurnstileVerifyRequest = match req.json().await {
@@ -881,7 +617,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         };
         let verified = turnstile::verify(
             &input.token,
-            &settings.turnstile_secret_key,
+            turnstile_secret_key,
             client_ip(&req).as_deref(),
         )
         .await
@@ -896,7 +632,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         response.headers_mut().append(
             "Set-Cookie",
             &format!(
-                "cf_monitor_turnstile={proof}; Path=/; Max-Age=3600; HttpOnly; SameSite=Strict"
+                "nodeflare_turnstile={proof}; Path=/; Max-Age=3600; HttpOnly; SameSite=Strict"
             ),
         )?;
         return Ok(response);
@@ -975,44 +711,12 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "timestamp": latest.timestamp,
                 "metrics": latest
             }))?;
-            let mib = |value: i64| value as f64 / 1024_f64.powi(2);
-            let samples = batch.samples.iter().map(|report| serde_json::json!({
-                "ts": report.timestamp * 1000,
-                "data": {
-                    "timestamp": report.timestamp * 1000,
-                    "cpu": report.cpu,
-                    "load_avg": format!("{} {} {}", report.load1, report.load5, report.load15),
-                    "ram_used": mib(report.mem_used),
-                    "ram_total": mib(report.mem_total),
-                    "swap_used": mib(report.swap_used),
-                    "swap_total": mib(report.swap_total),
-                    "disk_used": mib(report.disk_used),
-                    "disk_total": mib(report.disk_total),
-                    "net_in_speed": report.net_in,
-                    "net_out_speed": report.net_out,
-                    "net_rx": report.net_rx_total,
-                    "net_tx": report.net_tx_total,
-                    "processes": report.processes,
-                    "tcp_conn": report.tcp_connections,
-                    "udp_conn": report.udp_connections,
-                    "gpu": report.gpu_usage,
-                }
-            })).collect::<Vec<_>>();
-            let compatibility_payload = serde_json::to_string(&serde_json::json!({
-                "type": "batchUpdate",
-                "updates": [{
-                    "serverId": batch.server_id,
-                    "samples": samples
-                }]
-            }))?;
             let server_id = batch.server_id.clone();
             ctx.wait_until(async move {
                 let _ = live::broadcast(&env, &server_id, &payload).await;
-                let _ = live::broadcast(&env, &server_id, &compatibility_payload).await;
             });
         }
-        let config =
-            db::agent_config(&database, &batch.server_id, AGENT_VERSION, &settings).await?;
+        let config = db::agent_config(&database, &batch.server_id).await?;
         return json(
             &serde_json::json!({ "success": true, "config": config }),
             202,
@@ -1020,7 +724,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     let admin = is_admin(&req, &env, &settings.admin_password_hash);
-    let turnstile_verified = !settings.turnstile_enabled
+    let turnstile_verified = !public_turnstile_enabled
         || admin
         || request_turnstile_proof(&req).is_some_and(|value| {
             verify_turnstile_proof(&value, &env, &settings.admin_password_hash)
@@ -1066,80 +770,15 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 .or_default()
                 .push(sample);
         }
-        let mut region_stats = serde_json::Map::new();
-        for server in &raw_servers {
-            let region = server.region.trim().to_ascii_uppercase();
-            if region.is_empty() {
-                continue;
-            }
-            let count = region_stats
-                .get(&region)
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0)
-                + 1;
-            region_stats.insert(region, count.into());
-        }
         let servers: Vec<_> = raw_servers
             .into_iter()
             .map(public_server)
             .map(|server| {
                 let samples = latency_by_server.remove(&server.id).unwrap_or_default();
-                server_json(server, settings.offline_threshold_seconds, samples)
+                server_json(server, samples)
             })
             .collect();
-        return json(
-            &serde_json::json!({
-                "servers": servers,
-                "server_time": now(),
-                "latestReportUpdates": [],
-                "regionStats": region_stats,
-                "sysConfig": {
-                    "display_mode": "bar",
-                    "show_price": settings.show_price,
-                    "show_expire": settings.show_expiry,
-                    "show_tf": settings.show_traffic,
-                    "show_time": settings.show_uptime,
-                    "show_search": settings.show_search,
-                    "show_groups": settings.show_groups
-                }
-            }),
-            200,
-        );
-    }
-
-    if method == Method::Get && path == "/api/server" {
-        if !turnstile_verified {
-            return error("请先完成 Cloudflare 人机验证", 403);
-        }
-        if !settings.public_dashboard && !admin {
-            return error("仪表盘未公开", 401);
-        }
-        let id = req
-            .url()?
-            .query_pairs()
-            .find_map(|(key, value)| (key == "id").then(|| value.to_string()))
-            .unwrap_or_default();
-        if id.is_empty() || id.len() > 80 {
-            return error("节点 ID 无效", 400);
-        }
-        return match db::get_server(&database, &id, false).await? {
-            Some(server) => {
-                let samples = latency::latest_all(&database)
-                    .await?
-                    .into_iter()
-                    .filter(|sample| sample.server_id == id)
-                    .collect();
-                json(
-                    &server_json(
-                        public_server(server),
-                        settings.offline_threshold_seconds,
-                        samples,
-                    ),
-                    200,
-                )
-            }
-            None => error("节点不存在", 404),
-        };
+        return json(&serde_json::json!({ "servers": servers }), 200);
     }
 
     if method == Method::Get && path.starts_with("/api/servers/") {
@@ -1159,47 +798,10 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                     .into_iter()
                     .filter(|sample| sample.server_id == id)
                     .collect();
-                json(
-                    &server_json(
-                        public_server(server),
-                        settings.offline_threshold_seconds,
-                        samples,
-                    ),
-                    200,
-                )
+                json(&server_json(public_server(server), samples), 200)
             }
             None => error("节点不存在", 404),
         };
-    }
-
-    if method == Method::Get && path == "/api/history/all" {
-        if !turnstile_verified {
-            return error("请先完成 Cloudflare 人机验证", 403);
-        }
-        if !settings.public_dashboard && !admin {
-            return error("仪表盘未公开", 401);
-        }
-        let url = req.url()?;
-        let id = url
-            .query_pairs()
-            .find_map(|(key, value)| (key == "id").then(|| value.to_string()))
-            .unwrap_or_default();
-        if id.is_empty() || id.len() > 80 || db::get_server(&database, &id, false).await?.is_none()
-        {
-            return error("节点不存在", 404);
-        }
-        let hours = url
-            .query_pairs()
-            .find_map(|(key, value)| (key == "hours").then(|| value.parse::<f64>().ok()))
-            .flatten()
-            .map(|value| value.ceil() as i64)
-            .unwrap_or(24);
-        let points: Vec<_> = db::history(&database, &id, hours)
-            .await?
-            .into_iter()
-            .map(history_json)
-            .collect();
-        return json(&points, 200);
     }
 
     if method == Method::Get && path.starts_with("/api/history/") {
@@ -1516,45 +1118,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     if method == Method::Get && path == "/api/admin/theme-settings" {
-        return json(&theme::settings_schema(&settings.theme_url).await?, 200);
-    }
-
-    if method == Method::Post && path == "/api/admin/themes/preview" {
-        let input: ThemePreviewInput = match req.json().await {
-            Ok(value) => value,
-            Err(_) => return error("主题地址格式无效", 400),
-        };
-        let Some(source) = theme::parse_theme_url(&input.theme_url) else {
-            return error("主题地址必须是 GitHub tree 构建目录", 400);
-        };
-        if theme::load_index(&source.normalized, &settings.site_name)
-            .await?
-            .is_none()
-        {
-            return error("主题目录中未找到可用的 index.html", 400);
-        }
-        let Some(proof) =
-            create_theme_preview(&env, &settings.admin_password_hash, &source.normalized)
-        else {
-            return error("无法创建主题预览", 503);
-        };
-        return json(
-            &serde_json::json!({ "theme_url": source.normalized, "proof": proof }),
-            200,
-        );
-    }
-
-    if method == Method::Post && path == "/api/admin/themes/preview/clear" {
-        let mut response = json(&Success { success: true }, 200)?;
-        response.headers_mut().append(
-            "Set-Cookie",
-            "cf_monitor_theme_preview=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
-        )?;
-        response.headers_mut().append(
-            "Set-Cookie",
-            "cf_monitor_theme_proof=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
-        )?;
-        return Ok(response);
+        return json(&theme::settings_schema(), 200);
     }
 
     if method == Method::Post && path == "/api/admin/exchange-rates/refresh" {
@@ -1610,7 +1174,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if settings.notification_endpoint.trim().is_empty() {
             return error("请先填写 Telegram Bot Token 和 Chat ID", 400);
         }
-        if let Err(err) = notify::send(&settings, "CF Monitor 测试通知：通知渠道配置成功。").await
+        if let Err(err) = notify::send(&settings, "NodeFlare 测试通知：通知渠道配置成功。").await
         {
             console_error!("test notification failed: {err}");
             return error("测试通知发送失败，请检查 Bot Token 和 Chat ID", 502);
@@ -1619,7 +1183,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     if method == Method::Patch && path == "/api/admin/settings" {
-        let mut input: SettingsInput = match req.json().await {
+        let input: SettingsInput = match req.json().await {
             Ok(value) => value,
             Err(_) => return error("设置格式无效", 400),
         };
@@ -1679,28 +1243,6 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         }) {
             return error("主题设置格式无效", 400);
         }
-        if let Some(value) = input.theme_url.as_deref() {
-            if value.chars().count() > 1000 {
-                return error("主题地址过长", 400);
-            }
-            let normalized = if value.trim().is_empty() {
-                String::new()
-            } else {
-                let Some(source) = theme::parse_theme_url(value) else {
-                    return error("主题地址必须是 GitHub tree 构建目录", 400);
-                };
-                source.normalized
-            };
-            if !normalized.is_empty()
-                && normalized != settings.theme_url
-                && theme::load_index(&normalized, &settings.site_name)
-                    .await?
-                    .is_none()
-            {
-                return error("主题目录中未找到可用的 index.html", 400);
-            }
-            input.theme_url = Some(normalized);
-        }
         if input.admin_username.as_ref().is_some_and(|value| {
             value.trim().is_empty()
                 || value.chars().count() > 64
@@ -1718,20 +1260,27 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         let enabled = input
             .turnstile_enabled
             .unwrap_or(settings.turnstile_enabled);
-        let login_enabled = input
-            .turnstile_login_enabled
-            .unwrap_or(settings.turnstile_login_enabled);
-        let site_key = input
+        let configured_site_key = input
             .turnstile_site_key
             .as_deref()
             .unwrap_or(&settings.turnstile_site_key)
             .trim();
-        let secret_key = input
+        let configured_secret_key = input
             .turnstile_secret_key
             .as_deref()
             .unwrap_or(&settings.turnstile_secret_key)
             .trim();
-        if (enabled || login_enabled) && (site_key.is_empty() || secret_key.is_empty()) {
+        let site_key = if configured_site_key.is_empty() {
+            environment_turnstile_site_key.trim()
+        } else {
+            configured_site_key
+        };
+        let secret_key = if configured_secret_key.is_empty() {
+            environment_turnstile_secret_key.trim()
+        } else {
+            configured_secret_key
+        };
+        if enabled && (site_key.is_empty() || secret_key.is_empty()) {
             return error("启用 Turnstile 前必须填写站点密钥和私钥", 400);
         }
         if input
@@ -1781,24 +1330,6 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         }) {
             return error("站点图标必须使用 HTTPS 地址", 400);
         }
-        if input
-            .cors_allowed_origins
-            .as_deref()
-            .is_some_and(|value| configured_origins(value).is_none())
-            || input
-                .csp_asset_origins
-                .as_deref()
-                .is_some_and(|value| configured_origins(value).is_none())
-        {
-            return error("来源列表只能包含完整的 HTTP(S) Origin", 400);
-        }
-        if input
-            .federation_sites
-            .as_ref()
-            .is_some_and(|value| !valid_federation_sites(value))
-        {
-            return error("聚合站点应包含名称和 HTTPS 根地址，最多 16 个", 400);
-        }
         let password_hash = if let Some(password) = input
             .new_password
             .as_deref()
@@ -1819,7 +1350,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         )
         .await?;
         let token = if password_hash.is_some() {
-            create_session(&env, &updated.admin_password_hash)
+            create_admin_jwt(&env, &updated.admin_password_hash)
         } else {
             None
         };
@@ -1827,42 +1358,6 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             &serde_json::json!({ "settings": updated, "token": token }),
             200,
         );
-    }
-
-    let preview = preview_theme(&req, &env, &settings.admin_password_hash);
-    let effective_theme = preview
-        .as_ref()
-        .map(|(theme_url, _)| theme_url.as_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(settings.theme_url.as_str());
-
-    if method == Method::Get && path.starts_with("/assets/") && !effective_theme.is_empty() {
-        return theme::asset(effective_theme, path.trim_start_matches("/assets/")).await;
-    }
-
-    if method == Method::Get
-        && !effective_theme.is_empty()
-        && (path == "/favicon.ico" || path.starts_with("/flags/") || path.starts_with("/os-icons/"))
-    {
-        return theme::compatibility_asset(path.trim_start_matches('/')).await;
-    }
-
-    if method == Method::Get && (path == "/" || path == "/index.html") {
-        if query_value(&req, "theme_url").is_some() && preview.is_none() {
-            return error("主题预览已失效，请从后台重新打开", 401);
-        }
-        if !effective_theme.is_empty() {
-            let Some(html) = theme::load_index(effective_theme, &settings.site_name).await? else {
-                return error("当前第三方主题无法加载", 502);
-            };
-            return theme_html_response(
-                html,
-                preview
-                    .as_ref()
-                    .map(|(theme_url, proof)| (theme_url.as_str(), proof.as_str())),
-                &csp_sources(&settings.csp_asset_origins),
-            );
-        }
     }
 
     if path.starts_with("/api/") {
@@ -1879,70 +1374,30 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         "Permissions-Policy",
         "camera=(), microphone=(), geolocation=()",
     )?;
-    let extra_sources = csp_sources(&settings.csp_asset_origins);
-    headers.set("Content-Security-Policy", &format!(
-        "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss: {extra_sources}; frame-src https://challenges.cloudflare.com; font-src 'self' data: {extra_sources}; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
-    ))?;
+    headers.set(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:; frame-src https://challenges.cloudflare.com; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+    )?;
     Ok(response)
 }
 
 #[event(fetch, respond_with_errors)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let path = req.path();
-    let method = req.method();
     let request_url = req.url().ok();
     let origin = req.headers().get("Origin").ok().flatten();
-    let configured = if origin.is_some() && path.starts_with("/api/") {
-        match env.d1("DB") {
-            Ok(database) => db::get_setting(&database, "cors_allowed_origins")
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-            Err(_) => String::new(),
-        }
-    } else {
-        String::new()
-    };
-    let allow_origin = origin
-        .as_deref()
-        .zip(request_url.as_ref())
-        .filter(|(origin, url)| origin_allowed(origin, url, &configured))
-        .map(|(origin, _)| origin.to_string());
 
-    if path == "/api/ws" && origin.is_some() && allow_origin.is_none() {
+    if path == "/api/ws"
+        && origin
+            .as_deref()
+            .zip(request_url.as_ref())
+            .is_some_and(|(origin, url)| !same_origin(origin, url))
+    {
         return error("WebSocket Origin 未获授权", 403);
-    }
-    if method == Method::Options && path.starts_with("/api/") {
-        let Some(origin) = allow_origin else {
-            return error("跨域来源未获授权", 403);
-        };
-        let mut response = Response::empty()?.with_status(204);
-        let headers = response.headers_mut();
-        headers.set("Access-Control-Allow-Origin", &origin)?;
-        headers.set(
-            "Access-Control-Allow-Methods",
-            "GET, POST, PATCH, DELETE, OPTIONS",
-        )?;
-        headers.set(
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type, X-Turnstile-Verified, X-Turnstile-Token",
-        )?;
-        headers.set("Access-Control-Max-Age", "86400")?;
-        headers.set("Vary", "Origin")?;
-        return Ok(response);
     }
 
     match handle(req, env, ctx).await {
-        Ok(mut response) => {
-            if let Some(origin) = allow_origin {
-                response
-                    .headers_mut()
-                    .set("Access-Control-Allow-Origin", &origin)?;
-                response.headers_mut().set("Vary", "Origin")?;
-            }
-            Ok(response)
-        }
+        Ok(response) => Ok(response),
         Err(err) => {
             console_error!("request failed: {err}");
             error("服务暂时不可用，请检查 D1 迁移与绑定", 500)
@@ -1955,7 +1410,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let Ok(database) = env.d1("DB") else {
         return;
     };
-    let default_name = env_text(&env, "SITE_NAME", "CF Monitor");
+    let default_name = env_text(&env, "SITE_NAME", "NodeFlare");
     let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180).clamp(30, 3600);
     let default_retention = env_number(&env, "HISTORY_RETENTION_DAYS", 30).clamp(1, 365);
     let default_username = env_text(&env, "ADMIN_USERNAME", "admin");
@@ -2005,9 +1460,23 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 mod tests {
     use super::{
         valid_cloudflare_account_id, valid_cloudflare_api_token, valid_ping_target,
-        validate_latency_task, ADMIN_HTML, ADMIN_SCRIPT, ADMIN_STYLE,
+        validate_latency_task, validate_server, ADMIN_HTML, ADMIN_SCRIPT, ADMIN_STYLE,
     };
-    use crate::models::LatencyTaskInput;
+    use crate::models::{LatencyTaskInput, ServerInput};
+
+    #[test]
+    fn defaults_new_servers_to_hidden_price_and_agent_updates() {
+        let mut server: ServerInput =
+            serde_json::from_value(serde_json::json!({ "name": "node" })).expect("server");
+        assert_eq!(server.price, 0.0);
+        assert!(server.auto_update);
+        assert_eq!(validate_server(&server), None);
+
+        server.price = -1.0;
+        assert_eq!(validate_server(&server), None);
+        server.price = -2.0;
+        assert_eq!(validate_server(&server), Some("价格无效"));
+    }
 
     #[test]
     fn validates_latency_targets() {

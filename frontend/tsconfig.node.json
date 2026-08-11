@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "tsBuildInfoFile": "../node_modules/.cache/cf-monitor/tsconfig.node.tsbuildinfo",
+    "tsBuildInfoFile": "../node_modules/.cache/nodeflare/tsconfig.node.tsbuildinfo",
     "composite": true,
     "noEmit": true,
     "skipLibCheck": true,

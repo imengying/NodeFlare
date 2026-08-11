@@ -165,7 +165,7 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
     }
 
     if !messages.is_empty() {
-        let body = format!("CF Monitor 告警\n\n{}", messages.join("\n"));
+        let body = format!("NodeFlare 告警\n\n{}", messages.join("\n"));
         send(settings, &body).await?;
     }
     previous = current;

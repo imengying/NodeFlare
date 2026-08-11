@@ -1,4 +1,4 @@
-# CF Monitor
+# NodeFlare
 
 基于 Rust、WebAssembly 和 Cloudflare Workers 的服务器监控，支持 Linux、Windows 和 macOS Agent。
 
@@ -13,7 +13,7 @@
 - 用户名密码登录、Cloudflare Turnstile、节点隐藏和公开备注
 - 节点管理、批量删除、拖拽排序、Agent 密钥轮换和在线配置
 - Telegram 通知、资源告警、离线/到期提醒和数据维护
-- 内置主题与 CFSM Theme Store，支持主题预览、应用和自定义设置
+- 内置 Komari Glass 主题，支持展示项、背景图和主题选项配置
 - Rust Agent 支持 Linux x86_64/ARM64、Windows x86_64 和 macOS ARM64，可按节点自动更新
 
 ## 部署到 Cloudflare
@@ -26,8 +26,9 @@
 | --- | ---: | --- |
 | `ADMIN_USERNAME` | 可选 | 管理员登录用户名，未设置时使用 `admin` |
 | `ADMIN_PASSWORD` | 必填 | 初始管理员密码，勾选“加密” |
-| `SESSION_SECRET` | 可选 | 会话签名密钥，勾选“加密”；未设置时使用密码哈希 |
-| `SITE_NAME` | 可选 | 站点名称，未设置时使用 `CF Monitor` |
+| `SITE_NAME` | 可选 | 站点名称，未设置时使用 `NodeFlare` |
+| `TURNSTILE_SITE_KEY` | 可选 | Turnstile Site Key，无需加密；也可在后台设置 |
+| `TURNSTILE_SECRET_KEY` | 可选 | Turnstile Secret Key，勾选“加密”；也可在后台设置 |
 | `OFFLINE_THRESHOLD_SECONDS` | 可选 | 离线判定秒数，未设置时使用 180，范围 30-3600 |
 | `HISTORY_RETENTION_DAYS` | 可选 | 历史保留天数，未设置时使用 30，范围 1-365 |
 | `CF_USAGE_ACCOUNT_ID` | 可选 | Cloudflare 用量查询的账户 ID，不设置则不启用用量查询 |
@@ -38,7 +39,6 @@
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `GET` | `/api/config` | 公开站点配置 |
-| `GET` | `/api/themes` | 第三方主题商店 |
 | `GET` | `/api/exchange-rates` | D1 中的 CNY 基准汇率快照 |
 | `GET` | `/api/servers` | 公开节点和最新指标 |
 | `GET` | `/api/history/:id?hours=24` | 节点历史 |
@@ -57,15 +57,12 @@
 | `DELETE` | `/api/admin/servers` | 批量删除节点 |
 | `GET/PATCH` | `/api/admin/settings` | 读写站点与展示设置 |
 | `GET` | `/api/admin/theme-settings` | 读取当前前端提供的主题设置描述 |
-| `POST` | `/api/admin/themes/preview` | 创建短时签名主题预览 |
 | `POST` | `/api/turnstile/verify` | 校验全站 Turnstile 令牌 |
 | `GET` | `/api/admin/database` | 查询 D1 节点、历史和数据库统计 |
 | `GET` | `/api/admin/cloudflare-usage` | 查询 UTC 今日/昨日的 D1 与 Workers 用量 |
 | `POST` | `/api/admin/exchange-rates/refresh` | 立即拉取并更新 D1 汇率快照 |
 | `DELETE` | `/api/admin/history` | 清理历史指标 |
 | `POST` | `/api/admin/notifications/test` | 发送一条通知测试消息 |
-
-第三方主题可在构建目录提供 `theme-settings.json`（`schema: 1`）。后台按字段生成设置控件，保存值通过 `/api/config` 的 `theme_options` 返回。
 
 ## 鸣谢
 

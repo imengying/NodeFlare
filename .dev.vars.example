@@ -1,7 +1,8 @@
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=change-this-local-password
-# Optional: set a stable signing key for admin sessions in production.
-# SESSION_SECRET=replace-with-a-random-secret
+# Optional: configure Turnstile through Worker variables instead of the admin panel.
+# TURNSTILE_SITE_KEY=your-site-key
+# TURNSTILE_SECRET_KEY=your-secret-key
 # Optional: enable Cloudflare usage statistics in the admin data workspace.
-# CLOUDFLARE_ACCOUNT_ID=your-account-id
-# CLOUDFLARE_API_TOKEN=token-with-account-analytics-read
+# CF_USAGE_ACCOUNT_ID=your-account-id
+# CF_USAGE_API_TOKEN=token-with-account-analytics-read

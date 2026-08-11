@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -17,21 +17,27 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use sysinfo::{Disks, Networks, System};
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-compile_error!("cf-monitor-agent supports Linux, Windows, and macOS");
+compile_error!("nodeflare-agent supports Linux, Windows, and macOS");
 
-const VERSION: &str = match option_env!("CF_MONITOR_AGENT_VERSION") {
+const VERSION: &str = match option_env!("NODEFLARE_AGENT_VERSION") {
     Some(version) if !version.is_empty() => version,
     _ => env!("CARGO_PKG_VERSION"),
 };
-const RELEASE_DOWNLOAD_BASE: &str =
-    "https://github.com/imengying/CF-Monitor/releases/latest/download";
+const LATEST_RELEASE_API: &str = "https://api.github.com/repos/imengying/NodeFlare/releases/latest";
 const PROBE_ATTEMPTS: usize = 4;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LATENCY_TASKS: usize = 128;
+const MAX_REPORT_AGE_SECONDS: i64 = 7_000;
+const REPORT_RETRY_MIN: Duration = Duration::from_secs(5);
+const REPORT_RETRY_MAX: Duration = Duration::from_secs(300);
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
@@ -74,9 +80,19 @@ struct RemoteConfig {
     network_interface: String,
     auto_update: i64,
     #[serde(default)]
-    latest_agent_version: String,
-    #[serde(default)]
     latency_tasks: Vec<LatencyTask>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,6 +306,35 @@ fn mem_value(contents: &str, key: &str) -> i64 {
 #[cfg(target_os = "linux")]
 fn file_line_count(path: &str) -> i64 {
     text(path).lines().skip(1).count() as i64
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn connection_counts_from_netstat(output: &str) -> (i64, i64) {
+    output.lines().fold((0_i64, 0_i64), |(tcp, udp), line| {
+        let protocol = line
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if protocol.starts_with("tcp") {
+            (tcp.saturating_add(1), udp)
+        } else if protocol.starts_with("udp") {
+            (tcp, udp.saturating_add(1))
+        } else {
+            (tcp, udp)
+        }
+    })
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn connection_counts() -> (i64, i64) {
+    Command::new("netstat")
+        .args(["-an"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| connection_counts_from_netstat(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
 }
 
 #[cfg(target_os = "linux")]
@@ -763,6 +808,7 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
         .map(|gpu| gpu.model.as_str())
         .collect::<Vec<_>>()
         .join(" · ");
+    let (tcp_connections, udp_connections) = connection_counts();
 
     Report {
         timestamp: unix_timestamp(),
@@ -782,8 +828,8 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
         net_tx_total: u64_to_i64(net_tx_total),
         uptime: u64_to_i64(System::uptime()),
         processes: system.processes().len() as i64,
-        tcp_connections: 0,
-        udp_connections: 0,
+        tcp_connections,
+        udp_connections,
         cpu_cores: system.cpus().len().max(1) as i64,
         cpu_model: system
             .cpus()
@@ -827,10 +873,25 @@ fn runtime_config() -> Result<RuntimeConfig> {
         .unwrap_or(5)
         .clamp(2, 60)
         .min(interval);
+    let server_id = required("SERVER_ID")?;
+    let token = required("AGENT_TOKEN")?;
+    let worker_url = required("WORKER_URL")?;
+    if server_id.is_empty()
+        || token.is_empty()
+        || server_id.len() > 160
+        || token.len() > 512
+        || server_id.chars().any(char::is_whitespace)
+        || token.chars().any(char::is_whitespace)
+    {
+        return Err("SERVER_ID or AGENT_TOKEN is invalid".into());
+    }
+    if !valid_worker_url(&worker_url) {
+        return Err("WORKER_URL must be an http(s) URL without whitespace".into());
+    }
     Ok(RuntimeConfig {
-        server_id: required("SERVER_ID")?,
-        token: required("AGENT_TOKEN")?,
-        worker_url: required("WORKER_URL")?.trim_end_matches('/').to_string(),
+        server_id,
+        token,
+        worker_url: worker_url.trim_end_matches('/').to_string(),
         report_interval: interval,
         collect_interval,
         network_interface: env::var("NETWORK_INTERFACE").unwrap_or_default(),
@@ -850,6 +911,7 @@ fn submit(
     let response = agent
         .post(&format!("{}/api/agent/report", config.worker_url))
         .set("Authorization", &format!("Bearer {}", config.token))
+        .set("User-Agent", &format!("nodeflare-agent/{VERSION}"))
         .send_json(batch)?;
     Ok(response.into_json::<ReportResponse>()?.config)
 }
@@ -864,9 +926,58 @@ fn apply_remote(config: &mut RuntimeConfig, remote: &RemoteConfig) -> bool {
     config
         .network_interface
         .clone_from(&remote.network_interface);
-    let changed = config.latency_tasks != remote.latency_tasks;
-    config.latency_tasks.clone_from(&remote.latency_tasks);
+    let tasks = sanitize_latency_tasks(&remote.latency_tasks);
+    let changed = config.latency_tasks != tasks;
+    config.latency_tasks = tasks;
     changed
+}
+
+fn sanitize_latency_tasks(tasks: &[LatencyTask]) -> Vec<LatencyTask> {
+    let mut seen = HashSet::new();
+    tasks
+        .iter()
+        .filter(|task| {
+            !task.id.is_empty()
+                && task.id.len() <= 80
+                && (1..=80).contains(&task.name.trim().chars().count())
+                && (30..=3600).contains(&task.interval_seconds)
+                && matches!(task.task_type.as_str(), "tcp" | "icmp")
+                && parse_probe_target(&task.target).is_some_and(|(_, port)| {
+                    task.task_type == "tcp" || (port == 443 && !task.target.contains(':'))
+                })
+                && seen.insert(task.id.clone())
+        })
+        .take(MAX_LATENCY_TASKS)
+        .cloned()
+        .collect()
+}
+
+fn valid_worker_url(value: &str) -> bool {
+    let value = value.trim_end_matches('/');
+    let authority = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .and_then(|remainder| remainder.split('/').next());
+    value.len() <= 2048
+        && authority.is_some_and(|authority| !authority.is_empty() && !authority.contains('@'))
+        && !value
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '?' | '#'))
+}
+
+fn report_retry_delay(failures: u32, report_interval: u64) -> Duration {
+    if failures == 0 {
+        return Duration::from_secs(report_interval);
+    }
+    let exponent = failures.saturating_sub(1).min(16);
+    REPORT_RETRY_MIN
+        .checked_mul(1_u32 << exponent)
+        .unwrap_or(REPORT_RETRY_MAX)
+        .min(REPORT_RETRY_MAX)
+}
+
+fn prune_report_samples(samples: &mut Vec<Report>, now: i64) {
+    samples.retain(|report| (report.timestamp - now).abs() <= MAX_REPORT_AGE_SECONDS);
 }
 
 fn normalized_version(value: &str) -> &str {
@@ -915,11 +1026,51 @@ fn executable_format_valid(path: &Path) -> bool {
     }
 }
 
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn parse_checksum(contents: &str, artifact: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let hash = fields.next()?;
+        let name = fields.next()?.trim_start_matches('*');
+        (name == artifact
+            && fields.next().is_none()
+            && hash.len() == 64
+            && hash.chars().all(|character| character.is_ascii_hexdigit()))
+        .then(|| hash.to_ascii_lowercase())
+    })
+}
+
+fn release_checksum(agent: &ureq::Agent, url: &str, artifact: &str) -> Result<String> {
+    let mut contents = String::new();
+    agent
+        .get(url)
+        .call()?
+        .into_reader()
+        .take(1024 * 1024)
+        .read_to_string(&mut contents)?;
+    parse_checksum(&contents, artifact)
+        .ok_or_else(|| format!("SHA256SUMS does not contain a valid entry for {artifact}").into())
+}
+
 fn download_agent(
     agent: &ureq::Agent,
     url: &str,
     destination: &Path,
     expected_version: &str,
+    expected_sha256: &str,
 ) -> Result<bool> {
     let Ok(response) = agent.get(url).call() else {
         return Ok(false);
@@ -929,7 +1080,10 @@ fn download_agent(
     let copied = io::copy(&mut response.take(MAX_AGENT_BINARY_BYTES + 1), &mut file)?;
     file.flush()?;
     drop(file);
-    if copied > MAX_AGENT_BINARY_BYTES || !executable_format_valid(destination) {
+    if copied > MAX_AGENT_BINARY_BYTES
+        || !executable_format_valid(destination)
+        || sha256_file(destination)? != expected_sha256
+    {
         let _ = fs::remove_file(destination);
         return Ok(false);
     }
@@ -950,30 +1104,60 @@ fn download_agent(
     Ok(valid)
 }
 
-fn update(agent: &ureq::Agent, config: &RuntimeConfig, remote: &RemoteConfig) -> Result<bool> {
-    let Some(remote_version) = version_triplet(&remote.latest_agent_version) else {
+fn update(agent: &ureq::Agent) -> Result<bool> {
+    let release = agent
+        .get(LATEST_RELEASE_API)
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", &format!("nodeflare-agent/{VERSION}"))
+        .call()?
+        .into_json::<GithubRelease>()?;
+    let Some(remote_version) = version_triplet(&release.tag_name) else {
         return Ok(false);
     };
     let Some(current_version) = version_triplet(VERSION) else {
         return Ok(false);
     };
-    if remote.auto_update != 1 || remote_version <= current_version {
+    if remote_version <= current_version {
         return Ok(false);
     }
     let Some(artifact) = agent_artifact_name() else {
         return Ok(false);
     };
     let current = env::current_exe()?;
-    #[cfg(target_os = "windows")]
-    let temporary = current.with_extension("update.exe");
-    #[cfg(not(target_os = "windows"))]
-    let temporary = current.with_extension("update");
-    let primary = format!("{}/{}", config.worker_url, artifact);
-    let fallback = format!("{RELEASE_DOWNLOAD_BASE}/{artifact}");
-    if !download_agent(agent, &primary, &temporary, &remote.latest_agent_version)?
-        && !download_agent(agent, &fallback, &temporary, &remote.latest_agent_version)?
-    {
-        return Err("downloaded agent version does not match the Worker version".into());
+    let temporary = current.with_file_name(format!(
+        ".nodeflare-agent.{}.download{}",
+        std::process::id(),
+        if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        }
+    ));
+    let Some(download_url) = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == artifact)
+        .map(|asset| asset.browser_download_url.as_str())
+    else {
+        return Err(format!("latest release does not contain {artifact}").into());
+    };
+    let Some(checksum_url) = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == "SHA256SUMS")
+        .map(|asset| asset.browser_download_url.as_str())
+    else {
+        return Err("latest release does not contain SHA256SUMS".into());
+    };
+    let expected_sha256 = release_checksum(agent, checksum_url, artifact)?;
+    if !download_agent(
+        agent,
+        download_url,
+        &temporary,
+        &release.tag_name,
+        &expected_sha256,
+    )? {
+        return Err("downloaded agent version does not match the configured version".into());
     }
 
     #[cfg(unix)]
@@ -987,11 +1171,12 @@ fn update(agent: &ureq::Agent, config: &RuntimeConfig, remote: &RemoteConfig) ->
     {
         let script = concat!(
             "$ErrorActionPreference='Stop'; ",
-            "$targetPid=[int]$env:CF_MONITOR_UPDATE_PID; ",
+            "$targetPid=[int]$env:NODEFLARE_UPDATE_PID; ",
             "Wait-Process -Id $targetPid; ",
-            "Move-Item -LiteralPath $env:CF_MONITOR_UPDATE_NEW ",
-            "-Destination $env:CF_MONITOR_UPDATE_CURRENT -Force; ",
-            "Start-Process -FilePath $env:CF_MONITOR_UPDATE_CURRENT -ArgumentList 'run'"
+            "Move-Item -LiteralPath $env:NODEFLARE_UPDATE_NEW ",
+            "-Destination $env:NODEFLARE_UPDATE_CURRENT -Force; ",
+            "try { Start-ScheduledTask -TaskName 'NodeFlare Agent' -ErrorAction Stop } ",
+            "catch { Start-Process -FilePath $env:NODEFLARE_UPDATE_CURRENT -ArgumentList 'run' }"
         );
         Command::new("powershell.exe")
             .args([
@@ -1001,9 +1186,9 @@ fn update(agent: &ureq::Agent, config: &RuntimeConfig, remote: &RemoteConfig) ->
                 "-Command",
                 script,
             ])
-            .env("CF_MONITOR_UPDATE_PID", std::process::id().to_string())
-            .env("CF_MONITOR_UPDATE_NEW", &temporary)
-            .env("CF_MONITOR_UPDATE_CURRENT", &current)
+            .env("NODEFLARE_UPDATE_PID", std::process::id().to_string())
+            .env("NODEFLARE_UPDATE_NEW", &temporary)
+            .env("NODEFLARE_UPDATE_CURRENT", &current)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1022,6 +1207,8 @@ fn run(once: bool, print_only: bool) -> Result<()> {
     let mut next_latency: HashMap<String, Instant> = HashMap::new();
     let mut pending_results = Vec::new();
     let mut pending_samples = Vec::new();
+    let mut report_failures = 0_u32;
+    let mut next_update_check = Instant::now();
     loop {
         let current = Instant::now();
         let due = config
@@ -1056,6 +1243,7 @@ fn run(once: bool, print_only: bool) -> Result<()> {
                 return Ok(());
             }
             pending_samples.push(report);
+            prune_report_samples(&mut pending_samples, unix_timestamp());
             if pending_samples.len() > 720 {
                 let overflow = pending_samples.len() - 720;
                 pending_samples.drain(..overflow);
@@ -1067,9 +1255,19 @@ fn run(once: bool, print_only: bool) -> Result<()> {
             match submit(&agent, &config, &pending_samples) {
                 Ok(remote) => {
                     pending_samples.clear();
+                    report_failures = 0;
                     if let Some(remote) = remote {
-                        if update(&agent, &config, &remote)? {
-                            return Ok(());
+                        if !once && remote.auto_update == 1 && Instant::now() >= next_update_check {
+                            match update(&agent) {
+                                Ok(true) => return Ok(()),
+                                Ok(false) => {
+                                    next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
+                                }
+                                Err(error) => {
+                                    eprintln!("agent update failed: {error}");
+                                    next_update_check = Instant::now() + UPDATE_RETRY_INTERVAL;
+                                }
+                            }
                         }
                         if apply_remote(&mut config, &remote) {
                             next_latency.clear();
@@ -1078,9 +1276,14 @@ fn run(once: bool, print_only: bool) -> Result<()> {
                 }
                 Err(error) => {
                     eprintln!("report failed: {error}");
+                    report_failures = report_failures.saturating_add(1);
+                    if once {
+                        return Err(error);
+                    }
                 }
             }
-            next_report = Instant::now() + Duration::from_secs(config.report_interval);
+            let retry_delay = report_retry_delay(report_failures, config.report_interval);
+            next_report = Instant::now() + retry_delay;
             if once {
                 return Ok(());
             }
@@ -1111,10 +1314,10 @@ fn main() {
             println!("{VERSION}");
             Ok(())
         }
-        _ => Err("usage: cf-monitor-agent <run|once|collect|version>".into()),
+        _ => Err("usage: nodeflare-agent <run|once|collect|version>".into()),
     };
     if let Err(error) = result {
-        eprintln!("cf-monitor-agent: {error}");
+        eprintln!("nodeflare-agent: {error}");
         std::process::exit(1);
     }
 }
@@ -1123,13 +1326,17 @@ fn main() {
 mod tests {
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     use super::{
-        agent_artifact_name, executable_format_valid, median, normalized_version,
-        parse_probe_target, ping_latency, selected_interface, tcp_latency_probe, version_triplet,
-        PROBE_ATTEMPTS,
+        agent_artifact_name, executable_format_valid, median, normalized_version, parse_checksum,
+        parse_probe_target, ping_latency, prune_report_samples, report_retry_delay,
+        sanitize_latency_tasks, selected_interface, tcp_latency_probe, valid_worker_url,
+        version_triplet, LatencyTask, Report, MAX_LATENCY_TASKS, PROBE_ATTEMPTS,
     };
 
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    use super::connection_counts_from_netstat;
     #[cfg(target_os = "linux")]
     use super::disk_device;
 
@@ -1156,6 +1363,92 @@ mod tests {
         assert_eq!(version_triplet("1.2"), None);
         assert_eq!(version_triplet("1.2.3.4"), None);
         assert_eq!(version_triplet("rust-3"), None);
+    }
+
+    #[test]
+    fn parses_release_checksums() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let checksums = format!("{hash}  agent-linux-x86_64\ninvalid  other\n");
+        assert_eq!(
+            parse_checksum(&checksums, "agent-linux-x86_64").as_deref(),
+            Some(hash)
+        );
+        assert_eq!(parse_checksum(&checksums, "other"), None);
+    }
+
+    #[test]
+    fn validates_worker_urls() {
+        assert!(valid_worker_url("https://monitor.example.com/"));
+        assert!(valid_worker_url("http://127.0.0.1:8787"));
+        assert!(!valid_worker_url("monitor.example.com"));
+        assert!(!valid_worker_url("https://"));
+        assert!(!valid_worker_url("https://user@example.com"));
+        assert!(!valid_worker_url("https://monitor.example.com/?token=abc"));
+        assert!(!valid_worker_url("https://bad host.example"));
+    }
+
+    #[test]
+    fn bounds_and_filters_remote_latency_tasks() {
+        let valid = LatencyTask {
+            id: "task-1".to_string(),
+            name: "Cloudflare".to_string(),
+            task_type: "tcp".to_string(),
+            target: "1.1.1.1:443".to_string(),
+            interval_seconds: 60,
+        };
+        let mut tasks = vec![valid.clone(), valid];
+        tasks.push(LatencyTask {
+            id: "bad".to_string(),
+            name: "Bad".to_string(),
+            task_type: "http".to_string(),
+            target: "https://example.com".to_string(),
+            interval_seconds: 1,
+        });
+        for index in 2..=MAX_LATENCY_TASKS + 10 {
+            tasks.push(LatencyTask {
+                id: format!("task-{index}"),
+                name: format!("Task {index}"),
+                task_type: "icmp".to_string(),
+                target: "1.1.1.1".to_string(),
+                interval_seconds: 60,
+            });
+        }
+        let sanitized = sanitize_latency_tasks(&tasks);
+        assert_eq!(sanitized.len(), MAX_LATENCY_TASKS);
+        assert_eq!(sanitized[0].id, "task-1");
+        assert!(!sanitized.iter().any(|task| task.id == "bad"));
+    }
+
+    #[test]
+    fn backs_off_failed_reports() {
+        assert_eq!(report_retry_delay(0, 60), Duration::from_secs(60));
+        assert_eq!(report_retry_delay(1, 60), Duration::from_secs(5));
+        assert_eq!(report_retry_delay(4, 60), Duration::from_secs(40));
+        assert_eq!(report_retry_delay(20, 60), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn drops_samples_the_worker_would_reject_as_expired() {
+        let mut samples = vec![
+            Report {
+                timestamp: 1_000,
+                ..Report::default()
+            },
+            Report {
+                timestamp: 8_500,
+                ..Report::default()
+            },
+        ];
+        prune_report_samples(&mut samples, 9_000);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].timestamp, 8_500);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn parses_netstat_connection_counts() {
+        let output = "tcp4 0 0 host.443 peer.1 ESTABLISHED\nudp4 0 0 *.5353 *.*\nTCP host peer ESTABLISHED\n";
+        assert_eq!(connection_counts_from_netstat(output), (2, 1));
     }
 
     #[test]

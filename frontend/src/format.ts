@@ -75,7 +75,7 @@ export function formatCurrency(value: number, currency = "CNY") {
 
 export function formatPrice(server: Pick<Server, "price" | "billing_cycle" | "currency">, locale: UiLocale = "zh-CN") {
   if (server.price === -1) return ui(locale, "免费", "Free");
-  if (server.price === 0) return ui(locale, "未设置", "Not set");
+  if (server.price === 0) return "";
   if (server.price < 0) return "";
   const cycle = server.billing_cycle >= 27 && server.billing_cycle <= 32 ? ui(locale, "月", "month")
     : server.billing_cycle >= 87 && server.billing_cycle <= 95 ? ui(locale, "季", "quarter")

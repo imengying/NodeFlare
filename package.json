@@ -1,19 +1,19 @@
 {
-  "name": "cf-monitor",
+  "name": "nodeflare",
   "version": "0.0.1",
   "private": true,
-  "repository": "https://github.com/imengying/CF-Monitor",
+  "repository": "https://github.com/imengying/NodeFlare",
   "packageManager": "bun@1.3.14",
   "workspaces": [
     "frontend"
   ],
   "scripts": {
-    "dev": "bun run build:agent && bun run build:frontend && bun run db:local && CF_MONITOR_ADMIN_READY=1 bunx wrangler dev",
+    "dev": "bun run build:frontend && bun run db:local && NODEFLARE_ADMIN_READY=1 bunx wrangler dev",
     "dev:frontend": "bun run --cwd frontend dev",
-    "build": "bun run build:agent && bun run build:frontend && CF_MONITOR_ADMIN_READY=1 sh scripts/build-worker.sh",
+    "build": "bun run build:frontend && NODEFLARE_ADMIN_READY=1 sh scripts/build-worker.sh",
     "build:agent": "sh scripts/build-agent.sh",
-    "build:frontend": "bun run --cwd frontend build",
-    "deploy": "bun run build:agent && bun run build:frontend && CF_MONITOR_ADMIN_READY=1 sh scripts/deploy-worker.sh",
+    "build:frontend": "sh scripts/build-frontend.sh",
+    "deploy": "sh scripts/deploy-worker.sh",
     "db:local": "bunx wrangler d1 migrations apply DB --local",
     "db:remote": "bunx wrangler d1 migrations apply DB --remote",
     "test:smoke": "sh scripts/smoke-test.sh"

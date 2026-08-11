@@ -5,7 +5,11 @@ fn default_group() -> String {
 }
 
 fn default_price() -> f64 {
-    -2.0
+    0.0
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_billing_cycle() -> i64 {
@@ -43,11 +47,6 @@ pub struct LoginRequest {
 #[derive(Debug, Deserialize)]
 pub struct TurnstileVerifyRequest {
     pub token: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ThemePreviewInput {
-    pub theme_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -93,7 +92,7 @@ pub struct ServerInput {
     pub tx_correction: i64,
     #[serde(default)]
     pub offline_notify_disabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     pub auto_update: bool,
 }
 
@@ -109,7 +108,6 @@ pub struct SettingsInput {
     pub history_retention_days: Option<i64>,
     pub default_theme: Option<String>,
     pub background_url: Option<String>,
-    pub theme_url: Option<String>,
     pub theme_options: Option<serde_json::Value>,
     pub show_search: Option<bool>,
     pub show_groups: Option<bool>,
@@ -134,9 +132,6 @@ pub struct SettingsInput {
     pub expiry_alert_days: Option<i64>,
     pub cloudflare_account_id: Option<String>,
     pub cloudflare_api_token: Option<String>,
-    pub cors_allowed_origins: Option<String>,
-    pub csp_asset_origins: Option<String>,
-    pub federation_sites: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,7 +395,6 @@ pub struct AgentConfigView {
     pub collect_interval: i64,
     pub network_interface: String,
     pub auto_update: i64,
-    pub latest_agent_version: String,
     #[serde(default)]
     pub latency_tasks: Vec<AgentLatencyTask>,
 }

@@ -1,11 +1,21 @@
 #!/bin/sh
 set -eu
 
+current_build_key=$(sh scripts/build-key.sh worker 2>/dev/null || true)
+if [ "${NODEFLARE_WORKER_READY:-0}" = "1" ] && [ -n "$current_build_key" ]; then
+  built_build_key=$(sed -n '1p' build/.nodeflare-revision 2>/dev/null || true)
+  if [ "$built_build_key" = "$current_build_key" ] \
+    && [ -f build/index.js ] \
+    && [ -f build/worker/index.wasm ]; then
+    echo "Worker build output is ready; skipping rebuild."
+    exit 0
+  fi
+fi
+
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/ensure-rust.sh"
 
-if [ "${CF_MONITOR_ADMIN_READY:-0}" != "1" ]; then
-  bun run build:agent
+if [ "${NODEFLARE_ADMIN_READY:-0}" != "1" ]; then
   bun run build:frontend
 fi
 
@@ -18,4 +28,8 @@ else
   worker_build="${CARGO_HOME:-$HOME/.cargo}/bin/worker-build"
 fi
 
-exec "$worker_build" --release --no-panic-recovery
+CUSTOM_SHIM="$script_dir/worker-shim.js" "$worker_build" --release --no-panic-recovery
+
+if [ -n "$current_build_key" ]; then
+  printf '%s\n' "$current_build_key" > build/.nodeflare-revision
+fi

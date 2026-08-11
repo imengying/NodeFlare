@@ -42,7 +42,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_TARGET_DIR: target/agent
-      CF_MONITOR_AGENT_VERSION: ${{ needs.metadata.outputs.version }}
+      NODEFLARE_AGENT_VERSION: ${{ needs.metadata.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -89,7 +89,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p release
-          cp "target/agent/${{ matrix.target }}/release/cf-monitor-agent${{ matrix.extension }}" "release/${{ matrix.asset }}"
+          cp "target/agent/${{ matrix.target }}/release/nodeflare-agent${{ matrix.extension }}" "release/${{ matrix.asset }}"
       - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
@@ -110,11 +110,11 @@ jobs:
       - name: Build public frontend
         run: bun run --cwd frontend build:public
       - name: Package frontend
-        run: tar -czf "cf-monitor-frontend-${{ needs.metadata.outputs.version }}.tar.gz" -C frontend/dist .
+        run: tar -czf "nodeflare-frontend-${{ needs.metadata.outputs.version }}.tar.gz" -C frontend/dist .
       - uses: actions/upload-artifact@v6
         with:
           name: frontend
-          path: cf-monitor-frontend-${{ needs.metadata.outputs.version }}.tar.gz
+          path: nodeflare-frontend-${{ needs.metadata.outputs.version }}.tar.gz
           if-no-files-found: error
 
   release:
@@ -145,7 +145,16 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+      - name: Stage installer scripts
+        shell: bash
+        run: |
+          mkdir -p release-package
+          cp release-assets/* release-package/
+          cp agent/agent.sh release-package/install-agent.sh
+          cp agent/install.ps1 release-package/install-agent.ps1
+          cp agent/install-macos.sh release-package/install-agent-macos.sh
+          (cd release-package && sha256sum * > SHA256SUMS)
       - uses: softprops/action-gh-release@v3
         with:
           body_path: CHANGELOG.md
-          files: release-assets/**
+          files: release-package/**

@@ -9,7 +9,7 @@ import type { Config, ExchangeRates, Server } from "./types";
 import { resolveBackground, themeToggle } from "./theme";
 import { ui } from "./locale";
 
-const defaultConfig: Config = { ...demoConfig, site_description: "", site_name: "CF Monitor" };
+const defaultConfig: Config = { ...demoConfig, site_description: "", site_name: "" };
 const demoMode = import.meta.env.DEV && new URLSearchParams(window.location.search).has("demo");
 const NodeDetails = lazy(() => import("./components/NodeDetails").then((module) => ({ default: module.NodeDetails })));
 
@@ -21,6 +21,7 @@ function routeServerId() {
 
 export default function App() {
   const [config, setConfig] = useState(defaultConfig);
+  const [configReady, setConfigReady] = useState(demoMode);
   const [servers, setServers] = useState<Server[]>([]);
   const [exchangeRates, setExchangeRates] = useState<ExchangeRates | null>(null);
   const [loading, setLoading] = useState(true);
@@ -31,7 +32,7 @@ export default function App() {
   const [needsVerification, setNeedsVerification] = useState(false);
   const [verificationBusy, setVerificationBusy] = useState(false);
   const [appearance, setAppearance] = useState<"light" | "dark" | null>(() => {
-    const stored = localStorage.getItem("cf-monitor-theme");
+    const stored = localStorage.getItem("nodeflare-theme");
     return stored === "light" || stored === "dark" ? stored : null;
   });
   const [systemDark, setSystemDark] = useState(() => matchMedia("(prefers-color-scheme: dark)").matches);
@@ -44,6 +45,7 @@ export default function App() {
     if (!quiet) setLoading(true);
     if (demoMode) {
       setConfig(demoConfig);
+      setConfigReady(true);
       setServers(demoServers);
       setExchangeRates(demoExchangeRates);
       setError("");
@@ -53,6 +55,7 @@ export default function App() {
     try {
       const nextConfig = await api.config();
       setConfig(nextConfig);
+      setConfigReady(true);
       if (nextConfig.turnstile_enabled && !getTurnstileProof() && !getToken()) {
         setNeedsVerification(true);
         setServers([]);
@@ -60,17 +63,10 @@ export default function App() {
         return;
       }
       const [serverResult, ratesResult] = await Promise.all([api.servers(), api.exchangeRates()]);
-      const localServers = serverResult.servers.map((server) => ({ ...server, source_id: server.id, source_url: "", source_name: nextConfig.site_name }));
-      const remoteResults = await Promise.allSettled((nextConfig.federation_sites || []).map(async (site, index) => {
-        const result = await api.servers(false, site.url);
-        return result.servers.map((server) => ({ ...server, id: `remote-${index}-${server.id}`, source_id: server.id, source_url: site.url.replace(/\/$/, ""), source_name: site.name }));
-      }));
-      const remoteServers = remoteResults.flatMap((result) => result.status === "fulfilled" ? result.value : []);
-      setServers([...localServers, ...remoteServers]);
+      setServers(serverResult.servers);
       setExchangeRates(ratesResult);
       setNeedsVerification(false);
-      const failedSites = remoteResults.filter((result) => result.status === "rejected").length;
-      setError(failedSites ? ui(nextConfig.locale, `${failedSites} 个聚合站点暂时不可用`, `${failedSites} federated sites are unavailable`) : "");
+      setError("");
     } catch (reason) {
       if (reason instanceof ApiError && reason.status === 403) {
         setTurnstileProof("");
@@ -135,45 +131,42 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!configReady) return;
     const selected = servers.find((server) => server.id === selectedId);
     document.title = selected ? `${selected.name} · ${config.site_name}` : config.site_name;
-  }, [config.site_name, selectedId, servers]);
+  }, [config.site_name, configReady, selectedId, servers]);
 
   useEffect(() => {
     if (loading || !config.websocket || !config.public_dashboard || demoMode) return;
     if (config.turnstile_enabled && !getTurnstileProof()) return;
     const reconnects: number[] = [];
     let cancelled = false;
-    const sources = [{ url: "", name: config.site_name }, ...(config.federation_sites || []).map((site) => ({ ...site, url: site.url.replace(/\/$/, "") }))];
-    const connect = (source: typeof sources[number]) => {
+    const connect = () => {
       if (cancelled) return;
-      const endpoint = source.url ? new URL(source.url) : new URL(location.origin);
+      const endpoint = new URL(location.origin);
       endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
       endpoint.pathname = "/api/ws";
       endpoint.search = "";
-      const selectedServer = servers.find((server) => server.id === selectedId && (server.source_url || "") === source.url);
-      if (selectedServer?.source_id) endpoint.searchParams.set("server_id", selectedServer.source_id);
-      if (!source.url) {
-        const proof = getTurnstileProof();
-        if (proof) endpoint.searchParams.set("turnstile_verified", proof);
-      }
+      if (selectedId) endpoint.searchParams.set("server_id", selectedId);
+      const proof = getTurnstileProof();
+      if (proof) endpoint.searchParams.set("turnstile_verified", proof);
       const socket = new WebSocket(endpoint);
       wsRef.current.push(socket);
       socket.onclose = () => {
-        if (!cancelled) reconnects.push(window.setTimeout(() => connect(source), 3000));
+        if (!cancelled) reconnects.push(window.setTimeout(connect, 3000));
       };
       socket.onmessage = (event) => {
         if (event.data === "pong") return;
         try {
           const message = JSON.parse(event.data);
           if (message.type !== "metrics") return;
-          setServers((current) => current.map((server) => (server.source_url || "") === source.url && (server.source_id || server.id) === message.server_id
+          setServers((current) => current.map((server) => server.id === message.server_id
             ? { ...server, ...message.metrics, timestamp: message.timestamp }
             : server));
         } catch { /* Ignore non-protocol messages. */ }
       };
     };
-    sources.forEach(connect);
+    connect();
     const heartbeat = window.setInterval(() => wsRef.current.forEach((socket) => socket.readyState === WebSocket.OPEN && socket.send("ping")), 30_000);
     return () => {
       cancelled = true;
@@ -182,7 +175,7 @@ export default function App() {
       wsRef.current.forEach((socket) => socket.close());
       wsRef.current = [];
     };
-  }, [config.websocket, config.public_dashboard, config.turnstile_enabled, config.site_name, config.federation_sites, loading, needsVerification, selectedId]);
+  }, [config.websocket, config.public_dashboard, config.turnstile_enabled, loading, needsVerification, selectedId]);
 
   const groups = useMemo(() => ["__all__", ...Array.from(new Set(servers.map((server) => server.group_name || "默认")))], [servers]);
   const visible = useMemo(() => servers.filter((server) => {
@@ -212,8 +205,12 @@ export default function App() {
 
   function toggleTheme() {
     const next = dark ? "light" : "dark";
-    localStorage.setItem("cf-monitor-theme", next);
+    localStorage.setItem("nodeflare-theme", next);
     setAppearance(next);
+  }
+
+  if (!configReady) {
+    return <div className="app-bootstrap" aria-busy={loading}>{error ? <div className="error-band"><span>{error}</span><button onClick={() => void load()}>重试</button></div> : null}</div>;
   }
 
   return (

@@ -75,6 +75,7 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
   const locale = config.locale || "zh-CN";
   const price = formatPrice(server, locale);
   const remainingValue = remainingAssetValue(server.price, server.billing_cycle, server.expires_at);
+  const showExpiryPanel = config.show_expiry && (server.price !== 0 || server.expires_at !== null);
 
   return (
     <button className={`node-card glass-panel ${online ? "" : "offline"}`} onClick={onOpen} type="button" aria-label={ui(locale, `查看 ${server.name} 详情`, `View ${server.name} details`)}>
@@ -99,7 +100,7 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
           <Metric label={ui(locale, "流量", "Traffic")} value={server.traffic_limit > 0 ? `${traffic.toFixed(1)}%` : "∞"} used={traffic} sub={`${formatBytes(usedTraffic)} / ${server.traffic_limit > 0 ? formatBytes(server.traffic_limit) : "∞"}`} muted={!online} valueTone={server.traffic_limit <= 0 ? "" : traffic >= 95 ? "danger-text" : traffic >= 60 ? "warning-text" : "success-text"} />
         </div>
 
-        <div className={`data-grid ${config.show_expiry ? "" : "two-columns"}`}>
+        <div className={`data-grid ${showExpiryPanel ? "" : "two-columns"}`}>
           <div className="data-panel" aria-label="实时速率">
             <CompactLine icon={<ChevronUp size={11} />} tone="success-text">{formatSpeed(server.net_out)}</CompactLine>
             <CompactLine icon={<ChevronDown size={11} />} tone="info-text">{formatSpeed(server.net_in)}</CompactLine>
@@ -108,11 +109,9 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
             <CompactLine icon={<Upload size={11} />}>{formatBytes(server.net_tx_total)}</CompactLine>
             <CompactLine icon={<Download size={11} />}>{formatBytes(server.net_rx_total)}</CompactLine>
           </div>
-          {config.show_expiry ? <div className="data-panel" aria-label="剩余周期">
-            {(server.price >= -1) ? <>
-              <CompactLine icon={<CalendarDays size={11} />}>{formatExpire(server, locale)}</CompactLine>
-              <CompactLine icon={<Coins size={11} />}>{server.price === -1 ? ui(locale, "免费", "Free") : formatCurrency(remainingValue, server.currency)}</CompactLine>
-            </> : null}
+          {showExpiryPanel ? <div className="data-panel" aria-label="剩余周期">
+            <CompactLine icon={<CalendarDays size={11} />}>{formatExpire(server, locale)}</CompactLine>
+            {server.price !== 0 ? <CompactLine icon={<Coins size={11} />}>{server.price === -1 ? ui(locale, "免费", "Free") : formatCurrency(remainingValue, server.currency)}</CompactLine> : null}
           </div> : null}
         </div>
 
