@@ -20,7 +20,7 @@
 ## 部署到 Cloudflare
 
 1. Fork 本项目，打开 [Workers & Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages/create)，选择 **Continue with GitHub** 并导入仓库。
-2. 使用生产分支 `main`，根目录 `/`，构建命令留空，部署命令填写 `bun run deploy`。
+2. 使用生产分支 `main`，根目录 `/`，构建命令填写 `bun run build`，部署命令填写 `bun run deploy`。
 3. 在创建页展开 **高级设置**，按下表添加变量。
 
 | 变量 | 必填/可选 | 说明 |

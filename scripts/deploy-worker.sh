@@ -69,12 +69,7 @@ fi
 
 prepare_runtime_secrets
 
-# Some Cloudflare deployment flows provision bindings before this script runs.
-# A first deployment without that pre-provisioning needs one upload to create D1.
-if ! bunx wrangler d1 info DB --json >/dev/null 2>&1; then
-  echo "D1 binding is not provisioned; creating it through Wrangler deploy..."
-  deploy_worker
-fi
-
+# Workers Builds provisions the binding declared in wrangler.toml before running
+# the deploy command, so migrations can target the binding directly.
 bunx wrangler d1 migrations apply DB --remote
 deploy_worker
