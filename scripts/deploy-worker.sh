@@ -69,7 +69,13 @@ fi
 
 prepare_runtime_secrets
 
-# Workers Builds provisions the binding declared in wrangler.toml before running
-# the deploy command, so migrations can target the binding directly.
-bunx wrangler d1 migrations apply DB --remote
-deploy_worker
+# Workers Builds provisions this binding before running the deploy command. A
+# direct first deployment does not, so provision the Worker first when the
+# default database is not present. The first branch uploads only once.
+if bunx wrangler d1 info nodeflare --json >/dev/null 2>&1; then
+  bunx wrangler d1 migrations apply DB --remote
+  deploy_worker
+else
+  deploy_worker
+  bunx wrangler d1 migrations apply DB --remote
+fi

@@ -19,9 +19,20 @@
 
 ## 部署到 Cloudflare
 
-1. Fork 本项目，打开 [Workers & Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages/create)，选择 **Continue with GitHub** 并导入仓库。
-2. 使用生产分支 `main`，根目录 `/`，构建命令填写 `bun run build`，部署命令填写 `bun run deploy`。
+1. Fork 本项目后，点击下方按钮进入 Cloudflare 官方部署流程：
+
+   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/imengying/NodeFlare)
+
+2. Worker 名填写 `nodeflare`（必须与 `wrangler.toml` 一致），使用生产分支 `main`，根目录 `/`，构建命令填写 `bun run build`，部署命令填写 `bun run deploy`。手动配置时，请从 **Workers & Pages → Settings → Builds → Connect** 连接 GitHub 仓库，不要只创建空 Worker。
 3. 在创建页展开 **高级设置**，按下表添加变量。
+
+需要查看详细部署日志时，可在项目根目录执行 `wrangler login` 后运行：
+
+```sh
+WRANGLER_LOG=debug bun run deploy 2>&1 | tee nodeflare-deploy.log
+```
+
+首次直接用命令行部署会自动创建 `nodeflare` D1，后续部署会先执行迁移再上传 Worker。
 
 | 变量 | 必填/可选 | 说明 |
 | --- | ---: | --- |
