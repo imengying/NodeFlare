@@ -101,11 +101,26 @@ jobs:
           mkdir -p release
           cp "target/agent/${{ matrix.target }}/release/nodeflare-agent${{ matrix.extension }}" "release/${{ matrix.asset }}"
           chmod +x "release/${{ matrix.asset }}"
-      - name: Verify Agent version with cross
-        if: matrix.cross
+      - name: Install ARM64 emulator
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-user-static
+      - name: Verify Linux Agent version
+        if: matrix.cross && matrix.target == 'x86_64-unknown-linux-musl'
         shell: bash
         run: |
-          version_output=$(CROSS_CONFIG=Cross.toml cross run --manifest-path agent/Cargo.toml --release --locked --target ${{ matrix.target }} -- --version)
+          version_output=$("release/${{ matrix.asset }}" --version)
+          actual_version="${version_output##* }"
+          if [ "$actual_version" != "${{ needs.metadata.outputs.version }}" ]; then
+            echo "Agent version $actual_version does not match tag ${{ needs.metadata.outputs.version }}" >&2
+            exit 1
+          fi
+      - name: Verify Linux ARM64 Agent version
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          version_output=$(qemu-aarch64-static "release/${{ matrix.asset }}" --version)
           actual_version="${version_output##* }"
           if [ "$actual_version" != "${{ needs.metadata.outputs.version }}" ]; then
             echo "Agent version $actual_version does not match tag ${{ needs.metadata.outputs.version }}" >&2

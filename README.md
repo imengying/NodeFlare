@@ -20,7 +20,8 @@
 ## 部署到 Cloudflare
 
 1. Fork 本仓库并打开 [Workers & Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages/create)，选择 **Import a repository** 后连接仓库。
-2. 在创建页展开 **高级设置**，按下表添加变量后部署。仓库已包含 Worker、前端和 `nodeflare` D1 配置。
+2. 部署命令修改为 `bun run deploy`。
+3. 在 **高级设置** 中填写下表变量后部署。
 
 | 变量 | 必填/可选 | 说明 |
 | --- | ---: | --- |
