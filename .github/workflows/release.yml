@@ -57,13 +57,13 @@ jobs:
         include:
           - platform: Linux x86_64
             runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             asset: agent-linux-x86_64
             extension: ""
             cross: true
           - platform: Linux ARM64
             runner: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             asset: agent-linux-aarch64
             extension: ""
             cross: true
@@ -91,7 +91,7 @@ jobs:
         run: cargo install cross --version 0.2.5 --locked
       - name: Build Rust Agent with cross
         if: matrix.cross
-        run: cross build --manifest-path agent/Cargo.toml --release --locked --target ${{ matrix.target }}
+        run: CROSS_CONFIG=Cross.toml cross build --manifest-path agent/Cargo.toml --release --locked --target ${{ matrix.target }}
       - name: Build Rust Agent with Cargo
         if: matrix.cross == false
         run: cargo build --manifest-path agent/Cargo.toml --release --locked --target ${{ matrix.target }}
@@ -100,6 +100,35 @@ jobs:
         run: |
           mkdir -p release
           cp "target/agent/${{ matrix.target }}/release/nodeflare-agent${{ matrix.extension }}" "release/${{ matrix.asset }}"
+          chmod +x "release/${{ matrix.asset }}"
+      - name: Verify Agent version with cross
+        if: matrix.cross
+        shell: bash
+        run: |
+          version_output=$(CROSS_CONFIG=Cross.toml cross run --manifest-path agent/Cargo.toml --release --locked --target ${{ matrix.target }} -- --version)
+          actual_version="${version_output##* }"
+          if [ "$actual_version" != "${{ needs.metadata.outputs.version }}" ]; then
+            echo "Agent version $actual_version does not match tag ${{ needs.metadata.outputs.version }}" >&2
+            exit 1
+          fi
+      - name: Verify Agent version
+        if: matrix.cross == false
+        shell: bash
+        run: |
+          version_output=$("release/${{ matrix.asset }}" --version)
+          actual_version="${version_output##* }"
+          if [ "$actual_version" != "${{ needs.metadata.outputs.version }}" ]; then
+            echo "Agent version $actual_version does not match tag ${{ needs.metadata.outputs.version }}" >&2
+            exit 1
+          fi
+      - name: Verify static Linux binary
+        if: matrix.cross
+        shell: bash
+        run: |
+          if readelf -l "release/${{ matrix.asset }}" | grep -q 'Requesting program interpreter'; then
+            echo "Linux Agent must be statically linked" >&2
+            exit 1
+          fi
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: release/${{ matrix.asset }}

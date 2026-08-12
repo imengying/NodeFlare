@@ -14,6 +14,7 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -44,12 +45,35 @@ type Result<T> = std::result::Result<T, Error>;
 struct RuntimeConfig {
     server_id: String,
     token: String,
-    worker_url: String,
+    endpoint: String,
     report_interval: u64,
     collect_interval: u64,
     network_interface: String,
     auto_update: bool,
     latency_tasks: Vec<LatencyTask>,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "nodeflare", version = VERSION, about = "NodeFlare monitoring agent")]
+struct CliOptions {
+    /// NodeFlare endpoint
+    #[arg(short = 'e', value_name = "URL")]
+    endpoint: String,
+    /// Agent token
+    #[arg(short = 't', value_name = "TOKEN")]
+    token: String,
+    /// Server ID
+    #[arg(short = 's', value_name = "ID")]
+    server_id: String,
+    /// Initial report interval in seconds (15-3600)
+    #[arg(short = 'i', value_name = "SECONDS", default_value_t = 60)]
+    interval: u64,
+    /// Submit one report and exit
+    #[arg(long, conflicts_with = "collect")]
+    once: bool,
+    /// Print one metric sample and exit
+    #[arg(long, conflicts_with = "once")]
+    collect: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -757,7 +781,7 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
         gpu_usage,
         gpu_model,
         agent_version: VERSION.to_string(),
-        message: env::var("AGENT_MESSAGE").unwrap_or_default(),
+        message: String::new(),
         disk_read_bps: io_after
             .read_sectors
             .saturating_sub(io_before.read_sectors)
@@ -883,29 +907,19 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
         disk_utilization: 0.0,
         disks: disk_metrics,
         gpus,
-        message: env::var("AGENT_MESSAGE").unwrap_or_default(),
+        message: String::new(),
         latency_results,
     }
 }
 
-fn runtime_config() -> Result<RuntimeConfig> {
-    let required = |key: &str| -> Result<String> {
-        env::var(key).map_err(|_| format!("missing environment variable {key}").into())
-    };
-    let interval = env::var("REPORT_INTERVAL")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(60)
-        .clamp(15, 3600);
-    let collect_interval = env::var("COLLECT_INTERVAL")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(5)
-        .clamp(2, 60)
-        .min(interval);
-    let server_id = required("SERVER_ID")?;
-    let token = required("AGENT_TOKEN")?;
-    let worker_url = required("WORKER_URL")?;
+fn runtime_config(options: &CliOptions) -> Result<RuntimeConfig> {
+    let interval = options.interval;
+    if !(15..=3600).contains(&interval) {
+        return Err("interval must be between 15 and 3600 seconds".into());
+    }
+    let server_id = options.server_id.clone();
+    let token = options.token.clone();
+    let endpoint = options.endpoint.clone();
     if server_id.is_empty()
         || token.is_empty()
         || server_id.len() > 160
@@ -913,20 +927,20 @@ fn runtime_config() -> Result<RuntimeConfig> {
         || server_id.chars().any(char::is_whitespace)
         || token.chars().any(char::is_whitespace)
     {
-        return Err("SERVER_ID or AGENT_TOKEN is invalid".into());
+        return Err("server ID or token is invalid".into());
     }
-    if !valid_worker_url(&worker_url) {
+    if !valid_endpoint(&endpoint) {
         return Err(
-            "WORKER_URL must use HTTPS; HTTP is only allowed for loopback development".into(),
+            "endpoint must use HTTPS; HTTP is only allowed for loopback development".into(),
         );
     }
     Ok(RuntimeConfig {
         server_id,
         token,
-        worker_url: worker_url.trim_end_matches('/').to_string(),
+        endpoint: endpoint.trim_end_matches('/').to_string(),
         report_interval: interval,
-        collect_interval,
-        network_interface: env::var("NETWORK_INTERFACE").unwrap_or_default(),
+        collect_interval: 5,
+        network_interface: String::new(),
         auto_update: true,
         latency_tasks: Vec::new(),
     })
@@ -943,10 +957,9 @@ fn submit(
         samples: reports,
     };
     let mut response = agent
-        .post(&format!("{}/api/agent/report", config.worker_url))
+        .post(&format!("{}/api/agent/report", config.endpoint))
         .header("Authorization", format!("Bearer {}", config.token))
         .header("User-Agent", format!("nodeflare-agent/{VERSION}"))
-        .header("X-Agent-Config-Schema", "1")
         .header("X-Agent-Config-Sha256", config_hash)
         .send_json(batch)?;
     let next_hash = response
@@ -1007,7 +1020,7 @@ fn sanitize_latency_tasks(tasks: &[LatencyTask]) -> Vec<LatencyTask> {
         .collect()
 }
 
-fn valid_worker_url(value: &str) -> bool {
+fn valid_endpoint(value: &str) -> bool {
     let value = value.trim_end_matches('/');
     if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_whitespace) {
         return false;
@@ -1151,11 +1164,16 @@ fn download_agent(
     fs::set_permissions(destination, fs::Permissions::from_mode(0o755))?;
 
     let downloaded_version = Command::new(destination)
-        .arg("version")
+        .arg("--version")
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        });
     let valid = downloaded_version.as_deref().map(normalized_version)
         == Some(normalized_version(expected_version));
     if !valid {
@@ -1214,7 +1232,7 @@ fn update(agent: &ureq::Agent) -> Result<bool> {
     #[cfg(unix)]
     {
         fs::rename(&temporary, &current)?;
-        let error = Command::new(&current).arg("run").exec();
+        let error = Command::new(&current).args(env::args_os().skip(1)).exec();
         Err(error.into())
     }
 
@@ -1227,7 +1245,8 @@ fn update(agent: &ureq::Agent) -> Result<bool> {
             "Move-Item -LiteralPath $env:NODEFLARE_UPDATE_NEW ",
             "-Destination $env:NODEFLARE_UPDATE_CURRENT -Force; ",
             "try { Start-ScheduledTask -TaskName 'NodeFlare Agent' -ErrorAction Stop } ",
-            "catch { Start-Process -FilePath $env:NODEFLARE_UPDATE_CURRENT -ArgumentList 'run' }"
+            "catch { $restartArgs=@($env:NODEFLARE_UPDATE_ARGS | ConvertFrom-Json); ",
+            "Start-Process -FilePath $env:NODEFLARE_UPDATE_CURRENT -ArgumentList $restartArgs }"
         );
         Command::new("powershell.exe")
             .args([
@@ -1240,6 +1259,10 @@ fn update(agent: &ureq::Agent) -> Result<bool> {
             .env("NODEFLARE_UPDATE_PID", std::process::id().to_string())
             .env("NODEFLARE_UPDATE_NEW", &temporary)
             .env("NODEFLARE_UPDATE_CURRENT", &current)
+            .env(
+                "NODEFLARE_UPDATE_ARGS",
+                serde_json::to_string(&env::args().skip(1).collect::<Vec<_>>())?,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1248,8 +1271,8 @@ fn update(agent: &ureq::Agent) -> Result<bool> {
     }
 }
 
-fn run(once: bool, print_only: bool) -> Result<()> {
-    let mut config = runtime_config()?;
+fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
+    let mut config = runtime_config(options)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .build()
@@ -1360,16 +1383,8 @@ fn run(once: bool, print_only: bool) -> Result<()> {
 }
 
 fn main() {
-    let result = match env::args().nth(1).as_deref() {
-        Some("run") => run(false, false),
-        Some("once") => run(true, false),
-        Some("collect") => run(true, true),
-        Some("version") | Some("--version") => {
-            println!("{VERSION}");
-            Ok(())
-        }
-        _ => Err("usage: nodeflare-agent <run|once|collect|version>".into()),
-    };
+    let options = CliOptions::parse();
+    let result = run(&options, options.once || options.collect, options.collect);
     if let Err(error) = result {
         eprintln!("nodeflare-agent: {error}");
         std::process::exit(1);
@@ -1378,6 +1393,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
@@ -1386,7 +1402,7 @@ mod tests {
         agent_artifact_name, executable_format_valid, is_public_probe_ip, median,
         normalized_version, parse_probe_target, ping_latency, prune_report_samples,
         release_asset_sha256, report_retry_delay, sanitize_latency_tasks, selected_interface,
-        tcp_latency_probe_address, valid_worker_url, version_triplet, GithubReleaseAsset,
+        tcp_latency_probe_address, valid_endpoint, version_triplet, CliOptions, GithubReleaseAsset,
         LatencyTask, Report, MAX_LATENCY_TASKS, PROBE_ATTEMPTS,
     };
 
@@ -1440,18 +1456,43 @@ mod tests {
     }
 
     #[test]
-    fn validates_worker_urls() {
-        assert!(valid_worker_url("https://monitor.example.com/"));
-        assert!(valid_worker_url("http://127.0.0.1:8787"));
-        assert!(valid_worker_url("http://localhost:8787"));
-        assert!(valid_worker_url("http://[::1]:8787"));
-        assert!(!valid_worker_url("http://monitor.example.com"));
-        assert!(!valid_worker_url("http://127.0.0.2:8787"));
-        assert!(!valid_worker_url("monitor.example.com"));
-        assert!(!valid_worker_url("https://"));
-        assert!(!valid_worker_url("https://user@example.com"));
-        assert!(!valid_worker_url("https://monitor.example.com/?token=abc"));
-        assert!(!valid_worker_url("https://bad host.example"));
+    fn validates_endpoints() {
+        assert!(valid_endpoint("https://monitor.example.com/"));
+        assert!(valid_endpoint("http://127.0.0.1:8787"));
+        assert!(valid_endpoint("http://localhost:8787"));
+        assert!(valid_endpoint("http://[::1]:8787"));
+        assert!(!valid_endpoint("http://monitor.example.com"));
+        assert!(!valid_endpoint("http://127.0.0.2:8787"));
+        assert!(!valid_endpoint("monitor.example.com"));
+        assert!(!valid_endpoint("https://"));
+        assert!(!valid_endpoint("https://user@example.com"));
+        assert!(!valid_endpoint("https://monitor.example.com/?token=abc"));
+        assert!(!valid_endpoint("https://bad host.example"));
+    }
+
+    #[test]
+    fn parses_cli_options() {
+        let parsed = CliOptions::try_parse_from([
+            "nodeflare",
+            "-e",
+            "https://monitor.example.com",
+            "-t",
+            "secret",
+            "-s",
+            "server-a",
+            "-i",
+            "60",
+            "--once",
+        ])
+        .unwrap();
+        assert_eq!(parsed.endpoint, "https://monitor.example.com");
+        assert_eq!(parsed.token, "secret");
+        assert_eq!(parsed.server_id, "server-a");
+        assert_eq!(parsed.interval, 60);
+        assert!(parsed.once);
+        assert!(CliOptions::try_parse_from(["nodeflare", "-t"]).is_err());
+        assert!(CliOptions::try_parse_from(["nodeflare", "-t", "first", "-t", "second"]).is_err());
+        assert!(CliOptions::try_parse_from(["nodeflare", "--once", "--collect"]).is_err());
     }
 
     #[test]

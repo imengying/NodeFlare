@@ -1,17 +1,17 @@
+[CmdletBinding(DefaultParameterSetName = "Install")]
 param(
-  [Parameter(Position = 0)][ValidateSet("install", "uninstall", "status")][string]$Action = "install",
-  [string]$ServerId,
-  [string]$Token,
-  [string]$Url,
-  [ValidateRange(15, 3600)][int]$Interval = 60,
-  [ValidateRange(2, 60)][int]$CollectInterval = 5
+  [Parameter(ParameterSetName = "Install", Mandatory = $true)][Alias("s")][string]$ServerId,
+  [Parameter(ParameterSetName = "Install", Mandatory = $true)][Alias("t")][string]$Token,
+  [Parameter(ParameterSetName = "Install", Mandatory = $true)][Alias("e")][string]$Endpoint,
+  [Parameter(ParameterSetName = "Install")][Alias("i")][ValidateRange(15, 3600)][int]$Interval = 60,
+  [Parameter(ParameterSetName = "Uninstall", Mandatory = $true)][switch]$Uninstall,
+  [Parameter(ParameterSetName = "Status", Mandatory = $true)][switch]$Status
 )
 
 $ErrorActionPreference = "Stop"
 $TaskName = "NodeFlare Agent"
 $InstallDir = Join-Path $env:ProgramData "NodeFlare"
 $AgentFile = Join-Path $InstallDir "nodeflare-agent.exe"
-$RunnerFile = Join-Path $InstallDir "run.ps1"
 
 function Assert-Safe([string]$Name, [string]$Value) {
   if ([string]::IsNullOrWhiteSpace($Value) -or $Value -notmatch '^[A-Za-z0-9_./:@-]+$') {
@@ -19,7 +19,7 @@ function Assert-Safe([string]$Name, [string]$Value) {
   }
 }
 
-function Assert-WorkerUrl([string]$Value) {
+function Assert-Endpoint([string]$Value) {
   $Parsed = $null
   $SecureScheme = $false
   if ([Uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$Parsed)) {
@@ -36,11 +36,11 @@ function Assert-WorkerUrl([string]$Value) {
     -not [string]::IsNullOrEmpty($Parsed.Query) -or
     -not [string]::IsNullOrEmpty($Parsed.Fragment)
   ) {
-    throw "Url must use HTTPS; HTTP is only allowed for loopback development"
+    throw "Endpoint must use HTTPS; HTTP is only allowed for loopback development"
   }
 }
 
-if ($Action -eq "uninstall") {
+if ($Uninstall) {
   Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -48,7 +48,7 @@ if ($Action -eq "uninstall") {
   exit 0
 }
 
-if ($Action -eq "status") {
+if ($Status) {
   $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   if ($null -eq $Task) {
     Write-Error "NodeFlare Agent is not installed."
@@ -67,9 +67,13 @@ if ($NativeArchitecture -ne "AMD64") {
 }
 Assert-Safe "ServerId" $ServerId
 Assert-Safe "Token" $Token
-Assert-WorkerUrl $Url
-$Url = $Url.TrimEnd('/')
-$CollectInterval = [Math]::Min($CollectInterval, $Interval)
+Assert-Endpoint $Endpoint
+$ServerIdLength = $ServerId.Length
+$TokenLength = $Token.Length
+if ($ServerIdLength -gt 160 -or $TokenLength -gt 512) {
+  throw "Install argument is too long"
+}
+$Endpoint = $Endpoint.TrimEnd('/')
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 & icacls.exe $InstallDir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' | Out-Null
@@ -79,19 +83,28 @@ $Artifact = "agent-windows-x86_64.exe"
 try {
   $Release = Invoke-RestMethod -Uri $ReleaseApi -Headers @{ Accept = "application/vnd.github+json"; "User-Agent" = "nodeflare-installer" } -TimeoutSec 30
   $ReleaseAsset = $Release.assets | Where-Object { $_.name -eq $Artifact } | Select-Object -First 1
+  if ($Release.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$' -or $null -eq $ReleaseAsset) {
+    throw "GitHub latest release is invalid or does not contain $Artifact"
+  }
   $DigestMatch = [regex]::Match([string]$ReleaseAsset.digest, '^sha256:([0-9a-fA-F]{64})$')
-  if ($null -eq $ReleaseAsset -or -not $DigestMatch.Success) {
+  if (-not $DigestMatch.Success) {
     throw "GitHub release does not contain a SHA-256 digest for $Artifact"
   }
   $ExpectedChecksum = $DigestMatch.Groups[1].Value
-  Invoke-WebRequest -Uri $ReleaseAsset.browser_download_url -OutFile $Temporary -TimeoutSec 120
+  $DownloadUrl = "https://github.com/imengying/NodeFlare/releases/download/$($Release.tag_name)/$Artifact"
+  Invoke-WebRequest -Uri $DownloadUrl -OutFile $Temporary -TimeoutSec 120
   $ActualChecksum = (Get-FileHash -LiteralPath $Temporary -Algorithm SHA256).Hash
   if ($ActualChecksum -ne $ExpectedChecksum) {
     throw "Agent checksum verification failed"
   }
-  & $Temporary version | Out-Null
+  $InstalledVersion = (& $Temporary --version | Out-String).Trim()
   if ($LASTEXITCODE -ne 0) {
     throw "Downloaded Agent failed its version check"
+  }
+  $InstalledVersion = ($InstalledVersion -split '\s+')[-1]
+  $ExpectedVersion = $Release.tag_name.Substring(1)
+  if ($InstalledVersion -ne $ExpectedVersion) {
+    throw "Release $($Release.tag_name) contains Agent version $InstalledVersion"
   }
   Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   Move-Item -LiteralPath $Temporary -Destination $AgentFile -Force
@@ -99,19 +112,20 @@ try {
   Remove-Item -LiteralPath $Temporary -Force -ErrorAction SilentlyContinue
 }
 
-@"
-`$env:SERVER_ID='$ServerId'
-`$env:AGENT_TOKEN='$Token'
-`$env:WORKER_URL='$Url'
-`$env:REPORT_INTERVAL='$Interval'
-`$env:COLLECT_INTERVAL='$CollectInterval'
-& '$AgentFile' run
-"@ | Set-Content -LiteralPath $RunnerFile -Encoding UTF8
-
-$TaskAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$RunnerFile`""
+$TaskArguments = "-e $Endpoint -t $Token -s $ServerId -i $Interval"
+$TaskAction = New-ScheduledTaskAction -Execute $AgentFile -Argument $TaskArguments
 $Trigger = New-ScheduledTaskTrigger -AtStartup
 $Settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 3650)
 $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 Register-ScheduledTask -TaskName $TaskName -Action $TaskAction -Trigger $Trigger -Settings $Settings -Principal $Principal -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
-Write-Host "NodeFlare Agent installed and started."
+$Task = $null
+for ($Attempt = 0; $Attempt -lt 10; $Attempt++) {
+  Start-Sleep -Milliseconds 500
+  $Task = Get-ScheduledTask -TaskName $TaskName
+  if ($Task.State -eq "Running") { break }
+}
+if ($Task.State -ne "Running") {
+  throw "NodeFlare Agent scheduled task failed to start (state: $($Task.State))"
+}
+Write-Host "NodeFlare Agent $InstalledVersion installed and started."

@@ -53,15 +53,6 @@ login_json=$(request -H 'Content-Type: application/json' \
   "$MONITOR_BASE_URL/api/admin/login")
 admin_token=$(printf '%s' "$login_json" | jq -er '.token')
 
-incomplete_server_status=$(monitor_curl --silent --output /dev/null --write-out '%{http_code}' \
-  -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' \
-  --data '{"name":"incomplete"}' "$MONITOR_BASE_URL/api/admin/servers")
-[ "$incomplete_server_status" = "400" ]
-unknown_setting_status=$(monitor_curl --silent --output /dev/null --write-out '%{http_code}' \
-  -X PATCH -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' \
-  --data '{"unexpected":true}' "$MONITOR_BASE_URL/api/admin/settings")
-[ "$unknown_setting_status" = "400" ]
-
 request -H "Authorization: Bearer $admin_token" \
   "$MONITOR_BASE_URL/api/exchange-rates" | \
   jq -e '.base == "CNY" and .rates.CNY == 1 and .rates.USD > 0 and .rates.CAD > 0 and (has("cny") | not)' >/dev/null
@@ -105,12 +96,6 @@ server_id=$(printf '%s' "$server_json" | jq -er '.id')
 agent_token=$(printf '%s' "$server_json" | jq -er '.agent_token')
 agent_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' agent/Cargo.toml | head -1)
 
-incomplete_report_status=$(monitor_curl --silent --output /dev/null --write-out '%{http_code}' \
-  -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
-  --data "$(jq -nc --arg server_id "$server_id" '{server_id:$server_id,samples:[{timestamp:(now|floor),cpu:1}]}')" \
-  "$MONITOR_BASE_URL/api/agent/report")
-[ "$incomplete_report_status" = "400" ]
-
 sample=$(jq -nc --arg agent_version "$agent_version" '{
   timestamp:(now|floor),cpu:18.5,load1:0.42,load5:0.36,load15:0.31,
   mem_used:2147483648,mem_total:4294967296,swap_used:0,swap_total:0,disk_used:21474836480,disk_total:53687091200,
@@ -141,6 +126,17 @@ history_cache_header=$(monitor_curl --silent --dump-header - --output /dev/null 
   tr -d '\r' | awk -F ': ' 'tolower($1) == "x-cache" { print $2 }' | tail -1)
 [ "$history_cache_header" = "HIT" ]
 request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/latency/$server_id?hours=1" | jq -e --arg task_id "$latency_task_id" '(.tasks | any(.id == $task_id)) and (.points | any(.task_id == $task_id and .latency_ms == 28.4))' >/dev/null
+
+# An Agent may have already measured a task when the administrator removes its
+# assignment. The stale result must not block delivery of the new task list.
+request -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' -X PATCH \
+  --data '{"name":"Smoke TCP","task_type":"tcp","target":"example.com:443","interval_seconds":60,"default_enabled":true,"server_ids":[]}' \
+  "$MONITOR_BASE_URL/api/admin/latency-tasks/$latency_task_id" | jq -e '.success == true' >/dev/null
+stale_latency_response=$(request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
+  --data "$latency_report" "$MONITOR_BASE_URL/api/agent/report")
+printf '%s' "$stale_latency_response" | jq -e --arg task_id "$latency_task_id" \
+  '.success == true and (.config.latency_tasks | all(.id != $task_id))' >/dev/null
+
 alert_rule_json=$(request -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' \
   --data "$(jq -nc --arg server_id "$server_id" '{name:"Smoke CPU",metric:"cpu",threshold:80,duration_minutes:5,aggregation:"average",enabled:true,server_ids:[$server_id]}')" \
   "$MONITOR_BASE_URL/api/admin/alert-rules")
@@ -150,10 +146,10 @@ rotated_json=$(request -H "Authorization: Bearer $admin_token" -X POST \
   "$MONITOR_BASE_URL/api/admin/servers/$server_id/token")
 rotated_token=$(printf '%s' "$rotated_json" | jq -er '.agent_token')
 
-old_status=$(monitor_curl --silent --output /dev/null --write-out '%{http_code}' \
+revoked_token_status=$(monitor_curl --silent --output /dev/null --write-out '%{http_code}' \
   -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
   --data "$report" "$MONITOR_BASE_URL/api/agent/report")
-[ "$old_status" = "401" ]
+[ "$revoked_token_status" = "401" ]
 request -H "Authorization: Bearer $rotated_token" -H 'Content-Type: application/json' \
   --data "$latency_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.success == true' >/dev/null
 

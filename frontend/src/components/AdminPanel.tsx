@@ -436,18 +436,18 @@ export function AdminPanel({
     if (installPlatform === "windows") {
       return {
         ...server,
-        command: `Invoke-WebRequest -Uri "${installer}/install.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" install -ServerId ${powershellLiteral(server.id)} -Token ${powershellLiteral(server.agent_token)} -Url ${powershellLiteral(origin)}`,
+        command: `Invoke-WebRequest -Uri "${installer}/install.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" -e ${powershellLiteral(origin)} -t ${powershellLiteral(server.agent_token)} -s ${powershellLiteral(server.id)}`,
       };
     }
     if (installPlatform === "macos") {
       return {
         ...server,
-        command: `curl -fsSL ${installer}/install-macos.sh | sudo sh -s -- install --server-id ${shellLiteral(server.id)} --token ${shellLiteral(server.agent_token)} --url ${shellLiteral(origin)}`,
+        command: `curl -fsSL ${installer}/install-macos.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)} -s ${shellLiteral(server.id)}`,
       };
     }
     return {
       ...server,
-      command: `curl -fsSL ${installer}/agent.sh | sudo sh -s -- install --server-id ${shellLiteral(server.id)} --token ${shellLiteral(server.agent_token)} --url ${shellLiteral(origin)}`,
+      command: `wget -qO- ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)} -s ${shellLiteral(server.id)}`,
     };
   }), [install, installPlatform]);
 

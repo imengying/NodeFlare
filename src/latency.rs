@@ -213,15 +213,6 @@ pub async fn save_results(
         .into_iter()
         .map(|task| task.id)
         .collect();
-    if results
-        .iter()
-        .any(|result| !assigned.contains(&result.task_id))
-    {
-        return Err(worker::Error::RustError(
-            "延迟结果包含未分配给该节点的任务".to_string(),
-        ));
-    }
-
     let latest = db.prepare(
         "INSERT INTO latency_latest( \
            task_id, server_id, timestamp, latency_ms, packet_loss \
@@ -239,7 +230,10 @@ pub async fn save_results(
            latency_ms=excluded.latency_ms, packet_loss=excluded.packet_loss",
     );
     let mut statements = Vec::with_capacity(results.len() * 2);
-    for result in results {
+    for result in results
+        .iter()
+        .filter(|result| assigned.contains(&result.task_id))
+    {
         let timestamp = if (result.timestamp - received_at).abs() <= 86_400 {
             result.timestamp
         } else {
@@ -254,6 +248,9 @@ pub async fn save_results(
         ];
         statements.push(latest.clone().bind(&values)?);
         statements.push(historical.clone().bind(&values)?);
+    }
+    if statements.is_empty() {
+        return Ok(());
     }
     db.batch(statements).await?;
     Ok(())

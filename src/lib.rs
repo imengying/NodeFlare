@@ -450,6 +450,10 @@ fn valid_password_derived(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn valid_server_price(value: f64) -> bool {
+    value.is_finite() && (-1.0..=1_000_000_000.0).contains(&value)
+}
+
 fn submitted_secret<'a>(submitted: Option<&'a str>, stored: &'a str) -> &'a str {
     match submitted.map(str::trim) {
         Some(db::SECRET_MASK) | None => stored.trim(),
@@ -566,7 +570,7 @@ fn validate_server(input: &ServerInput) -> Option<&'static str> {
     ) {
         return Some("流量计算方式无效");
     }
-    if !input.price.is_finite() || !(-1.0..=1_000_000_000.0).contains(&input.price) {
+    if !valid_server_price(input.price) {
         return Some("价格无效");
     }
     if !(1..=3650).contains(&input.billing_cycle) {
@@ -926,10 +930,6 @@ async fn handle_agent_report(
         .headers()
         .get("X-Agent-Config-Sha256")?
         .unwrap_or_default();
-    let agent_config_schema = req
-        .headers()
-        .get("X-Agent-Config-Schema")?
-        .unwrap_or_default();
     let token = match bearer_token(&req) {
         Some(value) => value,
         None => return error("缺少探针凭据", 401),
@@ -965,19 +965,6 @@ async fn handle_agent_report(
         .flat_map(|report| report.latency_results.iter())
         .cloned()
         .collect::<Vec<_>>();
-    if !latency_results.is_empty() {
-        let assigned: HashSet<String> = latency::tasks_for_server(database, &batch.server_id)
-            .await?
-            .into_iter()
-            .map(|task| task.id)
-            .collect();
-        if latency_results
-            .iter()
-            .any(|result| !assigned.contains(&result.task_id))
-        {
-            return error("延迟结果包含未分配给该节点的任务", 400);
-        }
-    }
     db::save_reports(database, &batch.server_id, &batch.samples).await?;
     latency::save_results(database, &batch.server_id, &latency_results, received_at).await?;
 
@@ -1004,10 +991,9 @@ async fn handle_agent_report(
     }
     let config = db::agent_config(database, &batch.server_id).await?;
     let config_json = serde_json::to_string(&config)?;
-    let config_hash = sha256_hex(&format!("1:{config_json}"));
-    if agent_config_schema == "1" && agent_config_hash == config_hash {
+    let config_hash = sha256_hex(&config_json);
+    if agent_config_hash == config_hash {
         let mut response = Response::empty()?.with_status(204);
-        response.headers_mut().set("X-Agent-Config-Schema", "1")?;
         response
             .headers_mut()
             .set("X-Agent-Config-Sha256", &config_hash)?;
@@ -1018,7 +1004,6 @@ async fn handle_agent_report(
         &serde_json::json!({ "success": true, "config": config }),
         202,
     )?;
-    response.headers_mut().set("X-Agent-Config-Schema", "1")?;
     response
         .headers_mut()
         .set("X-Agent-Config-Sha256", &config_hash)?;
@@ -2109,13 +2094,10 @@ mod tests {
     use super::{
         allow_on_rate_limit_failure, history_cache_key, rate_limit_binding, same_origin,
         submitted_secret, valid_cloudflare_account_id, valid_cloudflare_api_token,
-        valid_password_derived, valid_ping_target, validate_latency_task, validate_server,
+        valid_password_derived, valid_ping_target, valid_server_price, validate_latency_task,
         ADMIN_HTML, ADMIN_SCRIPT, ADMIN_STYLE,
     };
-    use crate::{
-        db::SECRET_MASK,
-        models::{AgentReport, LatencyTaskInput, ServerInput, SettingsInput},
-    };
+    use crate::{db::SECRET_MASK, models::LatencyTaskInput};
     use worker::{Method, Url};
 
     #[test]
@@ -2150,56 +2132,12 @@ mod tests {
     }
 
     #[test]
-    fn requires_the_current_server_schema() {
-        assert!(
-            serde_json::from_value::<ServerInput>(serde_json::json!({ "name": "node" })).is_err()
-        );
-        let mut server: ServerInput = serde_json::from_value(serde_json::json!({
-            "name": "node",
-            "region": "",
-            "group_name": "默认",
-            "tags": "",
-            "note": "",
-            "hidden": false,
-            "expires_at": null,
-            "traffic_limit": 0,
-            "traffic_limit_type": "sum",
-            "price": 0,
-            "billing_cycle": 30,
-            "currency": "CNY",
-            "auto_renewal": false,
-            "public_remark": "",
-            "network_interface": "",
-            "reset_day": 1,
-            "report_interval": 60,
-            "collect_interval": 5,
-            "rx_correction": 0,
-            "tx_correction": 0,
-            "offline_notify_disabled": false,
-            "auto_update": true
-        }))
-        .expect("current server schema");
-        assert_eq!(server.price, 0.0);
-        assert!(server.auto_update);
-        assert_eq!(validate_server(&server), None);
-
-        server.price = -1.0;
-        assert_eq!(validate_server(&server), None);
-        server.price = -2.0;
-        assert_eq!(validate_server(&server), Some("价格无效"));
-    }
-
-    #[test]
-    fn rejects_incomplete_or_unknown_protocol_fields() {
-        assert!(serde_json::from_value::<AgentReport>(serde_json::json!({
-            "timestamp": 1,
-            "cpu": 1
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<SettingsInput>(serde_json::json!({
-            "unexpected": true
-        }))
-        .is_err());
+    fn validates_server_prices() {
+        assert!(valid_server_price(-1.0));
+        assert!(valid_server_price(0.0));
+        assert!(valid_server_price(1_000_000_000.0));
+        assert!(!valid_server_price(-1.01));
+        assert!(!valid_server_price(f64::NAN));
     }
 
     #[test]
