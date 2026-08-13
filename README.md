@@ -71,7 +71,7 @@
 
 ## 主题
 
-GitHub `tree` 地址对应的目录需提供 `index.html` 和 `assets/`，并使用 NodeFlare 公开 API 读取数据。启用第三方主题前请确认来源可信。
+GitHub `tree` 地址对应的目录需提供 `index.html` 和 `assets/`，并使用 NodeFlare 公开 API 读取数据。可选的 `theme.json` 可声明后台显示的主题设置项。启用第三方主题前请确认来源可信。
 
 ## 鸣谢
 

@@ -16,7 +16,7 @@ interface Stat {
 export function StatsBar({ servers, config, exchangeRates }: { servers: Server[]; config: Config; exchangeRates: ExchangeRates | null }) {
   if (!config.show_stats) return null;
   const displayCurrency = assetCurrency(config);
-  const locale = config.locale || "zh-CN";
+  const locale = config.locale;
   const showOnline = themeToggle(config, "showOnline");
   const onlineServers = servers.filter((server) => isOnline(server, config.offline_threshold_seconds));
   const trafficUp = servers.reduce((sum, server) => sum + number(server.net_tx_total), 0);

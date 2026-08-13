@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,6 +33,8 @@ const PROBE_ATTEMPTS: usize = 4;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LATENCY_TASKS: usize = 128;
+const LATENCY_WORKERS: usize = 4;
+const MAX_PENDING_LATENCY_RESULTS: usize = 4096;
 const MAX_REPORT_AGE_SECONDS: i64 = 7_000;
 const REPORT_RETRY_MIN: Duration = Duration::from_secs(5);
 const REPORT_RETRY_MAX: Duration = Duration::from_secs(300);
@@ -94,13 +97,80 @@ struct LatencyResult {
     packet_loss: f64,
 }
 
+struct LatencyExecutor {
+    task_tx: mpsc::SyncSender<LatencyTask>,
+    result_rx: mpsc::Receiver<LatencyResult>,
+    in_flight: HashSet<String>,
+}
+
+impl LatencyExecutor {
+    fn new() -> Result<Self> {
+        let (task_tx, task_rx) = mpsc::sync_channel::<LatencyTask>(MAX_LATENCY_TASKS);
+        let (result_tx, result_rx) = mpsc::channel();
+        let task_rx = Arc::new(Mutex::new(task_rx));
+
+        for index in 0..LATENCY_WORKERS {
+            let task_rx = Arc::clone(&task_rx);
+            let result_tx = result_tx.clone();
+            thread::Builder::new()
+                .name(format!("nodeflare-latency-{index}"))
+                .spawn(move || loop {
+                    let task = match task_rx.lock() {
+                        Ok(receiver) => receiver.try_recv(),
+                        Err(_) => return,
+                    };
+                    match task {
+                        Ok(task) => {
+                            if result_tx.send(execute_latency_task(task)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    };
+                })?;
+        }
+
+        Ok(Self {
+            task_tx,
+            result_rx,
+            in_flight: HashSet::new(),
+        })
+    }
+
+    fn enqueue(&mut self, task: LatencyTask) -> bool {
+        if self.in_flight.contains(&task.id) {
+            return false;
+        }
+        let task_id = task.id.clone();
+        match self.task_tx.try_send(task) {
+            Ok(()) => {
+                self.in_flight.insert(task_id);
+                true
+            }
+            Err(mpsc::TrySendError::Full(_)) => false,
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    fn drain(&mut self) -> Vec<LatencyResult> {
+        let results = self.result_rx.try_iter().collect::<Vec<_>>();
+        for result in &results {
+            self.in_flight.remove(&result.task_id);
+        }
+        results
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteConfig {
     report_interval: u64,
     collect_interval: u64,
     network_interface: String,
-    auto_update: i64,
+    auto_update: bool,
     latency_tasks: Vec<LatencyTask>,
 }
 
@@ -115,13 +185,6 @@ struct GithubReleaseAsset {
     name: String,
     browser_download_url: String,
     digest: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReportResponse {
-    success: bool,
-    config: RemoteConfig,
 }
 
 struct SubmitResult {
@@ -152,7 +215,7 @@ struct DiskMetric {
 #[derive(Debug, Clone, Serialize)]
 struct GpuMetric {
     model: String,
-    usage: f64,
+    usage: Option<f64>,
     memory_used: i64,
     memory_total: i64,
 }
@@ -195,7 +258,6 @@ struct Report {
     disk_utilization: f64,
     disks: Vec<DiskMetric>,
     gpus: Vec<GpuMetric>,
-    message: String,
     latency_results: Vec<LatencyResult>,
 }
 
@@ -619,38 +681,21 @@ fn unix_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-fn execute_latency_tasks(tasks: &[LatencyTask]) -> Vec<LatencyResult> {
-    let mut results = Vec::with_capacity(tasks.len());
-    thread::scope(|scope| {
-        let handles = tasks
-            .iter()
-            .cloned()
-            .map(|task| {
-                scope.spawn(move || {
-                    let (latency_ms, packet_loss) = match task.task_type.as_str() {
-                        "tcp" => tcp_latency_probe(&task.target),
-                        "icmp" => icmp_latency_probe(&task.target),
-                        _ => (-1.0, 100.0),
-                    };
-                    LatencyResult {
-                        task_id: task.id,
-                        timestamp: unix_timestamp(),
-                        latency_ms,
-                        packet_loss,
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        for handle in handles {
-            if let Ok(result) = handle.join() {
-                results.push(result);
-            }
-        }
-    });
-    results
+fn execute_latency_task(task: LatencyTask) -> LatencyResult {
+    let (latency_ms, packet_loss) = match task.task_type.as_str() {
+        "tcp" => tcp_latency_probe(&task.target),
+        "icmp" => icmp_latency_probe(&task.target),
+        _ => (-1.0, 100.0),
+    };
+    LatencyResult {
+        task_id: task.id,
+        timestamp: unix_timestamp(),
+        latency_ms,
+        packet_loss,
+    }
 }
 
-fn gpu_info() -> Vec<GpuMetric> {
+fn nvidia_gpu_info() -> Vec<GpuMetric> {
     let gpu = command(
         "nvidia-smi",
         &[
@@ -664,8 +709,11 @@ fn gpu_info() -> Vec<GpuMetric> {
             if fields.len() < 4 {
                 return None;
             }
+            if fields[1].is_empty() {
+                return None;
+            }
             Some(GpuMetric {
-                usage: fields[0].parse().unwrap_or(0.0),
+                usage: fields[0].parse().ok(),
                 model: fields[1].to_string(),
                 memory_used: fields[2]
                     .parse::<i64>()
@@ -678,6 +726,172 @@ fn gpu_info() -> Vec<GpuMetric> {
             })
         })
         .collect()
+}
+
+fn basic_gpu_metrics(names: impl IntoIterator<Item = String>) -> Vec<GpuMetric> {
+    let mut seen = HashSet::new();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let name = name.split(" (rev ").next().unwrap_or(&name).trim();
+            let lower = name.to_ascii_lowercase();
+            if name.is_empty()
+                || [
+                    "sensor hub",
+                    "management engine",
+                    "ethernet",
+                    "wireless",
+                    "audio controller",
+                    "usb controller",
+                    "sata controller",
+                    "virtio",
+                    "vmware",
+                    "qxl",
+                    "hyper-v",
+                    "cirrus",
+                    "microsoft basic display",
+                ]
+                .iter()
+                .any(|pattern| lower.contains(pattern))
+                || !seen.insert(name.to_string())
+            {
+                return None;
+            }
+            Some(GpuMetric {
+                model: name.to_string(),
+                usage: None,
+                memory_used: 0,
+                memory_total: 0,
+            })
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_lspci_gpu_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("vga compatible controller")
+                || lower.contains("3d controller")
+                || lower.contains("display controller")
+        })
+        .filter_map(|line| line.split_once(": ").map(|(_, name)| name.to_string()))
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn gpu_name_from_uevent(output: &str) -> Option<String> {
+    let driver = output
+        .lines()
+        .find_map(|line| line.strip_prefix("DRIVER="))?;
+    let pci_class = output
+        .lines()
+        .find_map(|line| line.strip_prefix("PCI_CLASS="))
+        .unwrap_or_default();
+    if u32::from_str_radix(pci_class, 16)
+        .ok()
+        .map(|class| class >> 16)
+        != Some(3)
+    {
+        return None;
+    }
+    match driver {
+        "i915" | "xe" => Some("Intel Integrated Graphics".to_string()),
+        "amdgpu" | "radeon" => Some("AMD Radeon Graphics".to_string()),
+        "nvidia" | "nouveau" => Some("NVIDIA GPU".to_string()),
+        "msm" | "msm_drm" => Some("Qualcomm Adreno GPU".to_string()),
+        "panfrost" | "lima" => Some("ARM Mali GPU".to_string()),
+        "vc4" | "v3d" => Some("Broadcom VideoCore Graphics".to_string()),
+        "virtio-pci" | "virtio_gpu" | "bochs-drm" | "qxl" | "vmwgfx" | "cirrus" | "vboxvideo"
+        | "hyperv_fb" | "simpledrm" | "simplefb" => None,
+        other if !other.is_empty() => Some(format!("GPU ({other})")),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sysfs_gpu_names() -> Vec<String> {
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.strip_prefix("card").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+            })
+        })
+        .filter_map(|entry| gpu_name_from_uevent(&text(entry.path().join("device/uevent"))))
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_system_profiler_gpu_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("Chipset Model:")
+                .map(|name| name.trim().to_string())
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn basic_gpu_info() -> Vec<GpuMetric> {
+    let names = parse_lspci_gpu_names(&command("lspci", &[]));
+    basic_gpu_metrics(if names.is_empty() {
+        sysfs_gpu_names()
+    } else {
+        names
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn basic_gpu_info() -> Vec<GpuMetric> {
+    basic_gpu_metrics(
+        command(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }",
+            ],
+        )
+        .lines()
+        .map(str::to_string),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn basic_gpu_info() -> Vec<GpuMetric> {
+    basic_gpu_metrics(parse_system_profiler_gpu_names(&command(
+        "system_profiler",
+        &["SPDisplaysDataType"],
+    )))
+}
+
+fn gpu_info() -> Vec<GpuMetric> {
+    let detailed = nvidia_gpu_info();
+    if detailed.is_empty() {
+        basic_gpu_info()
+    } else {
+        detailed
+    }
+}
+
+fn average_gpu_usage(gpus: &[GpuMetric]) -> f64 {
+    let usages = gpus.iter().filter_map(|gpu| gpu.usage).collect::<Vec<_>>();
+    if usages.is_empty() {
+        0.0
+    } else {
+        usages.iter().sum::<f64>() / usages.len() as f64
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -732,11 +946,7 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
     let disk_used = disks.iter().map(|disk| disk.used).sum();
     let disk_total = disks.iter().map(|disk| disk.total).sum();
     let gpus = gpu_info();
-    let gpu_usage = if gpus.is_empty() {
-        0.0
-    } else {
-        gpus.iter().map(|gpu| gpu.usage).sum::<f64>() / gpus.len() as f64
-    };
+    let gpu_usage = average_gpu_usage(&gpus);
     let gpu_model = gpus
         .iter()
         .map(|gpu| gpu.model.as_str())
@@ -781,7 +991,6 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
         gpu_usage,
         gpu_model,
         agent_version: VERSION.to_string(),
-        message: String::new(),
         disk_read_bps: io_after
             .read_sectors
             .saturating_sub(io_before.read_sectors)
@@ -854,11 +1063,7 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
     let disk_total = disk_metrics.iter().map(|disk| disk.total).sum();
     let load = System::load_average();
     let gpus = gpu_info();
-    let gpu_usage = if gpus.is_empty() {
-        0.0
-    } else {
-        gpus.iter().map(|gpu| gpu.usage).sum::<f64>() / gpus.len() as f64
-    };
+    let gpu_usage = average_gpu_usage(&gpus);
     let gpu_model = gpus
         .iter()
         .map(|gpu| gpu.model.as_str())
@@ -907,7 +1112,6 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
         disk_utilization: 0.0,
         disks: disk_metrics,
         gpus,
-        message: String::new(),
         latency_results,
     }
 }
@@ -971,11 +1175,7 @@ fn submit(
     let remote = if response.status().as_u16() == 204 {
         None
     } else {
-        let payload = response.body_mut().read_json::<ReportResponse>()?;
-        if !payload.success {
-            return Err("Worker rejected the report".into());
-        }
-        Some(payload.config)
+        Some(response.body_mut().read_json::<RemoteConfig>()?)
     };
     Ok(SubmitResult {
         config: remote,
@@ -993,7 +1193,7 @@ fn apply_remote(config: &mut RuntimeConfig, remote: &RemoteConfig) -> bool {
     config
         .network_interface
         .clone_from(&remote.network_interface);
-    config.auto_update = remote.auto_update == 1;
+    config.auto_update = remote.auto_update;
     let tasks = sanitize_latency_tasks(&remote.latency_tasks);
     let changed = config.latency_tasks != tasks;
     config.latency_tasks = tasks;
@@ -1063,6 +1263,16 @@ fn report_retry_delay(failures: u32, report_interval: u64) -> Duration {
 
 fn prune_report_samples(samples: &mut Vec<Report>, now: i64) {
     samples.retain(|report| (report.timestamp - now).abs() <= MAX_REPORT_AGE_SECONDS);
+    let mut remaining = MAX_PENDING_LATENCY_RESULTS;
+    for report in samples.iter_mut().rev() {
+        if report.latency_results.len() > remaining {
+            let discard = report.latency_results.len() - remaining;
+            report.latency_results.drain(..discard);
+            remaining = 0;
+        } else {
+            remaining -= report.latency_results.len();
+        }
+    }
 }
 
 fn normalized_version(value: &str) -> &str {
@@ -1280,12 +1490,14 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
     let mut next_report = Instant::now();
     let mut next_collect = Instant::now();
     let mut next_latency: HashMap<String, Instant> = HashMap::new();
+    let mut latency_executor = LatencyExecutor::new()?;
     let mut pending_results = Vec::new();
     let mut pending_samples = Vec::new();
     let mut report_failures = 0_u32;
     let mut next_update_check = Instant::now();
     let mut config_hash = String::new();
     loop {
+        pending_results.extend(latency_executor.drain());
         let current = Instant::now();
         let due = config
             .latency_tasks
@@ -1298,13 +1510,13 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
             .cloned()
             .collect::<Vec<_>>();
         if !due.is_empty() {
-            pending_results.extend(execute_latency_tasks(&due));
             let scheduled_at = Instant::now();
             for task in due {
-                next_latency.insert(
-                    task.id,
-                    scheduled_at + Duration::from_secs(task.interval_seconds.clamp(30, 3600)),
-                );
+                let task_id = task.id.clone();
+                let interval = task.interval_seconds.clamp(30, 3600);
+                if latency_executor.enqueue(task) {
+                    next_latency.insert(task_id, scheduled_at + Duration::from_secs(interval));
+                }
             }
         }
 
@@ -1399,11 +1611,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_artifact_name, executable_format_valid, is_public_probe_ip, median,
-        normalized_version, parse_probe_target, ping_latency, prune_report_samples,
-        release_asset_sha256, report_retry_delay, sanitize_latency_tasks, selected_interface,
-        tcp_latency_probe_address, valid_endpoint, version_triplet, CliOptions, GithubReleaseAsset,
-        LatencyTask, Report, MAX_LATENCY_TASKS, PROBE_ATTEMPTS,
+        agent_artifact_name, executable_format_valid, gpu_name_from_uevent, is_public_probe_ip,
+        median, normalized_version, parse_lspci_gpu_names, parse_probe_target,
+        parse_system_profiler_gpu_names, ping_latency, prune_report_samples, release_asset_sha256,
+        report_retry_delay, sanitize_latency_tasks, selected_interface, tcp_latency_probe_address,
+        valid_endpoint, version_triplet, CliOptions, GithubReleaseAsset, LatencyResult,
+        LatencyTask, Report, MAX_LATENCY_TASKS, MAX_PENDING_LATENCY_RESULTS, PROBE_ATTEMPTS,
     };
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1416,6 +1629,32 @@ mod tests {
         assert!(selected_interface("eth0", ""));
         assert!(!selected_interface("lo", ""));
         assert!(selected_interface("ens3", "eth0, ens3"));
+    }
+
+    #[test]
+    fn parses_platform_gpu_names() {
+        let lspci = "00:02.0 VGA compatible controller: Intel Corporation CometLake-S GT2 [UHD Graphics 630] (rev 05)\n\
+                     01:00.0 Audio device: NVIDIA Corporation HDMI Audio\n\
+                     02:00.0 3D controller: NVIDIA Corporation GA102 [GeForce RTX 3090] (rev a1)";
+        assert_eq!(
+            parse_lspci_gpu_names(lspci),
+            [
+                "Intel Corporation CometLake-S GT2 [UHD Graphics 630] (rev 05)",
+                "NVIDIA Corporation GA102 [GeForce RTX 3090] (rev a1)",
+            ]
+        );
+
+        let profiler = "Graphics/Displays:\n\n    Apple M3 Max:\n\n      Chipset Model: Apple M3 Max\n      Metal Support: Metal 3";
+        assert_eq!(parse_system_profiler_gpu_names(profiler), ["Apple M3 Max"]);
+
+        assert_eq!(
+            gpu_name_from_uevent("DRIVER=i915\nPCI_CLASS=30000\nPCI_ID=8086:591B"),
+            Some("Intel Integrated Graphics".to_string())
+        );
+        assert_eq!(
+            gpu_name_from_uevent("DRIVER=virtio_gpu\nPCI_CLASS=30000"),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1550,6 +1789,32 @@ mod tests {
         prune_report_samples(&mut samples, 9_000);
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].timestamp, 8_500);
+    }
+
+    #[test]
+    fn bounds_pending_latency_results() {
+        let mut samples = (0..MAX_PENDING_LATENCY_RESULTS + 10)
+            .map(|index| Report {
+                timestamp: index as i64 + 1,
+                latency_results: vec![LatencyResult {
+                    task_id: format!("task-{index}"),
+                    timestamp: index as i64 + 1,
+                    latency_ms: 10.0,
+                    packet_loss: 0.0,
+                }],
+                ..Report::default()
+            })
+            .collect::<Vec<_>>();
+        prune_report_samples(&mut samples, MAX_PENDING_LATENCY_RESULTS as i64 + 10);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.latency_results.len())
+                .sum::<usize>(),
+            MAX_PENDING_LATENCY_RESULTS
+        );
+        assert!(samples.first().unwrap().latency_results.is_empty());
+        assert_eq!(samples.last().unwrap().latency_results.len(), 1);
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]

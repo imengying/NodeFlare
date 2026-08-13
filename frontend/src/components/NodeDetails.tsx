@@ -24,7 +24,7 @@ import {
 } from "recharts";
 import { api } from "../api";
 import { demoHistory, demoLatencyHistory, demoLatencyTasks } from "../demo";
-import { formatBytes, formatSpeed, formatUptime, isOnline, number } from "../format";
+import { displayGpuDevices, formatBytes, formatCpuName, formatSpeed, formatUptime, isOnline, number } from "../format";
 import type { HistoryPoint, LatencySample, LatencyTestPoint, Server } from "../types";
 import { Flag, regionDisplayName } from "./Flag";
 import { OSIcon } from "./OSIcon";
@@ -83,7 +83,7 @@ export function NodeDetails({ server, threshold, retentionDays, locale, demo = f
     setError("");
     const requestHours = hours === 0 ? 1 : hours;
     if (demo) {
-      const taskIds = new Set((server.latency ?? []).map((point) => point.task_id));
+      const taskIds = new Set(server.latency.map((point) => point.task_id));
       const tasks = demoLatencyTasks.filter((task) => taskIds.has(task.id));
       setPoints(demoHistory(server.id, requestHours));
       setLatencyTasks(tasks);
@@ -100,6 +100,11 @@ export function NodeDetails({ server, threshold, retentionDays, locale, demo = f
   }, [server.id, hours, demo, locale]);
 
   const online = isOnline(server, threshold);
+  const gpuDevices = useMemo(() => displayGpuDevices(server.gpus), [server.gpus]);
+  const gpuNames = gpuDevices.map((gpu) => gpu.model).join(" · ");
+  const gpuMemory = gpuDevices.map((gpu) => gpu.memory_total > 0
+    ? `${formatBytes(gpu.memory_used)} / ${formatBytes(gpu.memory_total)}`
+    : ui(locale, "共享内存", "Shared memory")).join(" · ");
   const loadRanges = [
     { value: 0, label: ui(locale, "实时", "Live") },
     { value: 1, label: ui(locale, "1 小时", "1 hour") },
@@ -164,10 +169,13 @@ export function NodeDetails({ server, threshold, retentionDays, locale, demo = f
 
       <div className="info-groups">
         <InfoGroup title={ui(locale, "硬件信息", "Hardware")} icon={<Cpu size={16} />}>
-          <InfoItem icon={<Cpu size={14} />} label={ui(locale, "处理器", "Processor")} value={`${server.cpu_model || "--"} (x${server.cpu_cores || 0})`} />
+          <InfoItem icon={<Cpu size={14} />} label="CPU" value={formatCpuName(server.cpu_model, server.cpu_cores)} />
           <InfoItem icon={<Box size={14} />} label={ui(locale, "架构", "Architecture")} value={server.arch || "--"} />
-          <InfoItem icon={<Cpu size={14} />} label={ui(locale, "图形设备", "Graphics")} value={server.gpus?.length ? server.gpus.map((gpu) => `${gpu.model} ${gpu.usage.toFixed(1)}%`).join(" · ") : server.gpu_model || ui(locale, "未检测到", "Not detected")} />
-          <InfoItem icon={<HardDrive size={14} />} label={ui(locale, "存储设备", "Storage")} value={server.disks?.length ? server.disks.map((disk) => `${disk.mount_point} ${formatBytes(disk.used)} / ${formatBytes(disk.total)}`).join(" · ") : `${formatBytes(server.disk_used)} / ${formatBytes(server.disk_total)}`} />
+          {gpuDevices.length ? <>
+            <InfoItem icon={<Cpu size={14} />} label="GPU" value={gpuNames} />
+            <InfoItem icon={<Cpu size={14} />} label={ui(locale, "GPU 显存", "GPU Memory")} value={gpuMemory} />
+          </> : null}
+          <InfoItem icon={<HardDrive size={14} />} label={ui(locale, "存储设备", "Storage")} value={server.disks.length ? server.disks.map((disk) => `${disk.mount_point} ${formatBytes(disk.used)} / ${formatBytes(disk.total)}`).join(" · ") : `${formatBytes(server.disk_used)} / ${formatBytes(server.disk_total)}`} />
           <InfoItem icon={<ServerCog size={14} />} label={ui(locale, "虚拟化", "Virtualization")} value={server.virtualization || "--"} />
         </InfoGroup>
         <InfoGroup title={ui(locale, "系统信息", "System")} icon={<ServerCog size={16} />}>

@@ -6,6 +6,7 @@ pub const BUILTIN_THEME_ID: &str = "builtin-komari-glass";
 pub const BUILTIN_THEME_NAME: &str = "Komari Glass";
 pub const INDEX_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const ASSET_MAX_BYTES: usize = 16 * 1024 * 1024;
+const SETTINGS_MAX_BYTES: usize = 64 * 1024;
 
 pub struct ResolvedTheme {
     pub source_url: String,
@@ -133,6 +134,10 @@ pub fn index_url(base: &str) -> Option<String> {
     raw_github_base(base).map(|base| remote_url(base.as_str(), "index.html"))
 }
 
+fn settings_url(base: &str) -> Option<String> {
+    raw_github_base(base).map(|base| remote_url(base.as_str(), "theme.json"))
+}
+
 pub async fn read_response_limited(
     response: &mut Response,
     limit: usize,
@@ -181,7 +186,7 @@ pub async fn validate_remote(base: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn settings_schema() -> Value {
+pub fn builtin_settings_schema() -> Value {
     let currencies = [
         "CNY", "USD", "HKD", "EUR", "GBP", "JPY", "RUB", "CHF", "INR", "VND", "THB", "CAD",
     ];
@@ -214,17 +219,162 @@ pub fn settings_schema() -> Value {
     })
 }
 
+fn empty_settings_schema(source: &str) -> Value {
+    serde_json::json!({ "schema": 1, "source": source, "settings": [] })
+}
+
+fn valid_setting_value(value: &Value) -> bool {
+    value.is_string() || value.is_boolean() || value.as_f64().is_some()
+}
+
+fn validate_settings_schema(value: Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if object.get("schema")?.as_u64()? != 1 {
+        return None;
+    }
+    let fields = object.get("settings")?.as_array()?;
+    if fields.len() > 40 {
+        return None;
+    }
+    let allowed_types = [
+        "text", "textarea", "url", "color", "select", "toggle", "number",
+    ];
+    let mut keys = std::collections::HashSet::new();
+    for field in fields {
+        let field = field.as_object()?;
+        let key = field.get("key")?.as_str()?;
+        let label = field.get("label")?.as_str()?;
+        let field_type = field.get("type")?.as_str()?;
+        if key.is_empty()
+            || key.len() > 64
+            || !key
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
+            || !keys.insert(key)
+            || label.is_empty()
+            || label.chars().count() > 80
+            || !allowed_types.contains(&field_type)
+            || field.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "key"
+                        | "label"
+                        | "type"
+                        | "default"
+                        | "placeholder"
+                        | "options"
+                        | "min"
+                        | "max"
+                        | "step"
+                )
+            })
+            || field
+                .get("default")
+                .is_some_and(|value| !valid_setting_value(value))
+            || field
+                .get("placeholder")
+                .is_some_and(|value| value.as_str().is_none_or(|text| text.chars().count() > 160))
+            || ["min", "max", "step"].iter().any(|key| {
+                field
+                    .get(*key)
+                    .is_some_and(|value| value.as_f64().is_none())
+            })
+        {
+            return None;
+        }
+        let options = field.get("options").and_then(Value::as_array);
+        if field_type == "select"
+            && options.is_none_or(|choices| {
+                choices.is_empty()
+                    || choices.len() > 64
+                    || choices.iter().any(|choice| {
+                        choice.as_object().is_none_or(|choice| {
+                            choice.len() != 2
+                                || choice
+                                    .get("label")
+                                    .and_then(Value::as_str)
+                                    .is_none_or(|text| text.is_empty() || text.chars().count() > 80)
+                                || choice
+                                    .get("value")
+                                    .and_then(Value::as_str)
+                                    .is_none_or(|text| {
+                                        text.is_empty() || text.chars().count() > 160
+                                    })
+                        })
+                    })
+            })
+        {
+            return None;
+        }
+    }
+    Some(serde_json::json!({
+        "schema": 1,
+        "source": "remote",
+        "settings": fields
+    }))
+}
+
+pub async fn remote_settings_schema(base: &str) -> Result<Value> {
+    let url = settings_url(base)
+        .ok_or_else(|| Error::RustError("主题资源地址不是 GitHub Raw 地址".to_string()))?;
+    let request = Request::new(&url, Method::Get)?;
+    let mut response = Fetch::Request(request).send().await?;
+    if response.status_code() == 404 {
+        return Ok(empty_settings_schema("remote"));
+    }
+    if !(200..300).contains(&response.status_code()) {
+        return Err(Error::RustError(format!(
+            "主题 theme.json 返回 HTTP {}",
+            response.status_code()
+        )));
+    }
+    let body = read_response_limited(&mut response, SETTINGS_MAX_BYTES)
+        .await?
+        .ok_or_else(|| Error::RustError("主题 theme.json 内容无效".to_string()))?;
+    let value = serde_json::from_slice(body.as_slice())
+        .map_err(|_| Error::RustError("主题 theme.json 不是有效 JSON".to_string()))?;
+    validate_settings_schema(value)
+        .ok_or_else(|| Error::RustError("主题 theme.json 设置格式无效".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{asset_url, normalize_url, resolve_url, settings_schema};
+    use super::{
+        asset_url, builtin_settings_schema, normalize_url, resolve_url, validate_settings_schema,
+    };
 
     #[test]
     fn exposes_builtin_glass_theme_settings() {
-        let schema = settings_schema();
+        let schema = builtin_settings_schema();
         let settings = schema["settings"].as_array().expect("settings");
         assert!(settings.iter().any(|field| field["key"] == "assetCurrency"));
         assert!(settings.iter().any(|field| field["key"] == "enableBlur"));
         assert_eq!(schema["source"], "builtin");
+    }
+
+    #[test]
+    fn validates_remote_theme_settings() {
+        let schema = validate_settings_schema(serde_json::json!({
+            "schema": 1,
+            "settings": [{
+                "key": "accent",
+                "label": "强调色",
+                "type": "color",
+                "default": "#00aaff"
+            }]
+        }))
+        .expect("valid schema");
+        assert_eq!(schema["source"], "remote");
+        assert!(validate_settings_schema(serde_json::json!({
+            "schema": 1,
+            "settings": [{ "key": "../bad", "label": "Bad", "type": "text" }]
+        }))
+        .is_none());
+        assert!(validate_settings_schema(serde_json::json!({
+            "schema": 1,
+            "settings": [{ "key": "mode", "label": "Mode", "type": "select" }]
+        }))
+        .is_none());
     }
 
     #[test]

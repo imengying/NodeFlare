@@ -22,9 +22,9 @@ use crate::auth::{
     verify_theme_preview_proof, verify_turnstile_proof,
 };
 use crate::models::{
-    AgentReport, AgentReportBatch, AlertRuleInput, ApiError, LatencyTaskInput, LoginRequest,
-    ServerBatchInput, ServerInput, ServerOrderInput, ServerView, SettingsInput, ThemeInput,
-    ThemeView, TurnstileVerifyRequest,
+    AgentDiskMetric, AgentGpuMetric, AgentReport, AgentReportBatch, AlertRuleInput, ApiError,
+    LatencyTaskInput, LoginRequest, ServerBatchInput, ServerInput, ServerOrderInput, ServerView,
+    SettingsInput, ThemeInput, ThemeView, TurnstileVerifyRequest,
 };
 
 const ADMIN_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.html"));
@@ -33,11 +33,8 @@ const ADMIN_STYLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.css")
 const HISTORY_CACHE_SECONDS: i64 = 30;
 const API_JSON_MAX_BYTES: usize = 1024 * 1024;
 const AGENT_JSON_MAX_BYTES: usize = 16 * 1024 * 1024;
-
-#[derive(Serialize)]
-struct Success {
-    success: bool,
-}
+const MAX_AGENT_SAMPLES: usize = 720;
+const MAX_AGENT_LATENCY_RESULTS: usize = 4096;
 
 #[derive(Serialize)]
 struct PublicServer {
@@ -52,7 +49,7 @@ struct PublicServer {
     price: f64,
     billing_cycle: i64,
     currency: String,
-    auto_renewal: i64,
+    auto_renewal: bool,
     public_remark: String,
     reset_day: i64,
     timestamp: Option<i64>,
@@ -89,9 +86,8 @@ struct PublicServer {
     disk_write_iops: Option<f64>,
     disk_await_ms: Option<f64>,
     disk_utilization: Option<f64>,
-    message: Option<String>,
-    disks: serde_json::Value,
-    gpus: serde_json::Value,
+    disks: Vec<AgentDiskMetric>,
+    gpus: Vec<AgentGpuMetric>,
     latency: Vec<latency::LatencySample>,
 }
 
@@ -122,6 +118,11 @@ fn env_secret_text(env: &Env, key: &str) -> String {
 
 fn json<T: Serialize>(value: &T, status: u16) -> Result<Response> {
     let mut response = Response::from_json(value)?.with_status(status);
+    set_api_headers(&mut response)?;
+    Ok(response)
+}
+
+fn set_api_headers(response: &mut Response) -> Result<()> {
     let headers = response.headers_mut();
     headers.set("Cache-Control", "no-store")?;
     headers.set("X-Content-Type-Options", "nosniff")?;
@@ -130,6 +131,12 @@ fn json<T: Serialize>(value: &T, status: u16) -> Result<Response> {
         "Permissions-Policy",
         "camera=(), microphone=(), geolocation=()",
     )?;
+    Ok(())
+}
+
+fn no_content() -> Result<Response> {
+    let mut response = Response::empty()?.with_status(204);
+    set_api_headers(&mut response)?;
     Ok(response)
 }
 
@@ -643,8 +650,8 @@ fn validate_report(report: &AgentReport) -> Option<&'static str> {
     if counters.iter().any(|value| *value < 0) {
         return Some("计数指标不能为负数");
     }
-    if report.message.chars().count() > 500 || report.gpu_model.chars().count() > 240 {
-        return Some("探针文本字段过长");
+    if report.gpu_model.chars().count() > 240 {
+        return Some("GPU 型号字段过长");
     }
     if report.agent_version.chars().count() > 80 {
         return Some("探针版本字段过长");
@@ -671,8 +678,9 @@ fn validate_report(report: &AgentReport) -> Option<&'static str> {
             gpu.model.chars().count() > 240
                 || gpu.memory_used < 0
                 || gpu.memory_total < 0
-                || !gpu.usage.is_finite()
-                || !(0.0..=100.0).contains(&gpu.usage)
+                || gpu
+                    .usage
+                    .is_some_and(|usage| !usage.is_finite() || !(0.0..=100.0).contains(&usage))
         })
     {
         return Some("磁盘或 GPU 明细无效");
@@ -706,13 +714,13 @@ fn public_server(server: ServerView, latency: Vec<latency::LatencySample>) -> Pu
     let disks = server
         .disk_info
         .as_deref()
-        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-        .unwrap_or_else(|| serde_json::json!([]));
+        .and_then(|value| serde_json::from_str::<Vec<AgentDiskMetric>>(value).ok())
+        .unwrap_or_default();
     let gpus = server
         .gpu_info
         .as_deref()
-        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-        .unwrap_or_else(|| serde_json::json!([]));
+        .and_then(|value| serde_json::from_str::<Vec<AgentGpuMetric>>(value).ok())
+        .unwrap_or_default();
     PublicServer {
         id: server.id,
         name: server.name,
@@ -725,7 +733,7 @@ fn public_server(server: ServerView, latency: Vec<latency::LatencySample>) -> Pu
         price: server.price,
         billing_cycle: server.billing_cycle,
         currency: server.currency,
-        auto_renewal: server.auto_renewal,
+        auto_renewal: server.auto_renewal != 0,
         public_remark: server.public_remark,
         reset_day: server.reset_day,
         timestamp: server.timestamp,
@@ -762,7 +770,6 @@ fn public_server(server: ServerView, latency: Vec<latency::LatencySample>) -> Pu
         disk_write_iops: server.disk_write_iops,
         disk_await_ms: server.disk_await_ms,
         disk_utilization: server.disk_utilization,
-        message: server.message,
         disks,
         gpus,
         latency,
@@ -809,6 +816,13 @@ fn rate_limit_key(req: &Request) -> String {
             .unwrap_or_else(|| "anonymous".to_string())
     });
     sha256_hex(&identity)
+}
+
+fn agent_rate_limit_key(req: &Request) -> String {
+    bearer_token(req)
+        .filter(|value| !value.is_empty())
+        .map(|value| sha256_hex(&value))
+        .unwrap_or_else(|| rate_limit_key(req))
 }
 
 fn allow_on_rate_limit_failure(binding: &str) -> bool {
@@ -941,7 +955,7 @@ async fn handle_agent_report(
     if batch.server_id.is_empty() || batch.server_id.len() > 80 {
         return error("节点 ID 无效", 400);
     }
-    if batch.samples.is_empty() || batch.samples.len() > 720 {
+    if batch.samples.is_empty() || batch.samples.len() > MAX_AGENT_SAMPLES {
         return error("每批应包含 1 至 720 个样本", 400);
     }
     let received_at = now();
@@ -965,6 +979,9 @@ async fn handle_agent_report(
         .flat_map(|report| report.latency_results.iter())
         .cloned()
         .collect::<Vec<_>>();
+    if latency_results.len() > MAX_AGENT_LATENCY_RESULTS {
+        return error("每批最多包含 4096 条延迟结果", 400);
+    }
     db::save_reports(database, &batch.server_id, &batch.samples).await?;
     latency::save_results(database, &batch.server_id, &latency_results, received_at).await?;
 
@@ -972,38 +989,38 @@ async fn handle_agent_report(
         .await?
         .is_none_or(|value| value == "true");
     if row.hidden == 0 && public_dashboard {
-        let latest = batch
-            .samples
-            .iter()
-            .max_by_key(|report| report.timestamp)
-            .expect("batch is non-empty");
-        let metrics = serde_json::to_value(latest)?;
-        let payload = serde_json::to_string(&serde_json::json!({
-            "type": "metrics",
-            "server_id": batch.server_id,
-            "timestamp": latest.timestamp,
-            "metrics": metrics
-        }))?;
+        let server = db::get_server(database, &batch.server_id, false).await?;
+        let samples = latency::latest_for_server(database, &batch.server_id).await?;
+        let payload = server
+            .map(|server| public_server(server, samples))
+            .map(|server| {
+                serde_json::to_string(&serde_json::json!({
+                    "type": "server",
+                    "server": server
+                }))
+            })
+            .transpose()?;
         let server_id = batch.server_id.clone();
-        ctx.wait_until(async move {
-            let _ = live::broadcast(&env, &server_id, &payload).await;
-        });
+        if let Some(payload) = payload {
+            ctx.wait_until(async move {
+                let _ = live::broadcast(&env, &server_id, &payload).await;
+            });
+        }
     }
-    let config = db::agent_config(database, &batch.server_id).await?;
+    let Some(config) = db::agent_config(database, &batch.server_id).await? else {
+        return error("节点不存在", 404);
+    };
     let config_json = serde_json::to_string(&config)?;
     let config_hash = sha256_hex(&config_json);
     if agent_config_hash == config_hash {
-        let mut response = Response::empty()?.with_status(204);
+        let mut response = no_content()?;
         response
             .headers_mut()
             .set("X-Agent-Config-Sha256", &config_hash)?;
         response.headers_mut().set("Cache-Control", "no-store")?;
         return Ok(response);
     }
-    let mut response = json(
-        &serde_json::json!({ "success": true, "config": config }),
-        202,
-    )?;
+    let mut response = json(&config, 202)?;
     response
         .headers_mut()
         .set("X-Agent-Config-Sha256", &config_hash)?;
@@ -1095,8 +1112,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "turnstile_enabled": public_turnstile_enabled,
                 "turnstile_login_enabled": login_protection_enabled || public_turnstile_enabled,
                 "turnstile_site_key": turnstile_site_key,
-                "password_client_salt": settings.password_client_salt,
-                "websocket": true
+                "password_client_salt": settings.password_client_salt
             }),
             200,
         );
@@ -1180,7 +1196,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         response.headers_mut().append(
             "Set-Cookie",
             &format!(
-                "nodeflare_turnstile={proof}; Path=/; Max-Age=3600; HttpOnly; SameSite=Strict"
+                "nodeflare_turnstile={proof}; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Strict"
             ),
         )?;
         return Ok(response);
@@ -1241,29 +1257,6 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             })
             .collect();
         return json(&serde_json::json!({ "servers": servers }), 200);
-    }
-
-    if method == Method::Get && path.starts_with("/api/servers/") {
-        if !turnstile_verified {
-            return error("请先完成 Cloudflare 人机验证", 403);
-        }
-        if !settings.public_dashboard && !admin {
-            return error("仪表盘未公开", 401);
-        }
-        let Some(id) = server_id(&path, "/api/servers/") else {
-            return error("节点 ID 无效", 400);
-        };
-        return match db::get_server(&database, &id, false).await? {
-            Some(server) => {
-                let samples = latency::latest_all(&database)
-                    .await?
-                    .into_iter()
-                    .filter(|sample| sample.server_id == id)
-                    .collect();
-                json(&public_server(server, samples), 200)
-            }
-            None => error("节点不存在", 404),
-        };
     }
 
     if method == Method::Get && path.starts_with("/api/history/") {
@@ -1349,6 +1342,9 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if let Some(message) = validate_latency_task(&input) {
             return error(message, 400);
         }
+        if latency::task_count(&database).await? >= latency::MAX_LATENCY_TASKS as i64 {
+            return error("最多可创建 128 个延迟任务", 400);
+        }
         let server_ids: HashSet<String> = db::list_servers(&database, true)
             .await?
             .into_iter()
@@ -1365,6 +1361,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             .take(16)
             .collect::<String>();
         latency::create_task(&database, &id, &input, now()).await?;
+        db::increment_setting(&database, "history_cache_version").await?;
         return json(&serde_json::json!({ "id": id }), 201);
     }
 
@@ -1376,7 +1373,8 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         };
         if method == Method::Delete {
             return if latency::delete_task(&database, &id).await? {
-                json(&Success { success: true }, 200)
+                db::increment_setting(&database, "history_cache_version").await?;
+                no_content()
             } else {
                 error("延迟任务不存在", 404)
             };
@@ -1401,7 +1399,8 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error("延迟任务包含不存在的服务器", 400);
         }
         return if latency::update_task(&database, &id, &input, now()).await? {
-            json(&Success { success: true }, 200)
+            db::increment_setting(&database, "history_cache_version").await?;
+            no_content()
         } else {
             error("延迟任务不存在", 404)
         };
@@ -1452,7 +1451,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         };
         if method == Method::Delete {
             return if db::delete_alert_rule(&database, &id).await? {
-                json(&Success { success: true }, 200)
+                no_content()
             } else {
                 error("告警规则不存在", 404)
             };
@@ -1477,7 +1476,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error("告警规则包含不存在的服务器", 400);
         }
         return if db::update_alert_rule(&database, &id, &input).await? {
-            json(&Success { success: true }, 200)
+            no_content()
         } else {
             error("告警规则不存在", 404)
         };
@@ -1501,7 +1500,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error("批量删除列表无效", 400);
         }
         db::delete_servers(&database, &input.ids).await?;
-        return json(&Success { success: true }, 200);
+        return no_content();
     }
 
     if method == Method::Patch && path == "/api/admin/servers/order" {
@@ -1523,7 +1522,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error("排序列表必须包含全部节点", 400);
         }
         db::reorder_servers(&database, &input.ids).await?;
-        return json(&Success { success: true }, 200);
+        return no_content();
     }
 
     if method == Method::Post && path == "/api/admin/servers" {
@@ -1570,7 +1569,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         };
         if method == Method::Delete {
             return if db::delete_server(&database, &id).await? {
-                json(&Success { success: true }, 200)
+                no_content()
             } else {
                 error("节点不存在", 404)
             };
@@ -1583,7 +1582,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error(message, 400);
         }
         return if db::update_server(&database, &id, &input).await? {
-            json(&Success { success: true }, 200)
+            no_content()
         } else {
             error("节点不存在", 404)
         };
@@ -1695,7 +1694,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if !db::set_active_theme(&database, id).await? {
             return error("主题不存在", 404);
         }
-        return json(&Success { success: true }, 200);
+        return no_content();
     }
 
     if method == Method::Delete && path.starts_with("/api/admin/themes/") {
@@ -1706,14 +1705,26 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error("内置主题不能删除", 400);
         }
         return if db::delete_theme(&database, &id).await? {
-            json(&Success { success: true }, 200)
+            no_content()
         } else {
             error("主题不存在", 404)
         };
     }
 
     if method == Method::Get && path == "/api/admin/theme-settings" {
-        return json(&theme::settings_schema(), 200);
+        if settings.active_theme_id == theme::BUILTIN_THEME_ID {
+            return json(&theme::builtin_settings_schema(), 200);
+        }
+        let Some(url) = db::theme_url(&database, &settings.active_theme_id).await? else {
+            return error("当前主题不存在", 404);
+        };
+        return match theme::remote_settings_schema(&url).await {
+            Ok(schema) => json(&schema, 200),
+            Err(err) => {
+                console_warn!("theme settings validation failed for {url}: {err}");
+                error("当前主题的 theme.json 设置格式无效", 422)
+            }
+        };
     }
 
     if method == Method::Post && path == "/api/admin/exchange-rates/refresh" {
@@ -1762,8 +1773,8 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
 
     if method == Method::Delete && path == "/api/admin/history" {
         db::clear_history(&database).await?;
-        db::save_setting(&database, "history_cache_version", &now().to_string()).await?;
-        return json(&Success { success: true }, 200);
+        db::increment_setting(&database, "history_cache_version").await?;
+        return no_content();
     }
 
     if method == Method::Post && path == "/api/admin/notifications/test" {
@@ -1775,7 +1786,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             console_error!("test notification failed: {err}");
             return error("测试通知发送失败，请检查 Bot Token 和 Chat ID", 502);
         }
-        return json(&Success { success: true }, 200);
+        return no_content();
     }
 
     if method == Method::Patch && path == "/api/admin/settings" {
@@ -1870,9 +1881,6 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         {
             return error("新密码派生值无效", 400);
         }
-        let enabled = input
-            .turnstile_enabled
-            .unwrap_or(settings.turnstile_enabled);
         let configured_site_key = input
             .turnstile_site_key
             .as_deref()
@@ -1892,7 +1900,10 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         } else {
             configured_secret_key
         };
-        if enabled && (site_key.is_empty() || secret_key.is_empty()) {
+        let protection_activated = input.turnstile_enabled == Some(true)
+            && !settings.turnstile_enabled
+            || input.turnstile_login_enabled == Some(true) && !settings.turnstile_login_enabled;
+        if protection_activated && (site_key.is_empty() || secret_key.is_empty()) {
             return error("启用 Turnstile 前必须填写站点密钥和私钥", 400);
         }
         if input
@@ -2023,7 +2034,11 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     if let Some(binding) = rate_limit_binding(method, &path) {
-        let key = rate_limit_key(&req);
+        let key = if binding == "AGENT_RATE_LIMITER" {
+            agent_rate_limit_key(&req)
+        } else {
+            rate_limit_key(&req)
+        };
         if !request_within_rate_limit(&env, binding, key).await {
             return rate_limited();
         }
@@ -2081,6 +2096,9 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         ),
         Ok((_, false)) => {}
         Err(err) => console_error!("exchange-rate refresh failed: {err}"),
+    }
+    if let Err(err) = notify::renew_servers(&database).await {
+        console_error!("server renewal failed: {err}");
     }
     if let Ok(settings) = settings {
         if let Err(err) = notify::check_alerts(&database, &settings).await {

@@ -1,7 +1,7 @@
 import { Pencil, Plus, RadioTower, Save, Search, Trash2 } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import type { LatencyTask, LatencyTaskInput, Server } from "../types";
+import type { AdminServer, LatencyTask, LatencyTaskInput } from "../types";
 import { Checkbox } from "./Checkbox";
 
 const emptyTask: LatencyTaskInput = {
@@ -40,7 +40,7 @@ export function LatencyManager({
   onError,
   onNotice,
 }: {
-  servers: Server[];
+  servers: AdminServer[];
   onError: (message: string) => void;
   onNotice: (message: string) => void;
 }) {
@@ -137,8 +137,8 @@ export function LatencyManager({
 
   return <div className="admin-section latency-section">
     <div className="section-head">
-      <div><h3>延迟任务</h3><span>{tasks.length} 个任务 · TCP / ICMP</span></div>
-      <button className="primary-btn compact" type="button" onClick={() => open()}><Plus size={16} />添加</button>
+      <div><h3>延迟任务</h3><span>{tasks.length} / 128 个任务 · TCP / ICMP</span></div>
+      <button className="primary-btn compact" type="button" disabled={tasks.length >= 128} onClick={() => open()}><Plus size={16} />添加</button>
     </div>
     <div className="latency-task-list">
       {tasks.map((task) => <div className="latency-task-row" key={task.id}>

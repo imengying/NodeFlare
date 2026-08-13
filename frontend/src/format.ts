@@ -22,6 +22,52 @@ export function formatSpeed(value: number | null | undefined) {
   return `${formatBytes(value)}/s`;
 }
 
+export function formatCpuName(model: string | null | undefined, cores: number | null | undefined) {
+  const name = (model ?? "").replace(/\s+/g, " ").trim() || "--";
+  const count = Math.max(0, Math.trunc(number(cores)));
+  return count > 0 ? `${name} ×${count}` : name;
+}
+
+const GPU_MODEL_HINT = /(graphics|geforce|radeon|\bgpu\b|\buhd\b|\biris\b|\barc\b|quadro|tesla|\brtx\b|\bgtx\b|apple|adreno|mali|videocore)/i;
+const GPU_DEVICE_HINT = new RegExp(`${GPU_MODEL_HINT.source}|nvidia|amd|intel`, "i");
+const GPU_REJECT = /(sensor hub|management engine|ethernet|wireless|audio controller|usb controller|sata controller)/i;
+
+function conciseGpuName(raw: string | null | undefined) {
+  const original = (raw ?? "").replace(/\s+/g, " ").trim();
+  if (!original || /^(?:-|0|none|null|unknown|n\/a)$/i.test(original) || GPU_REJECT.test(original)) return "";
+
+  const bracketModels = Array.from(original.matchAll(/\[([^\]]+)]/g), (match) => match[1].trim());
+  const bracketModel = [...bracketModels].reverse().find((part) => GPU_MODEL_HINT.test(part));
+  let model = bracketModel ?? original;
+  if (!GPU_DEVICE_HINT.test(model)) return "";
+
+  model = model
+    .replace(/\bIntel Corporation\b/gi, "Intel")
+    .replace(/\bNVIDIA Corporation\b/gi, "NVIDIA")
+    .replace(/\bAdvanced Micro Devices,?\s*Inc\.?/gi, "AMD")
+    .replace(/\bAMD\/ATI\b/gi, "AMD")
+    .replace(/\s*\[(?:AMD|ATI|AMD\/ATI)]\s*/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (bracketModel) {
+    if (/Intel/i.test(original) && !/^Intel\b/i.test(model)) model = `Intel ${model}`;
+    else if (/NVIDIA/i.test(original) && !/^NVIDIA\b/i.test(model)) model = `NVIDIA ${model}`;
+    else if (/(AMD|Advanced Micro Devices|ATI)/i.test(original) && !/^AMD\b/i.test(model)) model = `AMD ${model}`;
+  }
+  return model;
+}
+
+export function displayGpuDevices(gpus: Server["gpus"]) {
+  const seen = new Set<string>();
+  return gpus.flatMap((gpu) => {
+    const name = conciseGpuName(gpu.model);
+    if (!name || seen.has(name)) return [];
+    seen.add(name);
+    return [{ ...gpu, model: name }];
+  });
+}
+
 export function formatUptime(seconds: number | null | undefined, locale: UiLocale = "zh-CN") {
   const days = Math.floor(number(seconds) / 86400);
   if (days > 0) return ui(locale, `${days} 天`, `${days} days`);
@@ -31,7 +77,7 @@ export function formatUptime(seconds: number | null | undefined, locale: UiLocal
   return ui(locale, `${minutes} 分钟`, `${minutes} minutes`);
 }
 
-export function isOnline(server: Server, threshold: number, at = Date.now() / 1000) {
+export function isOnline(server: Pick<Server, "timestamp">, threshold: number, at = Date.now() / 1000) {
   return !!server.timestamp && at - server.timestamp <= threshold;
 }
 
@@ -53,7 +99,7 @@ export function countryFlag(region: string) {
 export function trafficUsed(server: Pick<Server, "net_rx_total" | "net_tx_total" | "traffic_limit_type">) {
   const down = number(server.net_rx_total);
   const up = number(server.net_tx_total);
-  const type: TrafficLimitType = server.traffic_limit_type || "sum";
+  const type: TrafficLimitType = server.traffic_limit_type;
   if (type === "max") return Math.max(up, down);
   if (type === "min") return Math.min(up, down);
   if (type === "up") return up;
@@ -81,7 +127,7 @@ export function formatPrice(server: Pick<Server, "price" | "billing_cycle" | "cu
     : server.billing_cycle >= 87 && server.billing_cycle <= 95 ? ui(locale, "季", "quarter")
       : server.billing_cycle >= 175 && server.billing_cycle <= 185 ? ui(locale, "半年", "half-year")
         : server.billing_cycle >= 360 && server.billing_cycle <= 370 ? ui(locale, "年", "year")
-          : server.billing_cycle === -1 ? ui(locale, "一次", "one-time") : ui(locale, `${server.billing_cycle} 天`, `${server.billing_cycle} days`);
+          : ui(locale, `${server.billing_cycle} 天`, `${server.billing_cycle} days`);
   return `${formatCurrency(server.price, server.currency)} / ${cycle}`;
 }
 

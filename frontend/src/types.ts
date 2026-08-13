@@ -25,7 +25,6 @@ export interface Config {
   turnstile_login_enabled: boolean;
   turnstile_site_key: string;
   password_client_salt: string;
-  websocket: boolean;
 }
 
 export type ThemeSettingValue = string | number | boolean;
@@ -54,7 +53,7 @@ export interface ThemeSettingField {
 
 export interface ThemeSettingsSchema {
   schema: number;
-  source: "builtin";
+  source: "builtin" | "remote";
   settings: ThemeSettingField[];
 }
 
@@ -91,7 +90,7 @@ interface DiskMetric {
 
 interface GpuMetric {
   model: string;
-  usage: number;
+  usage: number | null;
   memory_used: number;
   memory_total: number;
 }
@@ -129,7 +128,7 @@ export interface LatencyTask {
 
 export type LatencyTaskInput = Pick<LatencyTask, "name" | "task_type" | "target" | "interval_seconds" | "default_enabled" | "server_ids">;
 
-export interface Server {
+interface ServerSummary {
   id: string;
   name: string;
   region: string;
@@ -141,7 +140,7 @@ export interface Server {
   price: number;
   billing_cycle: number;
   currency: string;
-  auto_renewal: number;
+  auto_renewal: boolean;
   public_remark: string;
   reset_day: number;
   timestamp: number | null;
@@ -178,22 +177,24 @@ export interface Server {
   disk_write_iops: number | null;
   disk_await_ms: number | null;
   disk_utilization: number | null;
-  disks?: DiskMetric[];
-  gpus?: GpuMetric[];
-  message: string | null;
-  latency?: LatencySample[];
 }
 
-export interface AdminServer extends Server {
+export interface Server extends ServerSummary {
+  disks: DiskMetric[];
+  gpus: GpuMetric[];
+  latency: LatencySample[];
+}
+
+export interface AdminServer extends ServerSummary {
   note: string;
-  hidden: number;
+  hidden: boolean;
   network_interface: string;
   report_interval: number;
   collect_interval: number;
   rx_correction: number;
   tx_correction: number;
-  offline_notify_disabled: number;
-  auto_update: number;
+  offline_notify_disabled: boolean;
+  auto_update: boolean;
 }
 
 export interface HistoryPoint {
@@ -249,7 +250,7 @@ export interface ServerInput {
   auto_update: boolean;
 }
 
-export interface Settings extends Omit<Config, "websocket" | "password_client_salt"> {
+export interface Settings extends Omit<Config, "password_client_salt"> {
   admin_username: string;
   admin_password_configured: boolean;
   new_password?: string;
@@ -274,7 +275,7 @@ export interface AlertRule {
   threshold: number;
   duration_minutes: number;
   aggregation: AlertAggregation;
-  enabled: number;
+  enabled: boolean;
   server_ids: string[];
 }
 

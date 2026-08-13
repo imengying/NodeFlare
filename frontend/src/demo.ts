@@ -27,7 +27,6 @@ export const demoConfig: Config = {
   turnstile_login_enabled: true,
   turnstile_site_key: "",
   password_client_salt: "nodeflare-demo-password-kdf",
-  websocket: true,
 };
 
 export const demoExchangeRates: ExchangeRates = {
@@ -85,7 +84,7 @@ const baseServer: Server = {
   price: 0,
   billing_cycle: 30,
   currency: "CNY",
-  auto_renewal: 0,
+  auto_renewal: false,
   public_remark: "",
   reset_day: 1,
   timestamp: now - 12,
@@ -124,7 +123,6 @@ const baseServer: Server = {
   disk_utilization: 8.4,
   disks: [],
   gpus: [],
-  message: "",
   latency: [],
 };
 
@@ -142,7 +140,7 @@ export const demoServers: Server[] = [
   node({ id: "frankfurt-lab", name: "法兰克福 Lab", region: "DE", group_name: "实验服务", tags: "Lab,IPv6", price: -1, expires_at: null, mem_total: 16 * 1024 ** 3, mem_used: 6.72 * 1024 ** 3, cpu: 52, uptime: 134 * 86400 }),
   node({ id: "taipei-homelab", name: "台北 HomeLab", region: "TW", group_name: "家庭网络", tags: "HomeLab,自建", price: -1, expires_at: null, mem_total: 24 * 1024 ** 3, mem_used: 10.08 * 1024 ** 3, cpu: 59, uptime: 122 * 86400 }),
   node({ id: "london-archive", name: "伦敦 Archive", region: "GB", group_name: "存储服务", tags: "Archive,HDD", price: 18, currency: "EUR", billing_cycle: 365, expires_at: now + 110 * 86400, disk_total: 4 * 1024 ** 4, disk_used: 2.7 * 1024 ** 4, cpu: 66, latency: [] }),
-  node({ id: "toronto-standby", name: "多伦多 Standby", region: "CA", group_name: "备用节点", tags: "Standby", price: 16, currency: "CAD", expires_at: now + 18 * 86400, timestamp: now - 640, cpu: 0, net_in: 0, net_out: 0, message: "节点维护中" }),
+  node({ id: "toronto-standby", name: "多伦多 Standby", region: "CA", group_name: "备用节点", tags: "Standby", price: 16, currency: "CAD", expires_at: now + 18 * 86400, timestamp: now - 640, cpu: 0, net_in: 0, net_out: 0 }),
 ];
 
 export function demoHistory(serverId: string, hours: number): HistoryPoint[] {

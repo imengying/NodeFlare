@@ -18,16 +18,16 @@ SELECT
   s.created_at,
   m.timestamp, m.cpu, m.load1, m.load5, m.load15, m.mem_used, m.mem_total,
   m.swap_used, m.swap_total, m.disk_used, m.disk_total, m.net_in, m.net_out,
-  CASE WHEN m.net_rx_total IS NULL THEN NULL ELSE m.net_rx_total + s.rx_correction END AS net_rx_total,
-  CASE WHEN m.net_tx_total IS NULL THEN NULL ELSE m.net_tx_total + s.tx_correction END AS net_tx_total,
+  CASE WHEN m.net_rx_total IS NULL THEN NULL ELSE COALESCE(c.used_rx, m.net_rx_total) + s.rx_correction END AS net_rx_total,
+  CASE WHEN m.net_tx_total IS NULL THEN NULL ELSE COALESCE(c.used_tx, m.net_tx_total) + s.tx_correction END AS net_tx_total,
   m.uptime, m.processes, m.tcp_connections,
   m.udp_connections, m.cpu_cores, m.cpu_model, m.os, m.kernel, m.arch,
   m.virtualization, m.gpu_usage, m.gpu_model, m.agent_version,
   m.disk_read_bps, m.disk_write_bps, m.disk_read_iops, m.disk_write_iops,
-  m.disk_await_ms, m.disk_utilization, m.disk_info, m.gpu_info,
-  m.message
+  m.disk_await_ms, m.disk_utilization, m.disk_info, m.gpu_info
 FROM servers s
 LEFT JOIN latest_metrics m ON m.server_id = s.id
+LEFT JOIN traffic_cycles c ON c.server_id = s.id
 "#;
 
 pub const SECRET_MASK: &str = "********";
@@ -67,6 +67,15 @@ struct AgentConfigRow {
     collect_interval: i64,
     network_interface: String,
     auto_update: i64,
+}
+
+#[derive(Serialize)]
+struct TrafficCounterSample {
+    timestamp: i64,
+    cycle_key: i64,
+    reset_day: i64,
+    raw_rx: i64,
+    raw_tx: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,6 +190,41 @@ fn number(value: impl ToString) -> JsValue {
     JsValue::from_f64(value.to_string().parse::<f64>().unwrap_or(0.0))
 }
 
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn traffic_cycle_key(timestamp: i64, reset_day: i64) -> i64 {
+    let (year, month, day) = civil_date_from_unix_days(timestamp.div_euclid(86_400));
+    let boundary = reset_day.clamp(1, 31).min(days_in_month(year, month));
+    let current_month = year * 12 + month - 1;
+    if day >= boundary {
+        current_month
+    } else {
+        current_month - 1
+    }
+}
+
 pub async fn list_servers(db: &D1Database, include_hidden: bool) -> Result<Vec<ServerView>> {
     let filter = if include_hidden {
         ""
@@ -228,7 +272,7 @@ pub async fn agent_config(db: &D1Database, id: &str) -> Result<Option<AgentConfi
         report_interval: row.report_interval,
         collect_interval: row.collect_interval,
         network_interface: row.network_interface.trim().to_string(),
-        auto_update: row.auto_update,
+        auto_update: row.auto_update != 0,
         latency_tasks: crate::latency::tasks_for_server(db, id).await?,
     }))
 }
@@ -401,7 +445,7 @@ pub async fn list_alert_rules(db: &D1Database) -> Result<Vec<AlertRuleView>> {
             threshold: row.threshold,
             duration_minutes: row.duration_minutes,
             aggregation: row.aggregation,
-            enabled: row.enabled,
+            enabled: row.enabled != 0,
             server_ids: servers.into_iter().map(|row| row.server_id).collect(),
         });
     }
@@ -648,11 +692,11 @@ pub async fn save_reports(db: &D1Database, server_id: &str, reports: &[AgentRepo
               udp_connections, cpu_cores, cpu_model, os, kernel, arch,
               virtualization, gpu_usage, gpu_model, agent_version,
               disk_read_bps, disk_write_bps, disk_read_iops, disk_write_iops,
-              disk_await_ms, disk_utilization, disk_info, gpu_info, message
+              disk_await_ms, disk_utilization, disk_info, gpu_info
             ) VALUES (
               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
               ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
-              ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38
+              ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
             ) ON CONFLICT(server_id) DO UPDATE SET
               timestamp=excluded.timestamp, cpu=excluded.cpu, load1=excluded.load1,
               load5=excluded.load5, load15=excluded.load15, mem_used=excluded.mem_used,
@@ -670,8 +714,7 @@ pub async fn save_reports(db: &D1Database, server_id: &str, reports: &[AgentRepo
               disk_read_iops=excluded.disk_read_iops, disk_write_iops=excluded.disk_write_iops,
               disk_await_ms=excluded.disk_await_ms,
               disk_utilization=excluded.disk_utilization,
-              disk_info=excluded.disk_info, gpu_info=excluded.gpu_info,
-              message=excluded.message
+              disk_info=excluded.disk_info, gpu_info=excluded.gpu_info
             WHERE excluded.timestamp >= latest_metrics.timestamp"#,
         )
         .bind(&report_values(server_id, latest_report, latest_timestamp))?;
@@ -684,10 +727,34 @@ pub async fn save_reports(db: &D1Database, server_id: &str, reports: &[AgentRepo
               tcp_connections, udp_connections, gpu_usage,
               disk_read_bps, disk_write_bps, disk_read_iops, disk_write_iops,
               disk_await_ms, disk_utilization
-            ) VALUES (
-              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-              ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
-            ) ON CONFLICT(server_id, timestamp) DO UPDATE SET
+            ) SELECT
+              ?1, CAST(json_extract(value, '$.timestamp') AS INTEGER),
+              CAST(json_extract(value, '$.cpu') AS REAL),
+              CAST(json_extract(value, '$.load1') AS REAL),
+              CAST(json_extract(value, '$.load5') AS REAL),
+              CAST(json_extract(value, '$.load15') AS REAL),
+              CAST(json_extract(value, '$.mem_used') AS INTEGER),
+              CAST(json_extract(value, '$.mem_total') AS INTEGER),
+              CAST(json_extract(value, '$.swap_used') AS INTEGER),
+              CAST(json_extract(value, '$.swap_total') AS INTEGER),
+              CAST(json_extract(value, '$.disk_used') AS INTEGER),
+              CAST(json_extract(value, '$.disk_total') AS INTEGER),
+              CAST(json_extract(value, '$.net_in') AS REAL),
+              CAST(json_extract(value, '$.net_out') AS REAL),
+              CAST(json_extract(value, '$.net_rx_total') AS INTEGER),
+              CAST(json_extract(value, '$.net_tx_total') AS INTEGER),
+              CAST(json_extract(value, '$.processes') AS INTEGER),
+              CAST(json_extract(value, '$.tcp_connections') AS INTEGER),
+              CAST(json_extract(value, '$.udp_connections') AS INTEGER),
+              CAST(json_extract(value, '$.gpu_usage') AS REAL),
+              CAST(json_extract(value, '$.disk_read_bps') AS REAL),
+              CAST(json_extract(value, '$.disk_write_bps') AS REAL),
+              CAST(json_extract(value, '$.disk_read_iops') AS REAL),
+              CAST(json_extract(value, '$.disk_write_iops') AS REAL),
+              CAST(json_extract(value, '$.disk_await_ms') AS REAL),
+              CAST(json_extract(value, '$.disk_utilization') AS REAL)
+            FROM json_each(?2) WHERE true
+            ON CONFLICT(server_id, timestamp) DO UPDATE SET
               cpu=excluded.cpu, load1=excluded.load1, load5=excluded.load5,
               load15=excluded.load15, mem_used=excluded.mem_used,
               mem_total=excluded.mem_total, swap_used=excluded.swap_used,
@@ -711,16 +778,96 @@ pub async fn save_reports(db: &D1Database, server_id: &str, reports: &[AgentRepo
     for report in reports {
         minute_samples.insert(report.timestamp / 60 * 60, report);
     }
-    let mut statements = Vec::with_capacity(minute_samples.len() + 1);
-    statements.push(latest);
-    for (timestamp, report) in minute_samples {
-        statements.push(
-            history_statement
-                .clone()
-                .bind(&history_values(server_id, report, timestamp))?,
-        );
-    }
-    db.batch(statements).await?;
+    let history_samples = minute_samples
+        .into_iter()
+        .map(|(timestamp, report)| HistoryPoint {
+            timestamp,
+            cpu: report.cpu,
+            load1: report.load1,
+            load5: report.load5,
+            load15: report.load15,
+            mem_used: report.mem_used,
+            mem_total: report.mem_total,
+            swap_used: report.swap_used,
+            swap_total: report.swap_total,
+            disk_used: report.disk_used,
+            disk_total: report.disk_total,
+            net_in: report.net_in,
+            net_out: report.net_out,
+            net_rx_total: report.net_rx_total,
+            net_tx_total: report.net_tx_total,
+            processes: report.processes,
+            tcp_connections: report.tcp_connections,
+            udp_connections: report.udp_connections,
+            gpu_usage: report.gpu_usage,
+            disk_read_bps: report.disk_read_bps,
+            disk_write_bps: report.disk_write_bps,
+            disk_read_iops: report.disk_read_iops,
+            disk_write_iops: report.disk_write_iops,
+            disk_await_ms: report.disk_await_ms,
+            disk_utilization: report.disk_utilization,
+        })
+        .collect::<Vec<_>>();
+    let history_json = serde_json::to_string(&history_samples)?;
+    let history = history_statement.bind(&[text(server_id), text(&history_json)])?;
+    let reset_day = db
+        .prepare("SELECT reset_day FROM servers WHERE id = ?1")
+        .bind(&[text(server_id)])?
+        .first::<i64>(Some("reset_day"))
+        .await?
+        .unwrap_or(1);
+    let mut traffic_samples = reports
+        .iter()
+        .map(|report| TrafficCounterSample {
+            timestamp: report.timestamp,
+            cycle_key: traffic_cycle_key(report.timestamp, reset_day),
+            reset_day,
+            raw_rx: report.net_rx_total,
+            raw_tx: report.net_tx_total,
+        })
+        .collect::<Vec<_>>();
+    traffic_samples.sort_by_key(|sample| sample.timestamp);
+    let traffic_json = serde_json::to_string(&traffic_samples)?;
+    let traffic = db
+        .prepare(
+            r#"INSERT INTO traffic_cycles(
+                 server_id, cycle_key, reset_day, timestamp, raw_rx, raw_tx, used_rx, used_tx
+               ) SELECT
+                 ?1,
+                 CAST(json_extract(value, '$.cycle_key') AS INTEGER),
+                 CAST(json_extract(value, '$.reset_day') AS INTEGER),
+                 CAST(json_extract(value, '$.timestamp') AS INTEGER),
+                 CAST(json_extract(value, '$.raw_rx') AS INTEGER),
+                 CAST(json_extract(value, '$.raw_tx') AS INTEGER),
+                 CAST(json_extract(value, '$.raw_rx') AS INTEGER),
+                 CAST(json_extract(value, '$.raw_tx') AS INTEGER)
+               FROM json_each(?2) WHERE true ORDER BY CAST(json_extract(value, '$.timestamp') AS INTEGER)
+               ON CONFLICT(server_id) DO UPDATE SET
+                 cycle_key=excluded.cycle_key,
+                 reset_day=excluded.reset_day,
+                 timestamp=excluded.timestamp,
+                 raw_rx=excluded.raw_rx,
+                 raw_tx=excluded.raw_tx,
+                 used_rx=CASE
+                   WHEN excluded.cycle_key != traffic_cycles.cycle_key THEN 0
+                   WHEN excluded.reset_day != traffic_cycles.reset_day
+                     THEN 0
+                   WHEN excluded.raw_rx >= traffic_cycles.raw_rx
+                     THEN traffic_cycles.used_rx + excluded.raw_rx - traffic_cycles.raw_rx
+                   ELSE traffic_cycles.used_rx + excluded.raw_rx
+                 END,
+                 used_tx=CASE
+                   WHEN excluded.cycle_key != traffic_cycles.cycle_key THEN 0
+                   WHEN excluded.reset_day != traffic_cycles.reset_day
+                     THEN 0
+                   WHEN excluded.raw_tx >= traffic_cycles.raw_tx
+                     THEN traffic_cycles.used_tx + excluded.raw_tx - traffic_cycles.raw_tx
+                   ELSE traffic_cycles.used_tx + excluded.raw_tx
+                 END
+               WHERE excluded.timestamp > traffic_cycles.timestamp"#,
+        )
+        .bind(&[text(server_id), text(&traffic_json)])?;
+    db.batch(vec![latest, history, traffic]).await?;
     Ok(())
 }
 
@@ -763,38 +910,6 @@ fn report_values(server_id: &str, report: &AgentReport, timestamp: i64) -> Vec<J
         number(report.disk_utilization),
         text(&serde_json::to_string(&report.disks).unwrap_or_else(|_| "[]".to_string())),
         text(&serde_json::to_string(&report.gpus).unwrap_or_else(|_| "[]".to_string())),
-        text(&report.message),
-    ]
-}
-
-fn history_values(server_id: &str, report: &AgentReport, timestamp: i64) -> Vec<JsValue> {
-    vec![
-        text(server_id),
-        number(timestamp),
-        number(report.cpu),
-        number(report.load1),
-        number(report.load5),
-        number(report.load15),
-        number(report.mem_used),
-        number(report.mem_total),
-        number(report.swap_used),
-        number(report.swap_total),
-        number(report.disk_used),
-        number(report.disk_total),
-        number(report.net_in),
-        number(report.net_out),
-        number(report.net_rx_total),
-        number(report.net_tx_total),
-        number(report.processes),
-        number(report.tcp_connections),
-        number(report.udp_connections),
-        number(report.gpu_usage),
-        number(report.disk_read_bps),
-        number(report.disk_write_bps),
-        number(report.disk_read_iops),
-        number(report.disk_write_iops),
-        number(report.disk_await_ms),
-        number(report.disk_utilization),
     ]
 }
 
@@ -1133,8 +1248,7 @@ pub async fn delete_theme(db: &D1Database, id: &str) -> Result<bool> {
 }
 
 pub async fn cleanup_history(db: &D1Database, retention_days: i64) -> Result<()> {
-    let cutoff = now() - retention_days.clamp(1, 365) * 86_400;
-    let recent_cutoff = now() - 7 * 86_400;
+    let (cutoff, recent_cutoff) = history_cutoffs(now(), retention_days);
     let compact = db
         .prepare(
             r#"INSERT INTO metric_history_hourly (
@@ -1178,6 +1292,12 @@ pub async fn cleanup_history(db: &D1Database, retention_days: i64) -> Result<()>
         .await?;
     crate::latency::cleanup_history(db, cutoff).await?;
     Ok(())
+}
+
+fn history_cutoffs(current: i64, retention_days: i64) -> (i64, i64) {
+    let cutoff = current - retention_days.clamp(1, 365) * 86_400;
+    let recent_cutoff = (current - 7 * 86_400).max(cutoff);
+    (cutoff, recent_cutoff)
 }
 
 pub async fn clear_history(db: &D1Database) -> Result<()> {
@@ -1292,6 +1412,19 @@ pub async fn save_setting(db: &D1Database, key: &str, value: &str) -> Result<()>
     Ok(())
 }
 
+pub async fn increment_setting(db: &D1Database, key: &str) -> Result<()> {
+    db.prepare(
+        "INSERT INTO settings(key, value, updated_at) VALUES (?1, '1', ?2) \
+         ON CONFLICT(key) DO UPDATE SET \
+           value = CAST(CAST(settings.value AS INTEGER) + 1 AS TEXT), \
+           updated_at = excluded.updated_at",
+    )
+    .bind(&[text(key), number(now())])?
+    .run()
+    .await?;
+    Ok(())
+}
+
 pub async fn update_expiry(db: &D1Database, id: &str, expires_at: i64) -> Result<()> {
     db.prepare("UPDATE servers SET expires_at = ?2, updated_at = ?3 WHERE id = ?1")
         .bind(&[text(id), number(expires_at), number(now())])?
@@ -1302,7 +1435,10 @@ pub async fn update_expiry(db: &D1Database, id: &str, expires_at: i64) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{alert_window_covered, secret_for_api, AlertMetricRow, SECRET_MASK};
+    use super::{
+        alert_window_covered, history_cutoffs, secret_for_api, traffic_cycle_key, AlertMetricRow,
+        SECRET_MASK,
+    };
 
     fn row(samples: i64, last_timestamp: i64, report_interval: i64) -> AlertMetricRow {
         AlertMetricRow {
@@ -1341,5 +1477,34 @@ mod tests {
     fn masks_stored_secrets_in_api_responses() {
         assert_eq!(secret_for_api(""), "");
         assert_eq!(secret_for_api("stored-secret"), SECRET_MASK);
+    }
+
+    #[test]
+    fn honors_short_and_long_history_retention() {
+        let current = 10_000_000;
+        let (one_day, one_day_recent) = history_cutoffs(current, 1);
+        assert_eq!(one_day, current - 86_400);
+        assert_eq!(one_day_recent, one_day);
+
+        let (thirty_days, thirty_days_recent) = history_cutoffs(current, 30);
+        assert_eq!(thirty_days, current - 30 * 86_400);
+        assert_eq!(thirty_days_recent, current - 7 * 86_400);
+    }
+
+    #[test]
+    fn assigns_monthly_traffic_cycles_with_short_months() {
+        let timestamp = |year: i64, month: i64, day: i64| {
+            let year = year - i64::from(month <= 2);
+            let era = year.div_euclid(400);
+            let year_of_era = year - era * 400;
+            let month_prime = month + if month > 2 { -3 } else { 9 };
+            let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+            let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+            (era * 146_097 + day_of_era - 719_468) * 86_400
+        };
+        assert_eq!(traffic_cycle_key(timestamp(2026, 8, 9), 10), 2026 * 12 + 6);
+        assert_eq!(traffic_cycle_key(timestamp(2026, 8, 10), 10), 2026 * 12 + 7);
+        assert_eq!(traffic_cycle_key(timestamp(2028, 2, 28), 31), 2028 * 12);
+        assert_eq!(traffic_cycle_key(timestamp(2028, 2, 29), 31), 2028 * 12 + 1);
     }
 }

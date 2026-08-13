@@ -56,6 +56,34 @@ pub async fn send(settings: &SettingsView, message: &str) -> Result<()> {
     Ok(())
 }
 
+fn renewed_expiry(expires_at: i64, billing_cycle_days: i64, current_time: i64) -> Option<i64> {
+    let renew_before = i128::from(current_time) + 86_400;
+    let expires_at = i128::from(expires_at);
+    if expires_at > renew_before {
+        return None;
+    }
+    let cycle = i128::from(billing_cycle_days.clamp(1, 3650)) * 86_400;
+    let elapsed = renew_before - expires_at;
+    let cycles = elapsed / cycle + 1;
+    Some((expires_at + cycles * cycle).min(i128::from(i64::MAX)) as i64)
+}
+
+pub async fn renew_servers(db_conn: &D1Database) -> Result<()> {
+    let current_time = worker::Date::now().as_millis() as i64 / 1000;
+    for server in db::list_servers(db_conn, true).await? {
+        if server.auto_renewal == 0 {
+            continue;
+        }
+        let Some(expires_at) = server.expires_at else {
+            continue;
+        };
+        if let Some(next_expiry) = renewed_expiry(expires_at, server.billing_cycle, current_time) {
+            db::update_expiry(db_conn, &server.id, next_expiry).await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Result<()> {
     if !settings.notification_enabled || settings.notification_endpoint.trim().is_empty() {
         return Ok(());
@@ -90,21 +118,8 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
             messages.push(format!("[恢复] {} 已恢复上报", server.name));
         }
 
-        let mut expires_at = server.expires_at;
-        if server.auto_renewal != 0 {
-            if let Some(mut value) = expires_at {
-                let cycle = server.billing_cycle.clamp(1, 3650) * 86_400;
-                if value <= current_time + 86_400 {
-                    while value <= current_time + 86_400 {
-                        value += cycle;
-                    }
-                    db::update_expiry(db_conn, &server_id, value).await?;
-                    expires_at = Some(value);
-                }
-            }
-        }
         if settings.expiry_alert_days > 0 {
-            if let Some(value) = expires_at {
+            if let Some(value) = server.expires_at {
                 let days = (value - current_time + 86_399) / 86_400;
                 if days >= 0 && days <= settings.expiry_alert_days {
                     let key = format!("{server_id}:{value}");
@@ -122,7 +137,7 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
     let mut evaluated_resources = HashSet::new();
     let mut eligible_resources = HashSet::new();
     for rule in db::list_alert_rules(db_conn).await? {
-        if rule.enabled == 0 {
+        if !rule.enabled {
             continue;
         }
         if rule.server_ids.is_empty() {
@@ -194,4 +209,22 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
         db::save_setting(db_conn, "alert_state", &serde_json::to_string(&current)?).await?;
     }
     db::sync_active_alert_states(db_conn, &previous_resources, &current_resources).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renewed_expiry;
+
+    #[test]
+    fn advances_expired_servers_without_looping() {
+        let day = 86_400;
+        assert_eq!(renewed_expiry(80 * day, 30, 100 * day), Some(110 * day));
+        assert_eq!(renewed_expiry(101 * day, 30, 100 * day), Some(131 * day));
+        assert_eq!(renewed_expiry(102 * day, 30, 100 * day), None);
+    }
+
+    #[test]
+    fn saturates_pathological_expiry_values() {
+        assert_eq!(renewed_expiry(i64::MIN, 1, i64::MAX), Some(i64::MAX));
+    }
 }

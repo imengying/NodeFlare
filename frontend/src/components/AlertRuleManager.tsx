@@ -1,7 +1,7 @@
 import { Pencil, Plus, Save, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
-import type { AlertRule, AlertRuleInput, Server } from "../types";
+import type { AdminServer, AlertRule, AlertRuleInput } from "../types";
 import { Checkbox } from "./Checkbox";
 
 const emptyRule: AlertRuleInput = {
@@ -23,7 +23,7 @@ const metricLabels = {
 };
 
 export function AlertRuleManager({ servers, onError, onNotice }: {
-  servers: Server[];
+  servers: AdminServer[];
   onError: (message: string) => void;
   onNotice: (message: string) => void;
 }) {
@@ -48,7 +48,7 @@ export function AlertRuleManager({ servers, onError, onNotice }: {
       threshold: rule.threshold,
       duration_minutes: rule.duration_minutes,
       aggregation: rule.aggregation,
-      enabled: !!rule.enabled,
+      enabled: rule.enabled,
       server_ids: [...rule.server_ids],
     } : { ...emptyRule, server_ids: [] });
     setAllServers(!rule?.server_ids.length);
@@ -95,7 +95,7 @@ export function AlertRuleManager({ servers, onError, onNotice }: {
     <div className="section-head"><div><h3>资源告警规则</h3><span>最多 20 条，可指定服务器和统计窗口</span></div><button type="button" className="primary-btn compact" onClick={() => open()}><Plus size={14} />新建规则</button></div>
     <div className="alert-rule-list">
       {rules.map((rule) => <div className="alert-rule-row" key={rule.id}>
-        <Checkbox checked={!!rule.enabled} onChange={() => void toggle(rule)} ariaLabel={`${rule.name}启用状态`} />
+        <Checkbox checked={rule.enabled} onChange={() => void toggle(rule)} ariaLabel={`${rule.name}启用状态`} />
         <div><strong>{rule.name}</strong><small>{metricLabels[rule.metric]} ≥ {rule.threshold} {rule.metric.startsWith("net_") ? "MiB/s" : "%"} · {rule.duration_minutes} 分钟{rule.aggregation === "continuous" ? "持续" : "平均"} · {rule.server_ids.length ? `${rule.server_ids.length} 台服务器` : "全部服务器"}</small></div>
         <button type="button" className="icon-btn" title="编辑规则" onClick={() => open(rule)}><Pencil size={14} /></button>
         <button type="button" className="icon-btn danger" title="删除规则" onClick={() => void remove(rule)}><Trash2 size={14} /></button>

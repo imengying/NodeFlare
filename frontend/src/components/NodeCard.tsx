@@ -1,5 +1,4 @@
 import {
-  AlertTriangle,
   CalendarDays,
   ChevronDown,
   ChevronUp,
@@ -72,7 +71,7 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
   const usedTraffic = trafficUsed(server);
   const traffic = server.traffic_limit > 0 ? Math.min(100, (usedTraffic / server.traffic_limit) * 100) : 0;
   const quality = useNodeLatency(server, config.show_latency);
-  const locale = config.locale || "zh-CN";
+  const locale = config.locale;
   const price = formatPrice(server, locale);
   const remainingValue = remainingAssetValue(server.price, server.billing_cycle, server.expires_at);
   const showExpiryPanel = config.show_expiry && (server.price !== 0 || server.expires_at !== null);
@@ -82,7 +81,6 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
       <header className="node-header">
         <span className={`status-dot ${online ? "online" : ""}`} />
         <strong title={server.name}>{server.name}</strong>
-        {server.message?.trim() ? <AlertTriangle className="node-alert" size={15}><title>{server.message}</title></AlertTriangle> : null}
         <OSIcon os={server.os} size={16} />
         <Flag region={server.region} size={19} locale={locale} />
       </header>

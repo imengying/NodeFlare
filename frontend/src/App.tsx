@@ -104,7 +104,7 @@ export default function App() {
     document.documentElement.classList.toggle("dark", dark);
     document.documentElement.style.colorScheme = dark ? "dark" : "light";
     document.documentElement.dataset.blur = blur ? "on" : "off";
-    document.documentElement.lang = config.locale || "zh-CN";
+    document.documentElement.lang = config.locale;
   }, [blur, config.locale, dark]);
 
   useEffect(() => {
@@ -137,7 +137,7 @@ export default function App() {
   }, [config.site_name, configReady, selectedId, servers]);
 
   useEffect(() => {
-    if (loading || !config.websocket || !config.public_dashboard || demoMode) return;
+    if (loading || !config.public_dashboard || demoMode) return;
     if (config.turnstile_enabled && !getTurnstileProof()) return;
     const reconnects: number[] = [];
     let cancelled = false;
@@ -161,9 +161,9 @@ export default function App() {
         if (event.data === "pong") return;
         try {
           const message = JSON.parse(event.data);
-          if (message.type !== "metrics") return;
-          setServers((current) => current.map((server) => server.id === message.server_id
-            ? { ...server, ...message.metrics, timestamp: message.timestamp }
+          if (message.type !== "server" || !message.server?.id) return;
+          setServers((current) => current.map((server) => server.id === message.server.id
+            ? message.server
             : server));
         } catch { /* Ignore non-protocol messages. */ }
       };
@@ -177,7 +177,7 @@ export default function App() {
       wsRef.current.forEach((socket) => socket.close());
       wsRef.current = [];
     };
-  }, [config.websocket, config.public_dashboard, config.turnstile_enabled, load, loading, needsVerification, selectedId]);
+  }, [config.public_dashboard, config.turnstile_enabled, load, loading, needsVerification, selectedId]);
 
   const groups = useMemo(() => ["__all__", ...Array.from(new Set(servers.map((server) => server.group_name || "默认")))], [servers]);
   const visible = useMemo(() => servers.filter((server) => {

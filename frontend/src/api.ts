@@ -38,6 +38,7 @@ async function request<T>(path: string, init: RequestInit = {}, admin = false): 
     if (response.status === 401 && admin) setToken("");
     throw new ApiError(payload.error ?? "请求失败", response.status);
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
@@ -47,7 +48,6 @@ export const api = {
   refreshExchangeRates: () => request<ExchangeRates>("/api/admin/exchange-rates/refresh", { method: "POST" }, true),
   servers: () => request<{ servers: Server[] }>("/api/servers"),
   adminServers: () => request<{ servers: AdminServer[] }>("/api/admin/servers", {}, true),
-  server: (id: string) => request<Server>(`/api/servers/${encodeURIComponent(id)}`),
   history: (id: string, hours: number) =>
     request<{ points: HistoryPoint[] }>(`/api/history/${encodeURIComponent(id)}?hours=${hours}`),
   latencyHistory: (id: string, hours: number) =>
@@ -64,26 +64,26 @@ export const api = {
   createLatencyTask: (input: LatencyTaskInput) =>
     request<{ id: string }>("/api/admin/latency-tasks", { method: "POST", body: JSON.stringify(input) }, true),
   updateLatencyTask: (id: string, input: LatencyTaskInput) =>
-    request<{ success: boolean }>(`/api/admin/latency-tasks/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }, true),
+    request<void>(`/api/admin/latency-tasks/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }, true),
   deleteLatencyTask: (id: string) =>
-    request<{ success: boolean }>(`/api/admin/latency-tasks/${encodeURIComponent(id)}`, { method: "DELETE" }, true),
+    request<void>(`/api/admin/latency-tasks/${encodeURIComponent(id)}`, { method: "DELETE" }, true),
   alertRules: () => request<{ rules: AlertRule[] }>("/api/admin/alert-rules", {}, true),
   createAlertRule: (input: AlertRuleInput) =>
     request<{ id: string }>("/api/admin/alert-rules", { method: "POST", body: JSON.stringify(input) }, true),
   updateAlertRule: (id: string, input: AlertRuleInput) =>
-    request<{ success: boolean }>(`/api/admin/alert-rules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }, true),
+    request<void>(`/api/admin/alert-rules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }, true),
   deleteAlertRule: (id: string) =>
-    request<{ success: boolean }>(`/api/admin/alert-rules/${encodeURIComponent(id)}`, { method: "DELETE" }, true),
+    request<void>(`/api/admin/alert-rules/${encodeURIComponent(id)}`, { method: "DELETE" }, true),
   themeSettings: () => request<ThemeSettingsSchema>("/api/admin/theme-settings", {}, true),
   themes: () => request<{ themes: Theme[] }>("/api/admin/themes", {}, true),
   addTheme: (input: Pick<Theme, "name" | "description" | "url">) =>
     request<{ id: string }>("/api/admin/themes", { method: "POST", body: JSON.stringify(input) }, true),
   activateTheme: (id: string) =>
-    request<{ success: boolean }>(`/api/admin/themes/${encodeURIComponent(id)}/activate`, { method: "POST" }, true),
+    request<void>(`/api/admin/themes/${encodeURIComponent(id)}/activate`, { method: "POST" }, true),
   previewTheme: (id: string) =>
     request<{ preview_url: string }>(`/api/admin/themes/${encodeURIComponent(id)}/preview`, { method: "POST" }, true),
   deleteTheme: (id: string) =>
-    request<{ success: boolean }>(`/api/admin/themes/${encodeURIComponent(id)}`, { method: "DELETE" }, true),
+    request<void>(`/api/admin/themes/${encodeURIComponent(id)}`, { method: "DELETE" }, true),
   saveSettings: (input: Partial<Settings>) =>
     request<{ settings: Settings; token: string | null }>("/api/admin/settings", { method: "PATCH", body: JSON.stringify(input) }, true),
   createServer: (input: ServerInput) =>
@@ -93,19 +93,19 @@ export const api = {
       true,
     ),
   updateServer: (id: string, input: ServerInput) =>
-    request<{ success: boolean }>(
+    request<void>(
       `/api/admin/servers/${encodeURIComponent(id)}`,
       { method: "PATCH", body: JSON.stringify(input) },
       true,
     ),
   deleteServer: (id: string) =>
-    request<{ success: boolean }>(
+    request<void>(
       `/api/admin/servers/${encodeURIComponent(id)}`,
       { method: "DELETE" },
       true,
     ),
   deleteServers: (ids: string[]) =>
-    request<{ success: boolean }>("/api/admin/servers", {
+    request<void>("/api/admin/servers", {
       method: "DELETE",
       body: JSON.stringify({ ids }),
     }, true),
@@ -116,13 +116,13 @@ export const api = {
       true,
     ),
   reorderServers: (ids: string[]) =>
-    request<{ success: boolean }>(
+    request<void>(
       "/api/admin/servers/order",
       { method: "PATCH", body: JSON.stringify({ ids }) },
       true,
     ),
   databaseStats: () => request<DatabaseStats>("/api/admin/database", {}, true),
   cloudflareUsage: () => request<CloudflareUsage>("/api/admin/cloudflare-usage", {}, true),
-  clearHistory: () => request<{ success: boolean }>("/api/admin/history", { method: "DELETE" }, true),
-  testNotification: () => request<{ success: boolean }>("/api/admin/notifications/test", { method: "POST" }, true),
+  clearHistory: () => request<void>("/api/admin/history", { method: "DELETE" }, true),
+  testNotification: () => request<void>("/api/admin/notifications/test", { method: "POST" }, true),
 };

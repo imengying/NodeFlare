@@ -84,23 +84,23 @@ function toInput(server: AdminServer): ServerInput {
     group_name: server.group_name,
     tags: server.tags,
     note: server.note,
-    hidden: !!server.hidden,
+    hidden: server.hidden,
     expires_at: server.expires_at,
     traffic_limit: server.traffic_limit,
-    traffic_limit_type: server.traffic_limit_type || "sum",
+    traffic_limit_type: server.traffic_limit_type,
     price: server.price,
     billing_cycle: server.billing_cycle,
     currency: server.currency,
-    auto_renewal: !!server.auto_renewal,
+    auto_renewal: server.auto_renewal,
     public_remark: server.public_remark,
-    network_interface: server.network_interface || "",
-    reset_day: server.reset_day || 1,
-    report_interval: server.report_interval || 60,
-    collect_interval: server.collect_interval || 5,
-    rx_correction: server.rx_correction || 0,
-    tx_correction: server.tx_correction || 0,
-    offline_notify_disabled: !!server.offline_notify_disabled,
-    auto_update: !!server.auto_update,
+    network_interface: server.network_interface,
+    reset_day: server.reset_day,
+    report_interval: server.report_interval,
+    collect_interval: server.collect_interval,
+    rx_correction: server.rx_correction,
+    tx_correction: server.tx_correction,
+    offline_notify_disabled: server.offline_notify_disabled,
+    auto_update: server.auto_update,
   };
 }
 
@@ -167,15 +167,7 @@ export function AdminPanel({
       const [serverResult, settingsResult, themesResult] = await Promise.all([api.adminServers(), api.settings(), api.themes()]);
       setServers(serverResult.servers);
       setThemes(themesResult.themes);
-      setSettings({
-        ...settingsResult,
-        site_announcement: settingsResult.site_announcement || "",
-        theme_options: settingsResult.theme_options || {},
-        cloudflare_account_id: settingsResult.cloudflare_account_id || "",
-        cloudflare_api_token: settingsResult.cloudflare_api_token || "",
-        favicon_url: settingsResult.favicon_url || "",
-        locale: settingsResult.locale || "zh-CN",
-      });
+      setSettings(settingsResult);
       setAuthenticated(true);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "加载失败");
@@ -533,7 +525,7 @@ export function AdminPanel({
               ) : tab === "themes" && settings ? (
                 <div className="theme-store-page">
                   <section className="admin-section">
-                    <div className="section-head"><div><h3>主题列表</h3><span>内置主题始终可用，远程主题由 Worker 代理前台页面和资源。</span></div></div>
+                    <div className="section-head"><div><h3>主题列表</h3><span>内置主题始终可用，远程主题由 Worker 代理前台页面和资源；可选的 theme.json 提供主题设置。</span></div></div>
                     <div className="theme-store-grid">
                       {themes.map((theme) => <article className={`theme-store-card ${theme.active ? "active" : ""}`} key={theme.id}>
                         <div className="theme-card-icon"><Palette size={20} /></div>
@@ -632,7 +624,7 @@ export function AdminPanel({
         <div className="form-grid three"><label><span>流量限额（GB）</span><input min="0" type="number" value={Math.round(form.traffic_limit / 1024 ** 3)} onChange={(event) => updateForm("traffic_limit", Number(event.target.value) * 1024 ** 3)} /></label><label><span>流量口径</span><select value={form.traffic_limit_type} onChange={(event) => updateForm("traffic_limit_type", event.target.value as ServerInput["traffic_limit_type"])}><option value="sum">上下行合计</option><option value="max">取较大值</option><option value="min">取较小值</option><option value="up">仅上行</option><option value="down">仅下行</option></select></label><label><span>流量重置日</span><input min="1" max="31" type="number" value={form.reset_day} onChange={(event) => updateForm("reset_day", Number(event.target.value))} /></label></div>
         <div className="form-grid three"><label><span>价格（0 隐藏，-1 免费）</span><input min="-1" step="0.01" type="number" value={form.price} onChange={(event) => updateForm("price", Number(event.target.value))} /></label><label><span>币种</span><select value={form.currency} onChange={(event) => updateForm("currency", event.target.value)}>{ASSET_CURRENCIES.map((code) => <option key={code}>{code}</option>)}</select></label><label><span>计费周期（天）</span><input min="1" max="3650" type="number" value={form.billing_cycle} onChange={(event) => updateForm("billing_cycle", Number(event.target.value))} /></label></div>
         <div className="form-grid three"><label><span>到期日期</span><input type="date" value={formatDate(form.expires_at)} onChange={(event) => updateForm("expires_at", event.target.value ? Math.floor(new Date(`${event.target.value}T00:00:00Z`).getTime() / 1000) : null)} /></label><label><span>Agent 上报间隔（秒）</span><input min="15" max="3600" type="number" value={form.report_interval} onChange={(event) => updateForm("report_interval", Number(event.target.value))} /></label><label><span>指标采样间隔（秒）</span><input min="2" max="60" type="number" value={form.collect_interval} onChange={(event) => updateForm("collect_interval", Number(event.target.value))} /></label></div>
-        <div className="form-grid"><label><span>统计网卡（逗号分隔，留空自动）</span><input value={form.network_interface} onChange={(event) => updateForm("network_interface", event.target.value)} placeholder="eth0,ens3" /></label><label><span>下行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.rx_correction / 1024 ** 3} onChange={(event) => updateForm("rx_correction", Number(event.target.value) * 1024 ** 3)} /></label><label><span>上行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.tx_correction / 1024 ** 3} onChange={(event) => updateForm("tx_correction", Number(event.target.value) * 1024 ** 3)} /></label></div>
+        <div className="form-grid"><label><span>统计网卡（逗号分隔，留空自动）</span><input value={form.network_interface} onChange={(event) => updateForm("network_interface", event.target.value)} placeholder="eth0,ens3" /></label><label><span>下行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.rx_correction / 1024 ** 3} onChange={(event) => updateForm("rx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label><label><span>上行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.tx_correction / 1024 ** 3} onChange={(event) => updateForm("tx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label></div>
         <label><span>公开备注</span><textarea rows={2} value={form.public_remark} onChange={(event) => updateForm("public_remark", event.target.value)} /></label><label><span>管理备注</span><textarea rows={2} value={form.note} onChange={(event) => updateForm("note", event.target.value)} /></label>
         <div className="settings-toggles editor-toggles"><Toggle label="自动续费" checked={form.auto_renewal} onChange={(value) => updateForm("auto_renewal", value)} /><Toggle label="Agent 自动更新" checked={form.auto_update} onChange={(value) => updateForm("auto_update", value)} /><Toggle label="隐藏节点" checked={form.hidden} onChange={(value) => updateForm("hidden", value)} /><Toggle label="关闭离线告警" checked={form.offline_notify_disabled} onChange={(value) => updateForm("offline_notify_disabled", value)} /></div>
         <div className="form-actions"><button type="button" className="secondary-btn" onClick={() => setEditing(null)}>取消</button><button className="primary-btn" disabled={busy}><Save size={16} />保存节点</button></div>

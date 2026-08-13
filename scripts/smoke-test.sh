@@ -53,6 +53,12 @@ login_json=$(request -H 'Content-Type: application/json' \
   "$MONITOR_BASE_URL/api/admin/login")
 admin_token=$(printf '%s' "$login_json" | jq -er '.token')
 
+# Login protection defaults to enabled, but without a complete Turnstile pair it
+# remains inactive so the first admin settings save must still work.
+request -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' -X PATCH \
+  --data '{"site_description":"Smoke settings"}' \
+  "$MONITOR_BASE_URL/api/admin/settings" | jq -e '.settings.site_description == "Smoke settings"' >/dev/null
+
 request -H "Authorization: Bearer $admin_token" \
   "$MONITOR_BASE_URL/api/exchange-rates" | \
   jq -e '.base == "CNY" and .rates.CNY == 1 and .rates.USD > 0 and .rates.CAD > 0 and (has("cny") | not)' >/dev/null
@@ -106,20 +112,29 @@ sample=$(jq -nc --arg agent_version "$agent_version" '{
   disk_read_iops:120,disk_write_iops:48,disk_await_ms:1.4,disk_utilization:8.2,
   disks:[{name:"/dev/vda1",mount_point:"/",used:21474836480,total:53687091200,read_bps:4194304,write_bps:2097152,read_iops:120,write_iops:48,await_ms:1.4,utilization:8.2}],
   gpus:[{model:"NVIDIA T4",usage:32.5,memory_used:1073741824,memory_total:17179869184}],
-  agent_version:$agent_version,message:"smoke",latency_results:[]
+  agent_version:$agent_version,latency_results:[]
 }')
 report=$(jq -nc --arg server_id "$server_id" --argjson sample "$sample" '{server_id:$server_id,samples:[$sample]}')
 report_response=$(request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
   --data "$report" "$MONITOR_BASE_URL/api/agent/report")
 printf '%s' "$report_response" | jq -e \
   --arg task_id "$latency_task_id" \
-  '.success == true and .config.collect_interval == 5 and .config.auto_update == 1 and (.config.latency_tasks | any(.id == $task_id and .task_type == "tcp" and .target == "example.com:443"))' >/dev/null
+  '.collect_interval == 5 and .auto_update == true and (.latency_tasks | any(.id == $task_id and .task_type == "tcp" and .target == "example.com:443"))' >/dev/null
 
 latency_report=$(printf '%s' "$report" | jq --arg task_id "$latency_task_id" '.samples[0].timestamp=(now|floor) | .samples[0].latency_results=[{task_id:$task_id,timestamp:(now|floor),latency_ms:28.4,packet_loss:25}]')
 request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
-  --data "$latency_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.success == true' >/dev/null
+  --data "$latency_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.collect_interval == 5' >/dev/null
 
-request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/servers/$server_id" | jq -e --arg task_id "$latency_task_id" '.cpu == 18.5 and .gpu_usage == 32.5 and .disk_await_ms == 1.4 and (.gpus | length) == 1 and (.disks | length) == 1 and .disk_used == 21474836480 and .traffic_limit == 107374182400 and .price == 9.9 and (has("note") | not) and .public_remark == "public" and (.latency | any(.task_id == $task_id and .latency_ms == 28.4 and .packet_loss == 25))' >/dev/null
+# Traffic counters may reset when a host reboots. Cycle usage must retain the
+# bytes already observed before the reset and continue from the new counter.
+traffic_report=$(printf '%s' "$report" | jq '.samples[0].timestamp += 2 | .samples[0].net_rx_total=2147483648 | .samples[0].net_tx_total=1073741824')
+request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
+  --data "$traffic_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.collect_interval == 5' >/dev/null
+reset_report=$(printf '%s' "$report" | jq '.samples[0].timestamp += 3 | .samples[0].net_rx_total=268435456 | .samples[0].net_tx_total=134217728')
+request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
+  --data "$reset_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.collect_interval == 5' >/dev/null
+
+request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/servers" | jq -e --arg id "$server_id" --arg task_id "$latency_task_id" '.servers | any(.id == $id and .cpu == 18.5 and .gpu_usage == 32.5 and .disk_await_ms == 1.4 and (.gpus | length) == 1 and (.disks | length) == 1 and .disk_used == 21474836480 and .traffic_limit == 107374182400 and .net_rx_total == 2415919104 and .net_tx_total == 1207959552 and .price == 9.9 and (has("note") | not) and .public_remark == "public" and (.latency | any(.task_id == $task_id and .latency_ms == 28.4 and .packet_loss == 25)))' >/dev/null
 request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/history/$server_id?hours=1" | jq -e '.points | length >= 1 and any(.gpu_usage == 32.5)' >/dev/null
 history_cache_header=$(monitor_curl --silent --dump-header - --output /dev/null \
   -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/history/$server_id?hours=1" | \
@@ -131,17 +146,18 @@ request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/latency/$
 # assignment. The stale result must not block delivery of the new task list.
 request -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' -X PATCH \
   --data '{"name":"Smoke TCP","task_type":"tcp","target":"example.com:443","interval_seconds":60,"default_enabled":true,"server_ids":[]}' \
-  "$MONITOR_BASE_URL/api/admin/latency-tasks/$latency_task_id" | jq -e '.success == true' >/dev/null
+  "$MONITOR_BASE_URL/api/admin/latency-tasks/$latency_task_id" >/dev/null
+request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/latency/$server_id?hours=1" | jq -e --arg task_id "$latency_task_id" '(.tasks | all(.id != $task_id)) and (.points | all(.task_id != $task_id))' >/dev/null
 stale_latency_response=$(request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
   --data "$latency_report" "$MONITOR_BASE_URL/api/agent/report")
 printf '%s' "$stale_latency_response" | jq -e --arg task_id "$latency_task_id" \
-  '.success == true and (.config.latency_tasks | all(.id != $task_id))' >/dev/null
+  '.latency_tasks | all(.id != $task_id)' >/dev/null
 
 alert_rule_json=$(request -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' \
   --data "$(jq -nc --arg server_id "$server_id" '{name:"Smoke CPU",metric:"cpu",threshold:80,duration_minutes:5,aggregation:"average",enabled:true,server_ids:[$server_id]}')" \
   "$MONITOR_BASE_URL/api/admin/alert-rules")
 alert_rule_id=$(printf '%s' "$alert_rule_json" | jq -er '.id')
-request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/admin/alert-rules" | jq -e --arg id "$alert_rule_id" --arg server_id "$server_id" '.rules | any(.id == $id and .metric == "cpu" and (.server_ids | index($server_id)))' >/dev/null
+request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/admin/alert-rules" | jq -e --arg id "$alert_rule_id" --arg server_id "$server_id" '.rules | any(.id == $id and .metric == "cpu" and .enabled == true and (.server_ids | index($server_id)))' >/dev/null
 rotated_json=$(request -H "Authorization: Bearer $admin_token" -X POST \
   "$MONITOR_BASE_URL/api/admin/servers/$server_id/token")
 rotated_token=$(printf '%s' "$rotated_json" | jq -er '.agent_token')
@@ -151,18 +167,16 @@ revoked_token_status=$(monitor_curl --silent --output /dev/null --write-out '%{h
   --data "$report" "$MONITOR_BASE_URL/api/agent/report")
 [ "$revoked_token_status" = "401" ]
 request -H "Authorization: Bearer $rotated_token" -H 'Content-Type: application/json' \
-  --data "$latency_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.success == true' >/dev/null
+  --data "$latency_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.collect_interval == 5' >/dev/null
 
 request -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' -X PATCH \
   --data "$(printf '%s' "$server_input" | jq '.hidden=true')" \
-  "$MONITOR_BASE_URL/api/admin/servers/$server_id" | jq -e '.success == true' >/dev/null
-hidden_detail_status=$(monitor_curl --silent --output /dev/null --write-out '%{http_code}' \
-  -H "Authorization: Bearer $admin_token" \
-  "$MONITOR_BASE_URL/api/servers/$server_id")
+  "$MONITOR_BASE_URL/api/admin/servers/$server_id" >/dev/null
+request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/servers" | \
+  jq -e --arg id "$server_id" '.servers | all(.id != $id)' >/dev/null
 hidden_history_status=$(monitor_curl --silent --output /dev/null --write-out '%{http_code}' \
   -H "Authorization: Bearer $admin_token" \
   "$MONITOR_BASE_URL/api/history/$server_id?hours=1")
-[ "$hidden_detail_status" = "404" ]
 [ "$hidden_history_status" = "404" ]
 
 echo "Smoke test passed"

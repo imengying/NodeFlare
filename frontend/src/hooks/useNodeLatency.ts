@@ -61,13 +61,13 @@ function tasksFromSamples(points: LatencySample[]): LatencyTestPoint[] {
 }
 
 export function useNodeLatency(server: Server, enabled: boolean) {
-  const initial = server.latency ?? [];
+  const initial = server.latency;
   const [tasks, setTasks] = useState<LatencyTestPoint[]>(() => tasksFromSamples(initial));
   const [points, setPoints] = useState<LatencySample[]>(initial);
   const [loading, setLoading] = useState(enabled);
 
   useEffect(() => {
-    if (!server.latency?.length) return;
+    if (!server.latency.length) return;
     setTasks(tasksFromSamples(server.latency));
     setPoints(server.latency);
   }, [server.latency]);

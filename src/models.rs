@@ -1,4 +1,11 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
+
+fn serialize_sqlite_bool<S>(value: &i64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_bool(*value != 0)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,7 +168,7 @@ pub struct AgentDiskMetric {
 #[serde(deny_unknown_fields)]
 pub struct AgentGpuMetric {
     pub model: String,
-    pub usage: f64,
+    pub usage: Option<f64>,
     pub memory_used: i64,
     pub memory_total: i64,
 }
@@ -212,7 +219,6 @@ pub struct AgentReport {
     pub disk_utilization: f64,
     pub disks: Vec<AgentDiskMetric>,
     pub gpus: Vec<AgentGpuMetric>,
-    pub message: String,
     pub latency_results: Vec<AgentLatencyResult>,
 }
 
@@ -224,6 +230,7 @@ pub struct ServerView {
     pub group_name: String,
     pub tags: String,
     pub note: String,
+    #[serde(serialize_with = "serialize_sqlite_bool")]
     pub hidden: i64,
     pub expires_at: Option<i64>,
     pub traffic_limit: i64,
@@ -231,6 +238,7 @@ pub struct ServerView {
     pub price: f64,
     pub billing_cycle: i64,
     pub currency: String,
+    #[serde(serialize_with = "serialize_sqlite_bool")]
     pub auto_renewal: i64,
     pub public_remark: String,
     pub network_interface: String,
@@ -239,7 +247,9 @@ pub struct ServerView {
     pub collect_interval: i64,
     pub rx_correction: i64,
     pub tx_correction: i64,
+    #[serde(serialize_with = "serialize_sqlite_bool")]
     pub offline_notify_disabled: i64,
+    #[serde(serialize_with = "serialize_sqlite_bool")]
     pub auto_update: i64,
     #[serde(skip_serializing)]
     pub created_at: i64,
@@ -281,7 +291,6 @@ pub struct ServerView {
     pub disk_info: Option<String>,
     #[serde(skip_serializing)]
     pub gpu_info: Option<String>,
-    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -324,7 +333,7 @@ pub struct AgentConfigView {
     pub report_interval: i64,
     pub collect_interval: i64,
     pub network_interface: String,
-    pub auto_update: i64,
+    pub auto_update: bool,
     pub latency_tasks: Vec<AgentLatencyTask>,
 }
 
@@ -348,7 +357,7 @@ pub struct AlertRuleView {
     pub threshold: f64,
     pub duration_minutes: i64,
     pub aggregation: String,
-    pub enabled: i64,
+    pub enabled: bool,
     pub server_ids: Vec<String>,
 }
 
