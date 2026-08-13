@@ -25,8 +25,8 @@
 
 | 变量 | 必填/可选 | 说明 |
 | --- | ---: | --- |
-| `ADMIN_USERNAME` | 必填 | 管理员登录用户名，不提供默认值 |
-| `ADMIN_PASSWORD` | 首次部署必填 | 初始管理员密码，勾选“加密”；后台保存密码哈希后可删除该变量 |
+| `ADMIN_USERNAME` | 必填 | 管理员登录用户名 |
+| `ADMIN_PASSWORD` | 必填 | 初始管理员密码，勾选“加密”；后台保存密码哈希后可删除该变量 |
 | `SITE_NAME` | 可选 | 站点名称，未设置时使用 `NodeFlare` |
 | `TURNSTILE_SITE_KEY` | 可选 | Turnstile Site Key，无需加密；也可在后台设置 |
 | `TURNSTILE_SECRET_KEY` | 可选 | Turnstile Secret Key，勾选“加密”；也可在后台设置 |
