@@ -29,7 +29,6 @@ pub struct ServerInput {
     pub region: String,
     pub group_name: String,
     pub tags: String,
-    pub note: String,
     pub hidden: bool,
     pub expires_at: Option<i64>,
     pub traffic_limit: i64,
@@ -38,7 +37,6 @@ pub struct ServerInput {
     pub billing_cycle: i64,
     pub currency: String,
     pub auto_renewal: bool,
-    pub public_remark: String,
     pub network_interface: String,
     pub reset_day: i64,
     pub report_interval: i64,
@@ -126,6 +124,7 @@ pub struct LatencyTaskInput {
     pub name: String,
     pub task_type: String,
     pub target: String,
+    pub port: Option<i64>,
     pub interval_seconds: i64,
     pub default_enabled: bool,
     pub server_ids: Vec<String>,
@@ -137,6 +136,7 @@ pub struct AgentLatencyTask {
     pub name: String,
     pub task_type: String,
     pub target: String,
+    pub port: Option<i64>,
     pub interval_seconds: i64,
 }
 
@@ -176,7 +176,6 @@ pub struct AgentGpuMetric {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentReportBatch {
-    pub server_id: String,
     pub samples: Vec<AgentReport>,
 }
 
@@ -229,7 +228,6 @@ pub struct ServerView {
     pub region: String,
     pub group_name: String,
     pub tags: String,
-    pub note: String,
     #[serde(serialize_with = "serialize_sqlite_bool")]
     pub hidden: i64,
     pub expires_at: Option<i64>,
@@ -240,7 +238,7 @@ pub struct ServerView {
     pub currency: String,
     #[serde(serialize_with = "serialize_sqlite_bool")]
     pub auto_renewal: i64,
-    pub public_remark: String,
+    pub last_ip: String,
     pub network_interface: String,
     pub reset_day: i64,
     pub report_interval: i64,
@@ -323,8 +321,8 @@ pub struct HistoryPoint {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TokenHashRow {
-    pub token_hash: String,
+pub struct AgentIdentityRow {
+    pub id: String,
     pub hidden: i64,
 }
 

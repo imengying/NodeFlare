@@ -8,7 +8,7 @@ SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 OPENRC_FILE="/etc/init.d/$SERVICE_NAME"
 
 usage() {
-  echo "Usage: agent.sh -e ENDPOINT -t TOKEN -s SERVER_ID [-i 60]"
+  echo "Usage: agent.sh -e ENDPOINT -t TOKEN [-i 60]"
   echo "       agent.sh --uninstall"
   echo "       agent.sh --status"
 }
@@ -66,7 +66,6 @@ install_agent() {
   [ "$(id -u)" -eq 0 ] || { echo "Run install as root" >&2; exit 1; }
   ensure_curl
   command -v sha256sum >/dev/null || { echo "sha256sum is required" >&2; exit 1; }
-  server_id=""
   token=""
   endpoint=""
   interval=60
@@ -74,7 +73,7 @@ install_agent() {
   while [ "$#" -gt 0 ]; do
     option="$1"
     case "$option" in
-      -s|-t|-e|-i)
+      -t|-e|-i)
         [ "$#" -ge 2 ] || { echo "Missing value for $option" >&2; usage; exit 1; }
         value="$2"
         shift 2
@@ -82,16 +81,15 @@ install_agent() {
       *) echo "Unknown argument: $option" >&2; usage; exit 1 ;;
     esac
     case "$option" in
-      -s) [ -z "$server_id" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; server_id="$value" ;;
       -t) [ -z "$token" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; token="$value" ;;
       -e) [ -z "$endpoint" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; endpoint="$value" ;;
       -i) [ "$interval_set" = false ] || { echo "Duplicate argument: $option" >&2; exit 1; }; interval="$value"; interval_set=true ;;
     esac
   done
-  [ -n "$server_id" ] && [ -n "$token" ] && [ -n "$endpoint" ] || { usage; exit 1; }
+  [ -n "$token" ] && [ -n "$endpoint" ] || { usage; exit 1; }
   endpoint=${endpoint%/}
-  [ ${#server_id} -le 160 ] && [ ${#token} -le 512 ] && [ ${#endpoint} -le 2048 ] || { echo "Install argument is too long" >&2; exit 1; }
-  safe_value "$server_id" && safe_value "$token" && safe_value "$endpoint" || { echo "Invalid install argument" >&2; exit 1; }
+  [ ${#token} -le 512 ] && [ ${#endpoint} -le 2048 ] || { echo "Install argument is too long" >&2; exit 1; }
+  safe_value "$token" && safe_value "$endpoint" || { echo "Invalid install argument" >&2; exit 1; }
   case "$endpoint" in
     https://?*|http://localhost|http://localhost/*|http://localhost:*|http://127.0.0.1|http://127.0.0.1/*|http://127.0.0.1:*) ;;
     *) echo "Worker URL must use HTTPS; HTTP is only allowed for loopback development" >&2; exit 1 ;;
@@ -171,7 +169,7 @@ install_agent() {
     '' \
     '[Service]' \
     'Type=simple' \
-    "ExecStart=$AGENT_FILE -e $endpoint -t $token -s $server_id -i $interval" \
+    "ExecStart=$AGENT_FILE -e $endpoint -t $token -i $interval" \
     'Restart=always' \
     'RestartSec=10' \
     'NoNewPrivileges=true' \
@@ -194,7 +192,7 @@ install_agent() {
       '#!/sbin/openrc-run' \
       "name=\"$SERVICE_NAME\"" \
       "command=\"$AGENT_FILE\"" \
-      "command_args=\"-e $endpoint -t $token -s $server_id -i $interval\"" \
+      "command_args=\"-e $endpoint -t $token -i $interval\"" \
       "command_user=\"root\"" \
       "supervisor=\"supervise-daemon\"" \
       "respawn_delay=10" \

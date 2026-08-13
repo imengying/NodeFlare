@@ -11,6 +11,23 @@ cleanup() {
 
 trap cleanup EXIT HUP INT TERM
 
+validate_admin_username() {
+  if [ -z "${ADMIN_USERNAME:-}" ]; then
+    echo "ADMIN_USERNAME is required" >&2
+    exit 1
+  fi
+  if [ "${#ADMIN_USERNAME}" -gt 64 ]; then
+    echo "ADMIN_USERNAME must not exceed 64 characters" >&2
+    exit 1
+  fi
+  case "$ADMIN_USERNAME" in
+    *[[:space:]]*)
+      echo "ADMIN_USERNAME must not contain whitespace" >&2
+      exit 1
+      ;;
+  esac
+}
+
 frontend_ready() {
   build_key=$(sh scripts/build-key.sh frontend 2>/dev/null || true)
   built_build_key=$(sed -n '1p' frontend/dist/.nodeflare-revision 2>/dev/null || true)
@@ -49,7 +66,7 @@ prepare_runtime_secrets() {
 
 deploy_worker() {
   set -- bunx wrangler deploy
-  [ -z "${ADMIN_USERNAME:-}" ] || set -- "$@" --var "ADMIN_USERNAME:${ADMIN_USERNAME}"
+  set -- "$@" --var "ADMIN_USERNAME:${ADMIN_USERNAME}"
   [ -z "${SITE_NAME:-}" ] || set -- "$@" --var "SITE_NAME:${SITE_NAME}"
   [ -z "${TURNSTILE_SITE_KEY:-}" ] || set -- "$@" --var "TURNSTILE_SITE_KEY:${TURNSTILE_SITE_KEY}"
   [ -z "${OFFLINE_THRESHOLD_SECONDS:-}" ] || set -- "$@" --var "OFFLINE_THRESHOLD_SECONDS:${OFFLINE_THRESHOLD_SECONDS}"
@@ -62,6 +79,8 @@ deploy_worker() {
     NODEFLARE_ADMIN_READY=1 "$@"
   fi
 }
+
+validate_admin_username
 
 if ! frontend_ready; then
   bun run build:frontend

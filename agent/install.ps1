@@ -1,6 +1,5 @@
 [CmdletBinding(DefaultParameterSetName = "Install")]
 param(
-  [Parameter(ParameterSetName = "Install", Mandatory = $true)][Alias("s")][string]$ServerId,
   [Parameter(ParameterSetName = "Install", Mandatory = $true)][Alias("t")][string]$Token,
   [Parameter(ParameterSetName = "Install", Mandatory = $true)][Alias("e")][string]$Endpoint,
   [Parameter(ParameterSetName = "Install")][Alias("i")][ValidateRange(15, 3600)][int]$Interval = 60,
@@ -65,12 +64,10 @@ $NativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW
 if ($NativeArchitecture -ne "AMD64") {
   throw "Only Windows x86_64 is supported"
 }
-Assert-Safe "ServerId" $ServerId
 Assert-Safe "Token" $Token
 Assert-Endpoint $Endpoint
-$ServerIdLength = $ServerId.Length
 $TokenLength = $Token.Length
-if ($ServerIdLength -gt 160 -or $TokenLength -gt 512) {
+if ($TokenLength -gt 512) {
   throw "Install argument is too long"
 }
 $Endpoint = $Endpoint.TrimEnd('/')
@@ -112,7 +109,7 @@ try {
   Remove-Item -LiteralPath $Temporary -Force -ErrorAction SilentlyContinue
 }
 
-$TaskArguments = "-e $Endpoint -t $Token -s $ServerId -i $Interval"
+$TaskArguments = "-e $Endpoint -t $Token -i $Interval"
 $TaskAction = New-ScheduledTaskAction -Execute $AgentFile -Argument $TaskArguments
 $Trigger = New-ScheduledTaskTrigger -AtStartup
 $Settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 3650)

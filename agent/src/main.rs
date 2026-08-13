@@ -46,7 +46,6 @@ type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone)]
 struct RuntimeConfig {
-    server_id: String,
     token: String,
     endpoint: String,
     report_interval: u64,
@@ -65,9 +64,6 @@ struct CliOptions {
     /// Agent token
     #[arg(short = 't', value_name = "TOKEN")]
     token: String,
-    /// Server ID
-    #[arg(short = 's', value_name = "ID")]
-    server_id: String,
     /// Initial report interval in seconds (15-3600)
     #[arg(short = 'i', value_name = "SECONDS", default_value_t = 60)]
     interval: u64,
@@ -86,6 +82,7 @@ struct LatencyTask {
     name: String,
     task_type: String,
     target: String,
+    port: Option<i64>,
     interval_seconds: u64,
 }
 
@@ -194,7 +191,6 @@ struct SubmitResult {
 
 #[derive(Debug, Serialize)]
 struct ReportBatch<'a> {
-    server_id: &'a str,
     samples: &'a [Report],
 }
 
@@ -561,7 +557,7 @@ fn resolve_public_probe_address(host: &str, port: u16) -> Option<SocketAddr> {
         .copied()
 }
 
-fn parse_probe_target(value: &str) -> Option<(String, u16)> {
+fn parse_probe_target(value: &str, port: Option<u16>) -> Option<(String, u16)> {
     let raw = value.trim();
     if raw.is_empty()
         || raw.len() > 60
@@ -569,14 +565,12 @@ fn parse_probe_target(value: &str) -> Option<(String, u16)> {
         || raw
             .chars()
             .any(|character| character.is_whitespace() || "/@?#\\[]".contains(character))
-        || raw.matches(':').count() > 1
+        || raw.contains(':')
     {
         return None;
     }
-    let (host, port) = raw.split_once(':').map_or((raw, 443), |(host, port)| {
-        (host, port.parse::<u16>().unwrap_or(0))
-    });
-    (port > 0 && valid_probe_host(host)).then(|| (host.to_ascii_lowercase(), port))
+    let port = port.unwrap_or(443);
+    (port > 0 && valid_probe_host(raw)).then(|| (raw.to_ascii_lowercase(), port))
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -589,11 +583,14 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
-fn tcp_latency_probe(target: &str) -> (f64, f64) {
+fn tcp_latency_probe(target: &str, port: Option<i64>) -> (f64, f64) {
     if target.trim().is_empty() {
         return (-1.0, -1.0);
     }
-    let Some((host, port)) = parse_probe_target(target) else {
+    let Some(port) = port.and_then(|value| u16::try_from(value).ok()) else {
+        return (-1.0, 100.0);
+    };
+    let Some((host, port)) = parse_probe_target(target, Some(port)) else {
         return (-1.0, 100.0);
     };
     let Some(address) = resolve_public_probe_address(&host, port) else {
@@ -635,10 +632,7 @@ fn ping_latency(output: &str) -> Option<f64> {
 
 fn icmp_latency_probe(target: &str) -> (f64, f64) {
     let host = target.trim();
-    if host.contains(':') {
-        return (-1.0, 100.0);
-    }
-    let Some((host, _)) = parse_probe_target(host) else {
+    let Some((host, _)) = parse_probe_target(host, None) else {
         return (-1.0, 100.0);
     };
     let Some(address) = resolve_public_probe_address(&host, 443) else {
@@ -683,7 +677,7 @@ fn unix_timestamp() -> i64 {
 
 fn execute_latency_task(task: LatencyTask) -> LatencyResult {
     let (latency_ms, packet_loss) = match task.task_type.as_str() {
-        "tcp" => tcp_latency_probe(&task.target),
+        "tcp" => tcp_latency_probe(&task.target, task.port),
         "icmp" => icmp_latency_probe(&task.target),
         _ => (-1.0, 100.0),
     };
@@ -1121,17 +1115,10 @@ fn runtime_config(options: &CliOptions) -> Result<RuntimeConfig> {
     if !(15..=3600).contains(&interval) {
         return Err("interval must be between 15 and 3600 seconds".into());
     }
-    let server_id = options.server_id.clone();
     let token = options.token.clone();
     let endpoint = options.endpoint.clone();
-    if server_id.is_empty()
-        || token.is_empty()
-        || server_id.len() > 160
-        || token.len() > 512
-        || server_id.chars().any(char::is_whitespace)
-        || token.chars().any(char::is_whitespace)
-    {
-        return Err("server ID or token is invalid".into());
+    if token.is_empty() || token.len() > 512 || token.chars().any(char::is_whitespace) {
+        return Err("token is invalid".into());
     }
     if !valid_endpoint(&endpoint) {
         return Err(
@@ -1139,7 +1126,6 @@ fn runtime_config(options: &CliOptions) -> Result<RuntimeConfig> {
         );
     }
     Ok(RuntimeConfig {
-        server_id,
         token,
         endpoint: endpoint.trim_end_matches('/').to_string(),
         report_interval: interval,
@@ -1156,10 +1142,7 @@ fn submit(
     reports: &[Report],
     config_hash: &str,
 ) -> Result<SubmitResult> {
-    let batch = ReportBatch {
-        server_id: &config.server_id,
-        samples: reports,
-    };
+    let batch = ReportBatch { samples: reports };
     let mut response = agent
         .post(&format!("{}/api/agent/report", config.endpoint))
         .header("Authorization", format!("Bearer {}", config.token))
@@ -1210,9 +1193,10 @@ fn sanitize_latency_tasks(tasks: &[LatencyTask]) -> Vec<LatencyTask> {
                 && (1..=80).contains(&task.name.trim().chars().count())
                 && (30..=3600).contains(&task.interval_seconds)
                 && matches!(task.task_type.as_str(), "tcp" | "icmp")
-                && parse_probe_target(&task.target).is_some_and(|(_, port)| {
-                    task.task_type == "tcp" || (port == 443 && !task.target.contains(':'))
-                })
+                && ((task.task_type == "tcp"
+                    && task.port.is_some_and(|port| (1..=65535).contains(&port)))
+                    || (task.task_type == "icmp" && task.port.is_none()))
+                && parse_probe_target(&task.target, None).is_some()
                 && seen.insert(task.id.clone())
         })
         .take(MAX_LATENCY_TASKS)
@@ -1717,8 +1701,6 @@ mod tests {
             "https://monitor.example.com",
             "-t",
             "secret",
-            "-s",
-            "server-a",
             "-i",
             "60",
             "--once",
@@ -1726,11 +1708,20 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.endpoint, "https://monitor.example.com");
         assert_eq!(parsed.token, "secret");
-        assert_eq!(parsed.server_id, "server-a");
         assert_eq!(parsed.interval, 60);
         assert!(parsed.once);
         assert!(CliOptions::try_parse_from(["nodeflare", "-t"]).is_err());
         assert!(CliOptions::try_parse_from(["nodeflare", "-t", "first", "-t", "second"]).is_err());
+        assert!(CliOptions::try_parse_from([
+            "nodeflare",
+            "-e",
+            "https://monitor.example.com",
+            "-t",
+            "secret",
+            "-s",
+            "server-a",
+        ])
+        .is_err());
         assert!(CliOptions::try_parse_from(["nodeflare", "--once", "--collect"]).is_err());
     }
 
@@ -1740,7 +1731,8 @@ mod tests {
             id: "task-1".to_string(),
             name: "Cloudflare".to_string(),
             task_type: "tcp".to_string(),
-            target: "1.1.1.1:443".to_string(),
+            target: "1.1.1.1".to_string(),
+            port: Some(443),
             interval_seconds: 60,
         };
         let mut tasks = vec![valid.clone(), valid];
@@ -1749,6 +1741,7 @@ mod tests {
             name: "Bad".to_string(),
             task_type: "http".to_string(),
             target: "https://example.com".to_string(),
+            port: Some(443),
             interval_seconds: 1,
         });
         for index in 2..=MAX_LATENCY_TASKS + 10 {
@@ -1757,6 +1750,7 @@ mod tests {
                 name: format!("Task {index}"),
                 task_type: "icmp".to_string(),
                 target: "1.1.1.1".to_string(),
+                port: None,
                 interval_seconds: 60,
             });
         }
@@ -1844,11 +1838,11 @@ mod tests {
     #[test]
     fn parses_probe_targets() {
         assert_eq!(
-            parse_probe_target("Example.COM"),
+            parse_probe_target("Example.COM", None),
             Some(("example.com".to_string(), 443))
         );
         assert_eq!(
-            parse_probe_target("1.1.1.1:8080"),
+            parse_probe_target("1.1.1.1", Some(8080)),
             Some(("1.1.1.1".to_string(), 8080))
         );
         for target in [
@@ -1865,7 +1859,7 @@ mod tests {
             "[::1]:443",
             "bad host",
         ] {
-            assert_eq!(parse_probe_target(target), None, "target: {target}");
+            assert_eq!(parse_probe_target(target, None), None, "target: {target}");
         }
     }
 

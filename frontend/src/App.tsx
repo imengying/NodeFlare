@@ -1,6 +1,6 @@
 import { Megaphone, Moon, Search, Sun, UserCircle } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, getToken, getTurnstileProof, setTurnstileProof } from "./api";
+import { api, ApiError } from "./api";
 import { NodeCard } from "./components/NodeCard";
 import { StatsBar } from "./components/StatsBar";
 import { TurnstileWidget } from "./components/TurnstileWidget";
@@ -56,12 +56,6 @@ export default function App() {
       const nextConfig = await api.config();
       setConfig(nextConfig);
       setConfigReady(true);
-      if (nextConfig.turnstile_enabled && !getTurnstileProof() && !getToken()) {
-        setNeedsVerification(true);
-        setServers([]);
-        setError("");
-        return;
-      }
       const [serverResult, ratesResult] = await Promise.all([api.servers(), api.exchangeRates()]);
       setServers(serverResult.servers);
       setExchangeRates(ratesResult);
@@ -69,8 +63,8 @@ export default function App() {
       setError("");
     } catch (reason) {
       if (reason instanceof ApiError && reason.status === 403) {
-        setTurnstileProof("");
         setNeedsVerification(true);
+        setServers([]);
       }
       setError(reason instanceof Error ? reason.message : ui(config.locale, "无法加载节点状态", "Unable to load server status"));
     } finally {
@@ -83,8 +77,7 @@ export default function App() {
     setVerificationBusy(true);
     setError("");
     try {
-      const result = await api.verifyTurnstile(token);
-      setTurnstileProof(result.verification);
+      await api.verifyTurnstile(token);
       setNeedsVerification(false);
       await load();
     } catch (reason) {
@@ -137,8 +130,7 @@ export default function App() {
   }, [config.site_name, configReady, selectedId, servers]);
 
   useEffect(() => {
-    if (loading || !config.public_dashboard || demoMode) return;
-    if (config.turnstile_enabled && !getTurnstileProof()) return;
+    if (loading || needsVerification || !config.public_dashboard || demoMode) return;
     const reconnects: number[] = [];
     let cancelled = false;
     const connect = () => {
@@ -148,8 +140,6 @@ export default function App() {
       endpoint.pathname = "/api/ws";
       endpoint.search = "";
       if (selectedId) endpoint.searchParams.set("server_id", selectedId);
-      const proof = getTurnstileProof();
-      if (proof) endpoint.searchParams.set("turnstile_verified", proof);
       const socket = new WebSocket(endpoint);
       wsRef.current.push(socket);
       socket.onopen = () => void load(true);
@@ -177,7 +167,7 @@ export default function App() {
       wsRef.current.forEach((socket) => socket.close());
       wsRef.current = [];
     };
-  }, [config.public_dashboard, config.turnstile_enabled, load, loading, needsVerification, selectedId]);
+  }, [config.public_dashboard, load, loading, needsVerification, selectedId]);
 
   const groups = useMemo(() => ["__all__", ...Array.from(new Set(servers.map((server) => server.group_name || "默认")))], [servers]);
   const visible = useMemo(() => servers.filter((server) => {

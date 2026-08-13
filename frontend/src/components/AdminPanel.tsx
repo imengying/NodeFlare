@@ -7,6 +7,7 @@ import {
   Coins,
   Copy,
   Database,
+  Download,
   Eye,
   GripVertical,
   KeyRound,
@@ -27,10 +28,10 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError, getToken, setToken } from "../api";
+import { ADMIN_UNAUTHORIZED_EVENT, api, ApiError, getToken, setToken } from "../api";
 import { formatBytes, isOnline } from "../format";
 import { derivePassword } from "../password";
-import { ASSET_CURRENCIES, type AdminServer, type AgentInstallTarget, type CloudflareUsage, type Config, type DatabaseStats, type ExchangeRates, type ServerInput, type Settings, type Theme, type ThemeSettingField, type ThemeSettingsSchema, type ThemeSettingValue } from "../types";
+import { ASSET_CURRENCIES, type AdminServer, type CloudflareUsage, type Config, type DatabaseStats, type ExchangeRates, type ServerInput, type Settings, type Theme, type ThemeSettingField, type ThemeSettingsSchema, type ThemeSettingValue } from "../types";
 import { Checkbox } from "./Checkbox";
 import { TurnstileWidget } from "./TurnstileWidget";
 import { LatencyManager } from "./LatencyManager";
@@ -39,9 +40,15 @@ import { AlertRuleManager } from "./AlertRuleManager";
 type AdminTab = "servers" | "latency" | "appearance" | "themes" | "themeSettings" | "alerts" | "security" | "data";
 type AgentPlatform = "linux" | "windows" | "macos";
 
+interface AgentInstallTarget {
+  id: string;
+  name: string;
+  agent_token: string;
+}
+
 const adminPages: Record<AdminTab, { title: string; description: string }> = {
-  servers: { title: "服务器", description: "管理监控节点、Agent 密钥和运行参数" },
-  latency: { title: "延迟监测", description: "配置分配给各服务器的 TCP 与 ICMP 延迟任务" },
+  servers: { title: "服务器", description: "管理监控节点和运行参数" },
+  latency: { title: "延迟检测", description: "配置分配给各服务器的 TCP 与 ICMP 延迟任务" },
   appearance: { title: "站点设置", description: "调整站点信息、公开内容和前台显示项目" },
   themes: { title: "主题商店", description: "选择内置主题或安装远程主题" },
   themeSettings: { title: "主题设置", description: "调整当前前端主题提供的显示选项" },
@@ -56,7 +63,6 @@ const emptyServer: ServerInput = {
   region: "",
   group_name: "默认",
   tags: "",
-  note: "",
   hidden: false,
   expires_at: null,
   traffic_limit: 0,
@@ -65,7 +71,6 @@ const emptyServer: ServerInput = {
   billing_cycle: 30,
   currency: "CNY",
   auto_renewal: false,
-  public_remark: "",
   network_interface: "",
   reset_day: 1,
   report_interval: 60,
@@ -83,7 +88,6 @@ function toInput(server: AdminServer): ServerInput {
     region: server.region,
     group_name: server.group_name,
     tags: server.tags,
-    note: server.note,
     hidden: server.hidden,
     expires_at: server.expires_at,
     traffic_limit: server.traffic_limit,
@@ -92,7 +96,6 @@ function toInput(server: AdminServer): ServerInput {
     billing_cycle: server.billing_cycle,
     currency: server.currency,
     auto_renewal: server.auto_renewal,
-    public_remark: server.public_remark,
     network_interface: server.network_interface,
     reset_day: server.reset_day,
     report_interval: server.report_interval,
@@ -134,7 +137,7 @@ export function AdminPanel({
   onChanged: () => void;
 }) {
   const [authenticated, setAuthenticated] = useState(!!getToken());
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [turnstileToken, setTurnstileToken] = useState("");
   const [turnstileReset, setTurnstileReset] = useState(0);
@@ -170,17 +173,29 @@ export function AdminPanel({
       setSettings(settingsResult);
       setAuthenticated(true);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "加载失败");
       if (reason instanceof ApiError && reason.status === 401) {
         setToken("");
         setAuthenticated(false);
+        setError("");
+        return;
       }
+      setError(reason instanceof Error ? reason.message : "加载失败");
     } finally {
       setBusy(false);
     }
   }, []);
 
   useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    const resetAuthentication = () => {
+      setAuthenticated(false);
+      setError("");
+      setNotice("");
+    };
+    window.addEventListener(ADMIN_UNAUTHORIZED_EVENT, resetAuthentication);
+    return () => window.removeEventListener(ADMIN_UNAUTHORIZED_EVENT, resetAuthentication);
+  }, []);
 
   useEffect(() => {
     if (!notice) return;
@@ -250,12 +265,17 @@ export function AdminPanel({
     catch (reason) { setError(reason instanceof Error ? reason.message : "删除失败"); }
   }
 
-  async function rotate(server: AdminServer) {
-    if (!window.confirm(`重置“${server.name}”的 Agent 密钥？旧 Agent 将立即失效。`)) return;
+  async function showInstallCommand(server: AdminServer) {
+    setBusy(true);
+    setError("");
     try {
-      const result = await api.rotateToken(server.id);
-      setInstall([{ id: server.id, name: server.name, agent_token: result.agent_token }]);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "重置失败"); }
+      const { agent_token } = await api.serverToken(server.id);
+      setInstall([{ id: server.id, name: server.name, agent_token }]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "读取 Agent Token 失败");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function move(index: number, offset: number) {
@@ -428,18 +448,18 @@ export function AdminPanel({
     if (installPlatform === "windows") {
       return {
         ...server,
-        command: `Invoke-WebRequest -Uri "${installer}/install.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" -e ${powershellLiteral(origin)} -t ${powershellLiteral(server.agent_token)} -s ${powershellLiteral(server.id)}`,
+        command: `Invoke-WebRequest -Uri "${installer}/install.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" -e ${powershellLiteral(origin)} -t ${powershellLiteral(server.agent_token)}`,
       };
     }
     if (installPlatform === "macos") {
       return {
         ...server,
-        command: `curl -fsSL ${installer}/install-macos.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)} -s ${shellLiteral(server.id)}`,
+        command: `curl -fsSL ${installer}/install-macos.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}`,
       };
     }
     return {
       ...server,
-      command: `wget -qO- ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)} -s ${shellLiteral(server.id)}`,
+      command: `wget -qO- ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}`,
     };
   }), [install, installPlatform]);
 
@@ -489,7 +509,7 @@ export function AdminPanel({
               <span className="admin-nav-label">管理</span>
               <nav className="admin-tabs">
                 <button className={tab === "servers" ? "active" : ""} onClick={() => selectTab("servers")}><ServerCog size={19} />服务器</button>
-                <button className={tab === "latency" ? "active" : ""} onClick={() => selectTab("latency")}><RadioTower size={19} />延迟监测</button>
+                <button className={tab === "latency" ? "active" : ""} onClick={() => selectTab("latency")}><RadioTower size={19} />延迟检测</button>
                 <button className={tab === "appearance" ? "active" : ""} onClick={() => selectTab("appearance")}><Eye size={19} />站点设置</button>
                 <button className={tab === "themes" ? "active" : ""} onClick={() => selectTab("themes")}><Palette size={19} />主题商店</button>
                 <button className={tab === "themeSettings" ? "active" : ""} onClick={() => { selectTab("themeSettings"); void loadThemeSettings(); }}><SlidersHorizontal size={19} />主题设置</button>
@@ -512,9 +532,9 @@ export function AdminPanel({
                         <button type="button" className="drag-handle" draggable onDragStart={(event) => startDrag(event, server.id)} onDragEnd={() => setDraggingId("")} title={`拖动排序：${server.name}`}><GripVertical size={15} /></button>
                         <Checkbox checked={selectedIds.includes(server.id)} onChange={() => toggleSelected(server.id)} ariaLabel={`选择 ${server.name}`} />
                         <span className={`status-dot ${settings && isOnline(server, settings.offline_threshold_seconds) ? "online" : ""}`} />
-                        <div className="server-name"><strong>{server.name}</strong><small>{server.group_name} · {server.region || "未设置地区"} · {server.report_interval}s</small></div>
+                        <div className="server-name"><strong>{server.name}</strong><small>{server.group_name} · {server.region || "未设置地区"} · {server.last_ip || "尚未上报 IP"} · {server.report_interval}s</small></div>
                         <span className="server-usage">{server.traffic_limit > 0 ? formatBytes(server.traffic_limit) : "不限流量"}</span>
-                        <div className="row-actions"><button className="icon-btn" disabled={index === 0} onClick={() => void move(index, -1)} title="上移"><ChevronUp size={15} /></button><button className="icon-btn" disabled={index === servers.length - 1} onClick={() => void move(index, 1)} title="下移"><ChevronDown size={15} /></button><button className="icon-btn" onClick={() => openEditor(server)} title="编辑节点"><Pencil size={15} /></button><button className="icon-btn" onClick={() => void rotate(server)} title="重置 Agent 密钥"><RotateCw size={15} /></button><button className="icon-btn danger" onClick={() => void remove(server)} title="删除节点"><Trash2 size={15} /></button></div>
+                        <div className="row-actions"><button className="icon-btn" disabled={index === 0} onClick={() => void move(index, -1)} title="上移"><ChevronUp size={15} /></button><button className="icon-btn" disabled={index === servers.length - 1} onClick={() => void move(index, 1)} title="下移"><ChevronDown size={15} /></button><button className="icon-btn" disabled={busy} onClick={() => void showInstallCommand(server)} title="显示安装命令"><Download size={15} /></button><button className="icon-btn" onClick={() => openEditor(server)} title="编辑节点"><Pencil size={15} /></button><button className="icon-btn danger" onClick={() => void remove(server)} title="删除节点"><Trash2 size={15} /></button></div>
                       </div>
                     ))}
                     {!servers.length && !busy ? <div className="list-empty">暂无节点</div> : null}
@@ -532,7 +552,7 @@ export function AdminPanel({
                         <div className="theme-card-main">
                           <div className="theme-card-title"><strong>{theme.name}</strong><span className={`theme-badge ${theme.builtin ? "builtin" : "remote"}`}>{theme.builtin ? "默认主题" : "远程主题"}</span></div>
                           <p>{theme.description || "暂无主题说明"}</p>
-                          {!theme.builtin ? <a href={theme.url} target="_blank" rel="noreferrer"><span>{theme.url}</span><ExternalLink size={13} /></a> : <small>NodeFlare 内置 Komari Glass</small>}
+                          {!theme.builtin ? <a href={theme.url} target="_blank" rel="noreferrer"><span>{theme.url}</span><ExternalLink size={13} /></a> : <small>NodeFlare 内置主题</small>}
                         </div>
                         <div className="theme-card-actions">
                           {!theme.builtin ? <button type="button" className="secondary-btn compact" disabled={busy} onClick={() => void previewTheme(theme)}><Eye size={14} />预览</button> : null}
@@ -547,14 +567,7 @@ export function AdminPanel({
                     <p className="settings-hint">填写 GitHub <code>tree</code> 地址，对应目录需包含 <code>index.html</code> 和 <code>assets/</code> 目录。</p>
                     <div className="form-grid"><label><span>主题名称</span><input required maxLength={80} value={themeName} onChange={(event) => setThemeName(event.target.value)} placeholder="例如：Ocean" /></label><label><span>主题 URL</span><input required type="url" maxLength={2048} value={themeUrl} onChange={(event) => setThemeUrl(event.target.value)} placeholder="https://github.com/user/theme/tree/main" /></label></div>
                     <label><span>主题说明（可选）</span><textarea rows={2} maxLength={300} value={themeDescription} onChange={(event) => setThemeDescription(event.target.value)} placeholder="简短描述主题风格和来源" /></label>
-                    <div className="theme-risk-note">远程主题包含第三方 HTML、JavaScript 和 CSS。仅添加你信任的主题仓库。</div>
                     <div className="form-actions"><button className="primary-btn" disabled={busy}><Plus size={16} />添加主题</button></div>
-                  </form>
-                  <form className="admin-section" onSubmit={saveSite}>
-                    <div className="section-title"><Eye size={15} />公开访问</div>
-                    <Toggle label="公开仪表盘" checked={settings.public_dashboard} onChange={(value) => updateSettings("public_dashboard", value)} />
-                    <p className="settings-hint">关闭后，未登录访客无法读取节点和历史数据。</p>
-                    <div className="form-actions"><button className="primary-btn" disabled={busy}><Save size={16} />保存公开设置</button></div>
                   </form>
                 </div>
               ) : settings ? (
@@ -571,7 +584,7 @@ export function AdminPanel({
                     <div className="section-title"><SlidersHorizontal size={15} />通用主题设置</div>
                     <div className="form-grid"><label><span>默认主题</span><select value={settings.default_theme} onChange={(event) => updateSettings("default_theme", event.target.value as Settings["default_theme"])}><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label><label><span>背景图地址</span><input type="text" value={settings.background_url} onChange={(event) => updateSettings("background_url", event.target.value)} /></label></div>
                     <p className="settings-hint">背景图可用 | 分隔浅色和深色地址，例如 light.jpg|dark.jpg。</p>
-                    {themeSettingsSchema?.settings.length ? <><div className="section-subtitle">当前主题选项</div><div className="theme-option-grid">{themeSettingsSchema.settings.map((field) => <ThemeOption key={field.key} field={field} value={settings.theme_options[field.key] ?? field.default} onChange={(value) => updateThemeOption(field.key, value)} />)}</div></> : <div className="theme-option-empty">当前主题没有提供额外设置</div>}
+                    <div className="section-subtitle">当前主题选项</div><div className="theme-option-grid"><Toggle label="公开仪表盘" checked={settings.public_dashboard} onChange={(value) => updateSettings("public_dashboard", value)} />{themeSettingsSchema?.settings.map((field) => <ThemeOption key={field.key} field={field} value={settings.theme_options[field.key] ?? field.default} onChange={(value) => updateThemeOption(field.key, value)} />)}</div>
                     <div className="section-subtitle">公开界面元素</div>
                     <div className="settings-toggles"><Toggle label="显示搜索" checked={settings.show_search} onChange={(value) => updateSettings("show_search", value)} /><Toggle label="显示分组" checked={settings.show_groups} onChange={(value) => updateSettings("show_groups", value)} /><Toggle label="总览统计" checked={settings.show_stats} onChange={(value) => updateSettings("show_stats", value)} /><Toggle label="在线资产" checked={settings.show_assets} onChange={(value) => updateSettings("show_assets", value)} /><Toggle label="累计流量" checked={settings.show_traffic} onChange={(value) => updateSettings("show_traffic", value)} /><Toggle label="实时网速" checked={settings.show_speed} onChange={(value) => updateSettings("show_speed", value)} /><Toggle label="价格信息" checked={settings.show_price} onChange={(value) => updateSettings("show_price", value)} /><Toggle label="到期信息" checked={settings.show_expiry} onChange={(value) => updateSettings("show_expiry", value)} /><Toggle label="延迟与丢包" checked={settings.show_latency} onChange={(value) => updateSettings("show_latency", value)} /><Toggle label="在线时长" checked={settings.show_uptime} onChange={(value) => updateSettings("show_uptime", value)} /></div>
                   </> : null}
@@ -625,7 +638,6 @@ export function AdminPanel({
         <div className="form-grid three"><label><span>价格（0 隐藏，-1 免费）</span><input min="-1" step="0.01" type="number" value={form.price} onChange={(event) => updateForm("price", Number(event.target.value))} /></label><label><span>币种</span><select value={form.currency} onChange={(event) => updateForm("currency", event.target.value)}>{ASSET_CURRENCIES.map((code) => <option key={code}>{code}</option>)}</select></label><label><span>计费周期（天）</span><input min="1" max="3650" type="number" value={form.billing_cycle} onChange={(event) => updateForm("billing_cycle", Number(event.target.value))} /></label></div>
         <div className="form-grid three"><label><span>到期日期</span><input type="date" value={formatDate(form.expires_at)} onChange={(event) => updateForm("expires_at", event.target.value ? Math.floor(new Date(`${event.target.value}T00:00:00Z`).getTime() / 1000) : null)} /></label><label><span>Agent 上报间隔（秒）</span><input min="15" max="3600" type="number" value={form.report_interval} onChange={(event) => updateForm("report_interval", Number(event.target.value))} /></label><label><span>指标采样间隔（秒）</span><input min="2" max="60" type="number" value={form.collect_interval} onChange={(event) => updateForm("collect_interval", Number(event.target.value))} /></label></div>
         <div className="form-grid"><label><span>统计网卡（逗号分隔，留空自动）</span><input value={form.network_interface} onChange={(event) => updateForm("network_interface", event.target.value)} placeholder="eth0,ens3" /></label><label><span>下行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.rx_correction / 1024 ** 3} onChange={(event) => updateForm("rx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label><label><span>上行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.tx_correction / 1024 ** 3} onChange={(event) => updateForm("tx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label></div>
-        <label><span>公开备注</span><textarea rows={2} value={form.public_remark} onChange={(event) => updateForm("public_remark", event.target.value)} /></label><label><span>管理备注</span><textarea rows={2} value={form.note} onChange={(event) => updateForm("note", event.target.value)} /></label>
         <div className="settings-toggles editor-toggles"><Toggle label="自动续费" checked={form.auto_renewal} onChange={(value) => updateForm("auto_renewal", value)} /><Toggle label="Agent 自动更新" checked={form.auto_update} onChange={(value) => updateForm("auto_update", value)} /><Toggle label="隐藏节点" checked={form.hidden} onChange={(value) => updateForm("hidden", value)} /><Toggle label="关闭离线告警" checked={form.offline_notify_disabled} onChange={(value) => updateForm("offline_notify_disabled", value)} /></div>
         <div className="form-actions"><button type="button" className="secondary-btn" onClick={() => setEditing(null)}>取消</button><button className="primary-btn" disabled={busy}><Save size={16} />保存节点</button></div>
       </form></div> : null}

@@ -4,15 +4,16 @@ use serde::{Deserialize, Serialize, Serializer};
 use worker::{wasm_bindgen::JsValue, D1Database, Date, Result};
 
 use crate::models::{
-    AgentConfigView, AgentReport, AlertRuleInput, AlertRuleView, HistoryPoint, ServerInput,
-    ServerView, SettingsInput, ThemeInput, ThemeView, TokenHashRow,
+    AgentConfigView, AgentIdentityRow, AgentReport, AlertRuleInput, AlertRuleView, HistoryPoint,
+    ServerInput, ServerView, SettingsInput, ThemeInput, ThemeView,
 };
 
 const SERVER_SELECT: &str = r#"
 SELECT
-  s.id, s.name, s.region, s.group_name, s.tags, s.note, s.hidden,
+  s.id, s.name, s.region, s.group_name, s.tags, s.hidden,
   s.expires_at, s.traffic_limit, s.traffic_limit_type,
-  s.price, s.billing_cycle, s.currency, s.auto_renewal, s.public_remark,
+  s.price, s.billing_cycle, s.currency, s.auto_renewal,
+  s.last_ip,
   s.network_interface, s.reset_day, s.report_interval, s.collect_interval,
   s.rx_correction, s.tx_correction, s.offline_notify_disabled, s.auto_update,
   s.created_at,
@@ -249,11 +250,26 @@ pub async fn get_server(
     db.prepare(query).bind(&[text(id)])?.first(None).await
 }
 
-pub async fn get_token_hash(db: &D1Database, id: &str) -> Result<Option<TokenHashRow>> {
-    db.prepare("SELECT token_hash, hidden FROM servers WHERE id = ?1")
-        .bind(&[text(id)])?
+pub async fn get_agent_identity(db: &D1Database, token: &str) -> Result<Option<AgentIdentityRow>> {
+    db.prepare("SELECT id, hidden FROM servers WHERE token = ?1 LIMIT 1")
+        .bind(&[text(token)])?
         .first(None)
         .await
+}
+
+pub async fn get_agent_token(db: &D1Database, id: &str) -> Result<Option<String>> {
+    db.prepare("SELECT token FROM servers WHERE id = ?1 LIMIT 1")
+        .bind(&[text(id)])?
+        .first(Some("token"))
+        .await
+}
+
+pub async fn update_last_ip(db: &D1Database, id: &str, ip: &str) -> Result<()> {
+    db.prepare("UPDATE servers SET last_ip = ?2 WHERE id = ?1 AND last_ip != ?2")
+        .bind(&[text(id), text(ip)])?
+        .run()
+        .await?;
+    Ok(())
 }
 
 pub async fn agent_config(db: &D1Database, id: &str) -> Result<Option<AgentConfigView>> {
@@ -280,21 +296,21 @@ pub async fn agent_config(db: &D1Database, id: &str) -> Result<Option<AgentConfi
 pub async fn create_server(
     db: &D1Database,
     id: &str,
-    token_hash: &str,
+    token: &str,
     input: &ServerInput,
 ) -> Result<()> {
     let timestamp = now();
     db.prepare(
         r#"INSERT INTO servers (
-          id, name, region, group_name, tags, note, hidden, sort_order,
+          id, name, region, group_name, tags, hidden, sort_order,
           expires_at, traffic_limit, traffic_limit_type, price, billing_cycle,
-          currency, auto_renewal, public_remark, network_interface, reset_day,
+          currency, auto_renewal, network_interface, reset_day,
           report_interval, collect_interval, rx_correction, tx_correction, offline_notify_disabled, auto_update,
-          token_hash, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+          token, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6,
           COALESCE((SELECT MAX(sort_order) + 1 FROM servers), 0),
-          ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-          ?20, ?21, ?22, ?23, ?24, ?25, ?25)"#,
+          ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+          ?18, ?19, ?20, ?21, ?22, ?23, ?23)"#,
     )
     .bind(&[
         text(id),
@@ -302,7 +318,6 @@ pub async fn create_server(
         text(input.region.trim()),
         text(input.group_name.trim()),
         text(input.tags.trim()),
-        text(input.note.trim()),
         JsValue::from_bool(input.hidden),
         input.expires_at.map(number).unwrap_or(JsValue::NULL),
         number(input.traffic_limit),
@@ -311,7 +326,6 @@ pub async fn create_server(
         number(input.billing_cycle),
         text(input.currency.trim()),
         JsValue::from_bool(input.auto_renewal),
-        text(input.public_remark.trim()),
         text(input.network_interface.trim()),
         number(input.reset_day),
         number(input.report_interval),
@@ -320,7 +334,7 @@ pub async fn create_server(
         number(input.tx_correction),
         JsValue::from_bool(input.offline_notify_disabled),
         JsValue::from_bool(input.auto_update),
-        text(token_hash),
+        text(token),
         number(timestamp),
     ])?
     .run()
@@ -332,13 +346,13 @@ pub async fn update_server(db: &D1Database, id: &str, input: &ServerInput) -> Re
     let result = db
         .prepare(
             r#"UPDATE servers SET
-              name = ?2, region = ?3, group_name = ?4, tags = ?5, note = ?6,
-              hidden = ?7, expires_at = ?8, traffic_limit = ?9,
-              traffic_limit_type = ?10, price = ?11, billing_cycle = ?12,
-              currency = ?13, auto_renewal = ?14, public_remark = ?15,
-              network_interface = ?16, reset_day = ?17, report_interval = ?18,
-              collect_interval = ?19, rx_correction = ?20, tx_correction = ?21,
-              offline_notify_disabled = ?22, auto_update = ?23, updated_at = ?24
+              name = ?2, region = ?3, group_name = ?4, tags = ?5,
+              hidden = ?6, expires_at = ?7, traffic_limit = ?8,
+              traffic_limit_type = ?9, price = ?10, billing_cycle = ?11,
+              currency = ?12, auto_renewal = ?13,
+              network_interface = ?14, reset_day = ?15, report_interval = ?16,
+              collect_interval = ?17, rx_correction = ?18, tx_correction = ?19,
+              offline_notify_disabled = ?20, auto_update = ?21, updated_at = ?22
             WHERE id = ?1"#,
         )
         .bind(&[
@@ -347,7 +361,6 @@ pub async fn update_server(db: &D1Database, id: &str, input: &ServerInput) -> Re
             text(input.region.trim()),
             text(input.group_name.trim()),
             text(input.tags.trim()),
-            text(input.note.trim()),
             JsValue::from_bool(input.hidden),
             input.expires_at.map(number).unwrap_or(JsValue::NULL),
             number(input.traffic_limit),
@@ -356,7 +369,6 @@ pub async fn update_server(db: &D1Database, id: &str, input: &ServerInput) -> Re
             number(input.billing_cycle),
             text(input.currency.trim()),
             JsValue::from_bool(input.auto_renewal),
-            text(input.public_remark.trim()),
             text(input.network_interface.trim()),
             number(input.reset_day),
             number(input.report_interval),
@@ -391,15 +403,6 @@ pub async fn delete_servers(db: &D1Database, ids: &[String]) -> Result<()> {
         db.batch(statements).await?;
     }
     Ok(())
-}
-
-pub async fn update_token(db: &D1Database, id: &str, token_hash: &str) -> Result<bool> {
-    let result = db
-        .prepare("UPDATE servers SET token_hash = ?2, updated_at = ?3 WHERE id = ?1")
-        .bind(&[text(id), text(token_hash), number(now())])?
-        .run()
-        .await?;
-    Ok(result.meta()?.and_then(|meta| meta.changes).unwrap_or(0) > 0)
 }
 
 pub async fn reorder_servers(db: &D1Database, ids: &[String]) -> Result<()> {
@@ -927,6 +930,15 @@ fn string_setting(values: &HashMap<String, String>, key: &str, fallback: &str) -
         .unwrap_or_else(|| fallback.to_string())
 }
 
+fn non_empty_string_setting(values: &HashMap<String, String>, key: &str, fallback: &str) -> String {
+    values
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback.trim())
+        .to_string()
+}
+
 fn integer_setting(values: &HashMap<String, String>, key: &str, fallback: i64) -> i64 {
     values
         .get(key)
@@ -986,7 +998,7 @@ pub async fn settings(
         show_expiry: bool_setting(&values, "show_expiry", true),
         show_latency: bool_setting(&values, "show_latency", true),
         show_uptime: bool_setting(&values, "show_uptime", true),
-        admin_username: string_setting(&values, "admin_username", default_username),
+        admin_username: non_empty_string_setting(&values, "admin_username", default_username),
         admin_password_configured: values
             .get("admin_password_hash")
             .is_some_and(|value| !value.is_empty()),
@@ -1436,9 +1448,10 @@ pub async fn update_expiry(db: &D1Database, id: &str, expires_at: i64) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        alert_window_covered, history_cutoffs, secret_for_api, traffic_cycle_key, AlertMetricRow,
-        SECRET_MASK,
+        alert_window_covered, history_cutoffs, non_empty_string_setting, secret_for_api,
+        traffic_cycle_key, AlertMetricRow, SECRET_MASK,
     };
+    use std::collections::HashMap;
 
     fn row(samples: i64, last_timestamp: i64, report_interval: i64) -> AlertMetricRow {
         AlertMetricRow {
@@ -1477,6 +1490,21 @@ mod tests {
     fn masks_stored_secrets_in_api_responses() {
         assert_eq!(secret_for_api(""), "");
         assert_eq!(secret_for_api("stored-secret"), SECRET_MASK);
+    }
+
+    #[test]
+    fn requires_an_explicit_admin_username() {
+        let mut values = HashMap::from([("admin_username".to_string(), String::new())]);
+        assert_eq!(
+            non_empty_string_setting(&values, "admin_username", "operator"),
+            "operator"
+        );
+        assert_eq!(non_empty_string_setting(&values, "admin_username", ""), "");
+        values.insert("admin_username".to_string(), "owner".to_string());
+        assert_eq!(
+            non_empty_string_setting(&values, "admin_username", "operator"),
+            "owner"
+        );
     }
 
     #[test]

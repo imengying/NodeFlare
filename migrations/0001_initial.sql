@@ -1,18 +1,17 @@
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE IF NOT EXISTS settings (
+CREATE TABLE settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS servers (
+CREATE TABLE servers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   region TEXT NOT NULL DEFAULT '',
   group_name TEXT NOT NULL DEFAULT '默认',
   tags TEXT NOT NULL DEFAULT '',
-  note TEXT NOT NULL DEFAULT '',
   hidden INTEGER NOT NULL DEFAULT 0,
   sort_order INTEGER NOT NULL DEFAULT 0,
   expires_at INTEGER,
@@ -22,7 +21,7 @@ CREATE TABLE IF NOT EXISTS servers (
   billing_cycle INTEGER NOT NULL DEFAULT 30,
   currency TEXT NOT NULL DEFAULT 'CNY',
   auto_renewal INTEGER NOT NULL DEFAULT 0,
-  public_remark TEXT NOT NULL DEFAULT '',
+  last_ip TEXT NOT NULL DEFAULT '',
   network_interface TEXT NOT NULL DEFAULT '',
   reset_day INTEGER NOT NULL DEFAULT 1,
   report_interval INTEGER NOT NULL DEFAULT 60,
@@ -31,12 +30,12 @@ CREATE TABLE IF NOT EXISTS servers (
   tx_correction INTEGER NOT NULL DEFAULT 0,
   offline_notify_disabled INTEGER NOT NULL DEFAULT 0,
   auto_update INTEGER NOT NULL DEFAULT 1,
-  token_hash TEXT NOT NULL,
+  token TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS latest_metrics (
+CREATE TABLE latest_metrics (
   server_id TEXT PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
   timestamp INTEGER NOT NULL,
   cpu REAL NOT NULL DEFAULT 0,
@@ -76,7 +75,7 @@ CREATE TABLE IF NOT EXISTS latest_metrics (
   gpu_info TEXT NOT NULL DEFAULT '[]'
 );
 
-CREATE TABLE IF NOT EXISTS traffic_cycles (
+CREATE TABLE traffic_cycles (
   server_id TEXT PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
   cycle_key INTEGER NOT NULL,
   reset_day INTEGER NOT NULL DEFAULT 1,
@@ -87,7 +86,7 @@ CREATE TABLE IF NOT EXISTS traffic_cycles (
   used_tx INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS metric_history (
+CREATE TABLE metric_history (
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
   timestamp INTEGER NOT NULL,
   cpu REAL NOT NULL DEFAULT 0,
@@ -117,7 +116,7 @@ CREATE TABLE IF NOT EXISTS metric_history (
   PRIMARY KEY(server_id, timestamp)
 );
 
-CREATE TABLE IF NOT EXISTS metric_history_hourly (
+CREATE TABLE metric_history_hourly (
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
   timestamp INTEGER NOT NULL,
   cpu REAL NOT NULL DEFAULT 0,
@@ -147,14 +146,14 @@ CREATE TABLE IF NOT EXISTS metric_history_hourly (
   PRIMARY KEY(server_id, timestamp)
 );
 
-CREATE INDEX IF NOT EXISTS idx_history_server_time
+CREATE INDEX idx_history_server_time
   ON metric_history(server_id, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_history_hourly_server_time
+CREATE INDEX idx_history_hourly_server_time
   ON metric_history_hourly(server_id, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_servers_sort
+CREATE INDEX idx_servers_sort
   ON servers(sort_order, created_at);
 
-INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES
+INSERT INTO settings(key, value, updated_at) VALUES
   ('site_description', '轻量、实时的服务器运行状态', unixepoch()),
   ('site_announcement', '', unixepoch()),
   ('favicon_url', '', unixepoch()),
@@ -162,7 +161,7 @@ INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES
   ('public_dashboard', 'true', unixepoch()),
   ('history_cache_version', '0', unixepoch()),
   ('default_theme', 'system', unixepoch()),
-  ('active_theme_id', 'builtin-komari-glass', unixepoch()),
+  ('active_theme_id', 'builtin-nodeflare-glass', unixepoch()),
   ('background_url', '', unixepoch()),
   ('theme_options', '{}', unixepoch()),
   ('show_search', 'true', unixepoch()),
@@ -190,7 +189,7 @@ INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES
   ('cloudflare_account_id', '', unixepoch()),
   ('cloudflare_api_token', '', unixepoch());
 
-CREATE TABLE IF NOT EXISTS exchange_rate_snapshots (
+CREATE TABLE exchange_rate_snapshots (
   base_currency TEXT PRIMARY KEY,
   rates_json TEXT NOT NULL,
   source TEXT NOT NULL,
@@ -199,7 +198,7 @@ CREATE TABLE IF NOT EXISTS exchange_rate_snapshots (
   attempted_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS themes (
+CREATE TABLE themes (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
@@ -207,10 +206,10 @@ CREATE TABLE IF NOT EXISTS themes (
   created_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_themes_created
+CREATE INDEX idx_themes_created
   ON themes(created_at DESC);
 
-INSERT OR IGNORE INTO exchange_rate_snapshots (
+INSERT INTO exchange_rate_snapshots (
   base_currency, rates_json, source, rate_date, fetched_at, attempted_at
 ) VALUES (
   'CNY',
@@ -218,25 +217,27 @@ INSERT OR IGNORE INTO exchange_rate_snapshots (
   'default', '', 0, 0
 );
 
-CREATE TABLE IF NOT EXISTS latency_tasks (
+CREATE TABLE latency_tasks (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   task_type TEXT NOT NULL CHECK(task_type IN ('tcp', 'icmp')),
   target TEXT NOT NULL,
+  port INTEGER CHECK(port IS NULL OR port BETWEEN 1 AND 65535),
   interval_seconds INTEGER NOT NULL CHECK(interval_seconds BETWEEN 30 AND 3600),
   default_enabled INTEGER NOT NULL DEFAULT 0,
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  CHECK((task_type = 'tcp' AND port IS NOT NULL) OR (task_type = 'icmp' AND port IS NULL))
 );
 
-CREATE TABLE IF NOT EXISTS latency_task_servers (
+CREATE TABLE latency_task_servers (
   task_id TEXT NOT NULL REFERENCES latency_tasks(id) ON DELETE CASCADE,
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
   PRIMARY KEY(task_id, server_id)
 );
 
-CREATE TABLE IF NOT EXISTS latency_latest (
+CREATE TABLE latency_latest (
   task_id TEXT NOT NULL REFERENCES latency_tasks(id) ON DELETE CASCADE,
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
   timestamp INTEGER NOT NULL,
@@ -245,7 +246,7 @@ CREATE TABLE IF NOT EXISTS latency_latest (
   PRIMARY KEY(task_id, server_id)
 );
 
-CREATE TABLE IF NOT EXISTS latency_history (
+CREATE TABLE latency_history (
   task_id TEXT NOT NULL REFERENCES latency_tasks(id) ON DELETE CASCADE,
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
   timestamp INTEGER NOT NULL,
@@ -254,14 +255,14 @@ CREATE TABLE IF NOT EXISTS latency_history (
   PRIMARY KEY(task_id, server_id, timestamp)
 );
 
-CREATE INDEX IF NOT EXISTS idx_latency_task_servers_server
+CREATE INDEX idx_latency_task_servers_server
   ON latency_task_servers(server_id, task_id);
-CREATE INDEX IF NOT EXISTS idx_latency_history_server_time
+CREATE INDEX idx_latency_history_server_time
   ON latency_history(server_id, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_latency_history_task_time
+CREATE INDEX idx_latency_history_task_time
   ON latency_history(task_id, timestamp DESC);
 
-CREATE TABLE IF NOT EXISTS alert_rules (
+CREATE TABLE alert_rules (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   metric TEXT NOT NULL CHECK(metric IN ('cpu', 'memory', 'disk', 'net_in', 'net_out')),
@@ -273,13 +274,13 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   updated_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS alert_rule_servers (
+CREATE TABLE alert_rule_servers (
   rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
   PRIMARY KEY(rule_id, server_id)
 );
 
-CREATE TABLE IF NOT EXISTS alert_states (
+CREATE TABLE alert_states (
   rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
   active INTEGER NOT NULL DEFAULT 0,

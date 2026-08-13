@@ -8,16 +8,15 @@ const emptyTask: LatencyTaskInput = {
   name: "",
   task_type: "icmp",
   target: "",
+  port: null,
   interval_seconds: 60,
   default_enabled: false,
   server_ids: [],
 };
 
 function validHost(value: string) {
-  const host = value.trim();
-  if (!host || host.length > 60 || /\s|:\/\/|[\/@?#\\\[\]]/.test(host) || (host.match(/:/g)?.length ?? 0) > 1) return false;
-  const [name, port] = host.split(":");
-  if (port && (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535)) return false;
+  const name = value.trim();
+  if (!name || name.length > 50 || /\s|:|[\/@?#\\\[\]]/.test(name)) return false;
   if (!name || name.startsWith(".") || name.endsWith(".")) return false;
   const labels = name.split(".");
   if (labels.length === 4 && labels.every((part) => /^\d+$/.test(part))) {
@@ -67,7 +66,7 @@ export function LatencyManager({
   const visibleServers = useMemo(() => {
     const keyword = query.trim().toLowerCase();
     if (!keyword) return servers;
-    return servers.filter((server) => `${server.name} ${server.region} ${server.group_name}`.toLowerCase().includes(keyword));
+    return servers.filter((server) => `${server.name} ${server.region} ${server.group_name} ${server.last_ip}`.toLowerCase().includes(keyword));
   }, [query, servers]);
 
   function open(task?: LatencyTask) {
@@ -76,6 +75,7 @@ export function LatencyManager({
       name: task.name,
       task_type: task.task_type,
       target: task.target,
+      port: task.port,
       interval_seconds: task.interval_seconds,
       default_enabled: task.default_enabled,
       server_ids: [...task.server_ids],
@@ -95,8 +95,8 @@ export function LatencyManager({
 
   async function save(event: FormEvent) {
     event.preventDefault();
-    if (!validHost(form.target) || (form.task_type === "icmp" && form.target.includes(":"))) {
-      onError(form.task_type === "icmp" ? "ICMP 目标应为公网域名或公网 IPv4，不能包含端口" : "TCP 目标应为公网域名、公网 IPv4 或 host:port");
+    if (!validHost(form.target) || (form.task_type === "tcp" && (!form.port || form.port < 1 || form.port > 65535)) || (form.task_type === "icmp" && form.port !== null)) {
+      onError(form.task_type === "icmp" ? "ICMP 节点应为公网域名或公网 IPv4，不使用端口" : "TCP 节点应为公网域名或公网 IPv4，并填写 1 至 65535 的端口");
       return;
     }
     if (!form.default_enabled && !form.server_ids.length) {
@@ -143,7 +143,7 @@ export function LatencyManager({
     <div className="latency-task-list">
       {tasks.map((task) => <div className="latency-task-row" key={task.id}>
         <span className={`latency-type ${task.task_type}`}><RadioTower size={13} />{task.task_type.toUpperCase()}</span>
-        <div className="latency-task-name"><strong>{task.name}</strong><small>{task.target}</small></div>
+        <div className="latency-task-name"><strong>{task.name}</strong><small>{task.target}{task.port ? `:${task.port}` : ""}</small></div>
         <span className="latency-task-meta">{task.interval_seconds}s</span>
         <span className="latency-task-meta">{task.server_ids.length} 个节点{task.default_enabled ? " · 默认" : ""}</span>
         <div className="row-actions"><button className="icon-btn" type="button" onClick={() => open(task)} title="编辑延迟任务"><Pencil size={15} /></button><button className="icon-btn danger" type="button" onClick={() => void remove(task)} title="删除延迟任务"><Trash2 size={15} /></button></div>
@@ -153,14 +153,15 @@ export function LatencyManager({
     </div>
 
     {editing ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setEditing(null)}><form className="latency-editor glass-panel" onSubmit={save} onMouseDown={(event) => event.stopPropagation()}>
-      <header><div><span className="eyebrow">延迟测试</span><h3>{editing === "new" ? "添加任务" : `编辑 · ${editing.name}`}</h3></div></header>
-      <div className="form-grid"><label><span>名称</span><input autoFocus required maxLength={80} value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} /></label><label><span>类型</span><div className="segmented task-type-control"><button type="button" className={form.task_type === "icmp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "icmp" }))}>ICMP</button><button type="button" className={form.task_type === "tcp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "tcp" }))}>TCP</button></div></label></div>
-      <div className="form-grid"><label><span>目标</span><input required maxLength={60} value={form.target} onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))} placeholder={form.task_type === "tcp" ? "example.com:443" : "1.1.1.1"} /></label><label><span>间隔（秒）</span><input type="number" min="30" max="3600" required value={form.interval_seconds} onChange={(event) => setForm((current) => ({ ...current, interval_seconds: Number(event.target.value) }))} /></label></div>
+      <header><div><span className="eyebrow">延迟检测</span><h3>{editing === "new" ? "添加任务" : `编辑 · ${editing.name}`}</h3></div></header>
+      <div className="form-grid"><label><span>名称</span><input autoFocus required maxLength={80} value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} /></label><label><span>类型</span><div className="segmented task-type-control"><button type="button" className={form.task_type === "icmp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "icmp", port: null }))}>ICMP</button><button type="button" className={form.task_type === "tcp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "tcp", port: current.port ?? 443 }))}>TCP</button></div></label></div>
+      <div className="form-grid"><label><span>节点</span><input required maxLength={50} value={form.target} onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))} placeholder={form.task_type === "tcp" ? "example.com" : "1.1.1.1"} /></label>{form.task_type === "tcp" ? <label><span>端口</span><input type="number" min="1" max="65535" required value={form.port ?? ""} onChange={(event) => setForm((current) => ({ ...current, port: event.target.value ? Number(event.target.value) : null }))} placeholder="443" /></label> : <div />}</div>
+      <label><span>检测间隔（秒）</span><input type="number" min="30" max="3600" required value={form.interval_seconds} onChange={(event) => setForm((current) => ({ ...current, interval_seconds: Number(event.target.value) }))} /></label>
       <div className="server-picker">
         <div className="server-picker-head"><strong>服务器</strong><span>已选 {form.server_ids.length} / 共 {servers.length}</span><button type="button" onClick={() => setForm((current) => ({ ...current, server_ids: allSelected ? [] : servers.map((server) => server.id) }))}>{allSelected ? "取消全选" : "全选"}</button></div>
         <div className="server-picker-search"><Search size={16} /><input aria-label="搜索服务器" placeholder="搜索" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
         <div className="server-picker-list">
-          {visibleServers.map((server) => <label className="server-picker-row" key={server.id}><Checkbox checked={form.server_ids.includes(server.id)} onChange={() => toggleServer(server.id)} /><span><strong>{server.name}</strong><small>{server.group_name} · {server.region || "未设置地区"}</small></span></label>)}
+          {visibleServers.map((server) => <label className="server-picker-row" key={server.id}><Checkbox checked={form.server_ids.includes(server.id)} onChange={() => toggleServer(server.id)} /><span><strong>{server.name}</strong><small>{server.group_name} · {server.region || "未设置地区"}{server.last_ip ? ` · ${server.last_ip}` : ""}</small></span></label>)}
           {!visibleServers.length ? <div className="server-picker-empty">没有匹配的服务器</div> : null}
         </div>
       </div>

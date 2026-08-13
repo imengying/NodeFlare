@@ -44,15 +44,6 @@ fn admin_secret(env: &Env) -> Option<String> {
     env.secret("ADMIN_PASSWORD").ok().map(|v| v.to_string())
 }
 
-pub fn admin_username(env: &Env, configured: &str) -> String {
-    if !configured.trim().is_empty() {
-        return configured.trim().to_string();
-    }
-    env.var("ADMIN_USERNAME")
-        .map(|value| value.to_string())
-        .unwrap_or_else(|_| "admin".to_string())
-}
-
 fn password_digest(password_derived: &str, salt: &str, rounds: u32) -> String {
     let mut digest = [0_u8; 32];
     pbkdf2_hmac::<Sha256>(
@@ -120,8 +111,9 @@ pub fn verify_credentials(
     password: &str,
     password_derived: &str,
 ) -> bool {
-    let expected_username = admin_username(env, configured_username);
-    let username_valid = secure_eq(&expected_username, username.trim());
+    let expected_username = configured_username.trim();
+    let username_valid =
+        !expected_username.is_empty() && secure_eq(expected_username, username.trim());
     let password_valid = if password_hash.is_empty() {
         admin_secret(env)
             .map(|expected| secure_eq(&expected, password))

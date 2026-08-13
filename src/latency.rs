@@ -15,6 +15,7 @@ struct TaskRow {
     name: String,
     task_type: String,
     target: String,
+    port: Option<i64>,
     interval_seconds: i64,
     default_enabled: i64,
 }
@@ -39,6 +40,7 @@ pub struct LatencyTaskView {
     pub name: String,
     pub task_type: String,
     pub target: String,
+    pub port: Option<i64>,
     pub interval_seconds: i64,
     pub default_enabled: bool,
     pub server_ids: Vec<String>,
@@ -51,6 +53,7 @@ pub struct LatencySample {
     pub name: String,
     pub task_type: String,
     pub target: String,
+    pub port: Option<i64>,
     pub timestamp: i64,
     pub latency_ms: f64,
     pub packet_loss: f64,
@@ -67,7 +70,7 @@ fn number(value: impl ToString) -> JsValue {
 pub async fn list_tasks(db: &D1Database) -> Result<Vec<LatencyTaskView>> {
     let rows: Vec<TaskRow> = db
         .prepare(
-            "SELECT id, name, task_type, target, interval_seconds, default_enabled \
+            "SELECT id, name, task_type, target, port, interval_seconds, default_enabled \
              FROM latency_tasks \
              ORDER BY sort_order ASC, created_at ASC",
         )
@@ -97,6 +100,7 @@ pub async fn list_tasks(db: &D1Database) -> Result<Vec<LatencyTaskView>> {
             name: row.name,
             task_type: row.task_type,
             target: row.target,
+            port: row.port,
             interval_seconds: row.interval_seconds,
             default_enabled: row.default_enabled != 0,
         })
@@ -112,7 +116,7 @@ pub async fn task_count(db: &D1Database) -> Result<i64> {
 
 pub async fn tasks_for_server(db: &D1Database, server_id: &str) -> Result<Vec<AgentLatencyTask>> {
     db.prepare(
-        "SELECT t.id, t.name, t.task_type, t.target, t.interval_seconds \
+        "SELECT t.id, t.name, t.task_type, t.target, t.port, t.interval_seconds \
          FROM latency_tasks t \
          INNER JOIN latency_task_servers a ON a.task_id = t.id \
          WHERE a.server_id = ?1 ORDER BY t.sort_order ASC, t.created_at ASC",
@@ -133,16 +137,17 @@ pub async fn create_task(
     let statements = vec![
         db.prepare(
             "INSERT INTO latency_tasks( \
-               id, name, task_type, target, interval_seconds, default_enabled, \
+               id, name, task_type, target, port, interval_seconds, default_enabled, \
                sort_order, created_at, updated_at \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
-               COALESCE((SELECT MAX(sort_order) + 1 FROM latency_tasks), 0), ?7, ?7)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+               COALESCE((SELECT MAX(sort_order) + 1 FROM latency_tasks), 0), ?8, ?8)",
         )
         .bind(&[
             text(id),
             text(input.name.trim()),
             text(input.task_type.trim()),
             text(input.target.trim()),
+            input.port.map(number).unwrap_or(JsValue::NULL),
             number(input.interval_seconds),
             JsValue::from_bool(input.default_enabled),
             number(timestamp),
@@ -165,7 +170,7 @@ pub async fn update_task(
 ) -> Result<bool> {
     let exists: Option<TaskRow> = db
         .prepare(
-            "SELECT id, name, task_type, target, interval_seconds, default_enabled \
+            "SELECT id, name, task_type, target, port, interval_seconds, default_enabled \
              FROM latency_tasks WHERE id = ?1",
         )
         .bind(&[text(id)])?
@@ -174,19 +179,21 @@ pub async fn update_task(
     let Some(existing) = exists else {
         return Ok(false);
     };
-    let reset_history =
-        existing.task_type != input.task_type.trim() || existing.target != input.target.trim();
+    let reset_history = existing.task_type != input.task_type.trim()
+        || existing.target != input.target.trim()
+        || existing.port != input.port;
     let server_ids = serde_json::to_string(&input.server_ids)?;
     let mut statements = vec![
         db.prepare(
-            "UPDATE latency_tasks SET name = ?2, task_type = ?3, target = ?4, \
-             interval_seconds = ?5, default_enabled = ?6, updated_at = ?7 WHERE id = ?1",
+            "UPDATE latency_tasks SET name = ?2, task_type = ?3, target = ?4, port = ?5, \
+             interval_seconds = ?6, default_enabled = ?7, updated_at = ?8 WHERE id = ?1",
         )
         .bind(&[
             text(id),
             text(input.name.trim()),
             text(input.task_type.trim()),
             text(input.target.trim()),
+            input.port.map(number).unwrap_or(JsValue::NULL),
             number(input.interval_seconds),
             JsValue::from_bool(input.default_enabled),
             number(timestamp),
@@ -357,7 +364,7 @@ fn compact_results(
 
 pub async fn latest_all(db: &D1Database) -> Result<Vec<LatencySample>> {
     db.prepare(
-        "SELECT l.task_id, l.server_id, t.name, t.task_type, t.target, \
+        "SELECT l.task_id, l.server_id, t.name, t.task_type, t.target, t.port, \
          l.timestamp, l.latency_ms, l.packet_loss \
          FROM latency_latest l INNER JOIN latency_tasks t ON t.id = l.task_id \
          INNER JOIN latency_task_servers a \
@@ -371,7 +378,7 @@ pub async fn latest_all(db: &D1Database) -> Result<Vec<LatencySample>> {
 
 pub async fn latest_for_server(db: &D1Database, server_id: &str) -> Result<Vec<LatencySample>> {
     db.prepare(
-        "SELECT l.task_id, l.server_id, t.name, t.task_type, t.target, \
+        "SELECT l.task_id, l.server_id, t.name, t.task_type, t.target, t.port, \
          l.timestamp, l.latency_ms, l.packet_loss \
          FROM latency_latest l INNER JOIN latency_tasks t ON t.id = l.task_id \
          INNER JOIN latency_task_servers a \
@@ -399,7 +406,7 @@ pub async fn history(db: &D1Database, server_id: &str, hours: i64) -> Result<Vec
     }
     let bucket = history_bucket_seconds(hours, task_count);
     let query = format!(
-        "SELECT h.task_id, h.server_id, t.name, t.task_type, t.target, \
+        "SELECT h.task_id, h.server_id, t.name, t.task_type, t.target, t.port, \
          (h.timestamp / {bucket}) * {bucket} AS timestamp, \
          CASE WHEN SUM(CASE WHEN h.latency_ms >= 0 THEN 1 ELSE 0 END) > 0 \
            THEN AVG(CASE WHEN h.latency_ms >= 0 THEN h.latency_ms END) ELSE -1 END AS latency_ms, \
@@ -408,7 +415,7 @@ pub async fn history(db: &D1Database, server_id: &str, hours: i64) -> Result<Vec
          INNER JOIN latency_task_servers a \
            ON a.task_id = h.task_id AND a.server_id = h.server_id \
          WHERE h.server_id = ?1 AND h.timestamp >= ?2 \
-         GROUP BY h.task_id, h.server_id, t.name, t.task_type, t.target, h.timestamp / {bucket} \
+         GROUP BY h.task_id, h.server_id, t.name, t.task_type, t.target, t.port, h.timestamp / {bucket} \
          ORDER BY timestamp ASC, t.sort_order ASC LIMIT {MAX_HISTORY_RESPONSE_ROWS}"
     );
     db.prepare(query)

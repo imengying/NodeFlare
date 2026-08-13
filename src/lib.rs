@@ -10,7 +10,7 @@ mod theme;
 mod turnstile;
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use futures_util::TryStreamExt;
 use serde::{de::DeserializeOwned, Serialize};
@@ -50,7 +50,6 @@ struct PublicServer {
     billing_cycle: i64,
     currency: String,
     auto_renewal: bool,
-    public_remark: String,
     reset_day: i64,
     timestamp: Option<i64>,
     cpu: Option<f64>,
@@ -365,37 +364,24 @@ fn valid_ping_target(value: &str) -> bool {
         || raw.contains("://")
         || raw
             .chars()
-            .any(|character| character.is_whitespace() || "/@?#\\[]".contains(character))
-        || raw.matches(':').count() > 1
+            .any(|character| character.is_whitespace() || ":/@?#\\[]".contains(character))
     {
         return false;
     }
 
-    let (host, port) = raw
-        .split_once(':')
-        .map_or((raw, None), |(host, port)| (host, Some(port)));
-    if let Some(port) = port {
-        if port.is_empty()
-            || port.len() > 5
-            || !port.chars().all(|character| character.is_ascii_digit())
-            || port.parse::<u16>().ok().is_none_or(|port| port == 0)
-        {
-            return false;
-        }
-    }
-    if host.is_empty() || host.len() > 50 || host.starts_with('.') || host.ends_with('.') {
+    if raw.len() > 50 || raw.starts_with('.') || raw.ends_with('.') {
         return false;
     }
 
-    let labels = host.split('.').collect::<Vec<_>>();
+    let labels = raw.split('.').collect::<Vec<_>>();
     let ipv4_like = labels.len() == 4
         && labels
             .iter()
             .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()));
     if ipv4_like {
-        return host.parse::<Ipv4Addr>().is_ok_and(public_probe_ipv4);
+        return raw.parse::<Ipv4Addr>().is_ok_and(public_probe_ipv4);
     }
-    let lower = host.to_ascii_lowercase();
+    let lower = raw.to_ascii_lowercase();
     if labels.len() < 2
         || ["local", "localhost", "internal", "lan", "localdomain"]
             .iter()
@@ -482,13 +468,17 @@ fn validate_latency_task(input: &LatencyTaskInput) -> Option<&'static str> {
     }
     let target = input.target.trim();
     if target.is_empty() || !valid_ping_target(target) {
-        return Some("目标应为公网域名、公网 IPv4 或 TCP host:port");
+        return Some("目标应为公网域名或公网 IPv4");
     }
-    if input.task_type == "icmp" && target.contains(':') {
-        return Some("ICMP 目标不能包含端口");
+    if input.task_type == "tcp" {
+        if input.port.is_none_or(|port| !(1..=65535).contains(&port)) {
+            return Some("TCP 端口应为 1 至 65535");
+        }
+    } else if input.port.is_some() {
+        return Some("ICMP 检测不使用端口");
     }
     if !(30..=3600).contains(&input.interval_seconds) {
-        return Some("延迟测试间隔应为 30 至 3600 秒");
+        return Some("延迟检测间隔应为 30 至 3600 秒");
     }
     if input.server_ids.len() > 500
         || input
@@ -562,11 +552,8 @@ fn validate_server(input: &ServerInput) -> Option<&'static str> {
     if input.region.chars().count() > 16 || input.group_name.chars().count() > 40 {
         return Some("地区或分组字段过长");
     }
-    if input.tags.chars().count() > 240
-        || input.note.chars().count() > 1000
-        || input.public_remark.chars().count() > 1000
-    {
-        return Some("标签或备注字段过长");
+    if input.tags.chars().count() > 240 {
+        return Some("标签字段过长");
     }
     if input.traffic_limit < 0 {
         return Some("流量限额不能为负数");
@@ -734,7 +721,6 @@ fn public_server(server: ServerView, latency: Vec<latency::LatencySample>) -> Pu
         billing_cycle: server.billing_cycle,
         currency: server.currency,
         auto_renewal: server.auto_renewal != 0,
-        public_remark: server.public_remark,
         reset_day: server.reset_day,
         timestamp: server.timestamp,
         cpu: server.cpu,
@@ -912,17 +898,7 @@ async fn store_history_response(key: &str, response: &mut Response) {
 }
 
 fn request_turnstile_proof(req: &Request) -> Option<String> {
-    req.headers()
-        .get("X-Turnstile-Verified")
-        .ok()
-        .flatten()
-        .or_else(|| request_cookie(req, "nodeflare_turnstile"))
-        .or_else(|| {
-            req.url()
-                .ok()?
-                .query_pairs()
-                .find_map(|(key, value)| (key == "turnstile_verified").then(|| value.to_string()))
-        })
+    request_cookie(req, "nodeflare_turnstile")
 }
 
 fn server_id(path: &str, prefix: &str) -> Option<String> {
@@ -952,9 +928,6 @@ async fn handle_agent_report(
         Ok(value) => value,
         Err(_) => return error("指标格式无效", 400),
     };
-    if batch.server_id.is_empty() || batch.server_id.len() > 80 {
-        return error("节点 ID 无效", 400);
-    }
     if batch.samples.is_empty() || batch.samples.len() > MAX_AGENT_SAMPLES {
         return error("每批应包含 1 至 720 个样本", 400);
     }
@@ -967,11 +940,12 @@ async fn handle_agent_report(
             return error(message, 400);
         }
     }
-    let Some(row) = db::get_token_hash(database, &batch.server_id).await? else {
-        return error("节点不存在", 404);
-    };
-    if sha256_hex(&token) != row.token_hash {
+    let Some(identity) = db::get_agent_identity(database, &token).await? else {
         return error("探针凭据无效", 401);
+    };
+    let server_id = identity.id;
+    if let Some(ip) = client_ip(&req).and_then(|value| value.parse::<IpAddr>().ok()) {
+        db::update_last_ip(database, &server_id, &ip.to_string()).await?;
     }
     let latency_results = batch
         .samples
@@ -982,15 +956,15 @@ async fn handle_agent_report(
     if latency_results.len() > MAX_AGENT_LATENCY_RESULTS {
         return error("每批最多包含 4096 条延迟结果", 400);
     }
-    db::save_reports(database, &batch.server_id, &batch.samples).await?;
-    latency::save_results(database, &batch.server_id, &latency_results, received_at).await?;
+    db::save_reports(database, &server_id, &batch.samples).await?;
+    latency::save_results(database, &server_id, &latency_results, received_at).await?;
 
     let public_dashboard = db::get_setting(database, "public_dashboard")
         .await?
         .is_none_or(|value| value == "true");
-    if row.hidden == 0 && public_dashboard {
-        let server = db::get_server(database, &batch.server_id, false).await?;
-        let samples = latency::latest_for_server(database, &batch.server_id).await?;
+    if identity.hidden == 0 && public_dashboard {
+        let server = db::get_server(database, &server_id, false).await?;
+        let samples = latency::latest_for_server(database, &server_id).await?;
         let payload = server
             .map(|server| public_server(server, samples))
             .map(|server| {
@@ -1000,14 +974,14 @@ async fn handle_agent_report(
                 }))
             })
             .transpose()?;
-        let server_id = batch.server_id.clone();
+        let broadcast_server_id = server_id.clone();
         if let Some(payload) = payload {
             ctx.wait_until(async move {
-                let _ = live::broadcast(&env, &server_id, &payload).await;
+                let _ = live::broadcast(&env, &broadcast_server_id, &payload).await;
             });
         }
     }
-    let Some(config) = db::agent_config(database, &batch.server_id).await? else {
+    let Some(config) = db::agent_config(database, &server_id).await? else {
         return error("节点不存在", 404);
     };
     let config_json = serde_json::to_string(&config)?;
@@ -1058,7 +1032,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     let default_name = env_text(&env, "SITE_NAME", "NodeFlare");
     let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180).clamp(30, 3600);
     let default_retention = env_number(&env, "HISTORY_RETENTION_DAYS", 30).clamp(1, 365);
-    let default_username = env_text(&env, "ADMIN_USERNAME", "admin");
+    let default_username = env_text(&env, "ADMIN_USERNAME", "");
     let settings = db::settings(
         &database,
         &default_name,
@@ -1119,6 +1093,9 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     if method == Method::Post && path == "/api/admin/login" {
+        if settings.admin_username.trim().is_empty() {
+            return error("尚未配置 ADMIN_USERNAME", 503);
+        }
         if settings.admin_password_hash.is_empty() && env.secret("ADMIN_PASSWORD").is_err() {
             return error("尚未配置 ADMIN_PASSWORD", 503);
         }
@@ -1192,11 +1169,13 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         let Some(proof) = create_turnstile_proof(&env, &settings.admin_password_hash) else {
             return error("验证凭据签名失败", 503);
         };
-        let mut response = json(&serde_json::json!({ "verification": proof }), 200)?;
+        let secure = req.url().ok().is_some_and(|url| url.scheme() == "https");
+        let mut response = no_content()?;
         response.headers_mut().append(
             "Set-Cookie",
             &format!(
-                "nodeflare_turnstile={proof}; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Strict"
+                "nodeflare_turnstile={proof}; Path=/; Max-Age=3600; HttpOnly{}; SameSite=Strict",
+                if secure { "; Secure" } else { "" }
             ),
         )?;
         return Ok(response);
@@ -1218,9 +1197,11 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
         let rates = exchange::current(&database, now()).await?;
         let mut response = json(&rates, 200)?;
-        response
-            .headers_mut()
-            .set("Cache-Control", "public, max-age=300")?;
+        if settings.public_dashboard {
+            response
+                .headers_mut()
+                .set("Cache-Control", "public, max-age=300")?;
+        }
         return Ok(response);
     }
 
@@ -1273,19 +1254,27 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error("节点不存在", 404);
         }
         let hours = requested_hours(&req, 24 * 30)?;
-        let cache_key = history_cache_key(
-            &req.url()?,
-            "metrics",
-            &id,
-            hours,
-            settings.history_cache_version,
-        );
-        if let Some(response) = cached_history_response(&cache_key).await {
-            return Ok(response);
+        let cache_key = if settings.public_dashboard {
+            Some(history_cache_key(
+                &req.url()?,
+                "metrics",
+                &id,
+                hours,
+                settings.history_cache_version,
+            ))
+        } else {
+            None
+        };
+        if let Some(cache_key) = cache_key.as_deref() {
+            if let Some(response) = cached_history_response(cache_key).await {
+                return Ok(response);
+            }
         }
         let points = db::history(&database, &id, hours).await?;
         let mut response = json(&serde_json::json!({ "points": points }), 200)?;
-        store_history_response(&cache_key, &mut response).await;
+        if let Some(cache_key) = cache_key.as_deref() {
+            store_history_response(cache_key, &mut response).await;
+        }
         return Ok(response);
     }
 
@@ -1303,15 +1292,21 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error("节点不存在", 404);
         }
         let hours = requested_hours(&req, 24 * 365)?;
-        let cache_key = history_cache_key(
-            &req.url()?,
-            "latency",
-            &id,
-            hours,
-            settings.history_cache_version,
-        );
-        if let Some(response) = cached_history_response(&cache_key).await {
-            return Ok(response);
+        let cache_key = if settings.public_dashboard {
+            Some(history_cache_key(
+                &req.url()?,
+                "latency",
+                &id,
+                hours,
+                settings.history_cache_version,
+            ))
+        } else {
+            None
+        };
+        if let Some(cache_key) = cache_key.as_deref() {
+            if let Some(response) = cached_history_response(cache_key).await {
+                return Ok(response);
+            }
         }
         let tasks = latency::tasks_for_server(&database, &id).await?;
         let points = latency::history(&database, &id, hours).await?;
@@ -1319,12 +1314,14 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             &serde_json::json!({ "tasks": tasks, "points": points }),
             200,
         )?;
-        store_history_response(&cache_key, &mut response).await;
+        if let Some(cache_key) = cache_key.as_deref() {
+            store_history_response(cache_key, &mut response).await;
+        }
         return Ok(response);
     }
 
     if path.starts_with("/api/admin/") && !admin {
-        return error("登录已失效", 401);
+        return error("未授权", 401);
     }
 
     if method == Method::Get && path == "/api/admin/latency-tasks" {
@@ -1537,27 +1534,23 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         let id_source = namespace.unique_id()?.to_string();
         let id = id_source.chars().take(16).collect::<String>();
         let token = namespace.unique_id()?.to_string();
-        db::create_server(&database, &id, &sha256_hex(&token), &input).await?;
+        db::create_server(&database, &id, &token, &input).await?;
         latency::assign_defaults(&database, &id).await?;
         return json(&serde_json::json!({ "id": id, "agent_token": token }), 201);
     }
 
-    if method == Method::Post && path.starts_with("/api/admin/servers/") && path.ends_with("/token")
+    if method == Method::Get && path.starts_with("/api/admin/servers/") && path.ends_with("/token")
     {
-        let raw_id = path
+        let id = path
             .strip_prefix("/api/admin/servers/")
             .and_then(|value| value.strip_suffix("/token"))
-            .unwrap_or("")
-            .trim_matches('/');
-        if raw_id.is_empty() || raw_id.contains('/') || raw_id.len() > 80 {
+            .unwrap_or_default();
+        if id.is_empty() || id.contains('/') || id.len() > 80 {
             return error("节点 ID 无效", 400);
         }
-        let namespace = env.durable_object("LIVE_HUB")?;
-        let token = namespace.unique_id()?.to_string();
-        return if db::update_token(&database, raw_id, &sha256_hex(&token)).await? {
-            json(&serde_json::json!({ "agent_token": token }), 200)
-        } else {
-            error("节点不存在", 404)
+        return match db::get_agent_token(&database, id).await? {
+            Some(token) => json(&serde_json::json!({ "agent_token": token }), 200),
+            None => error("节点不存在", 404),
         };
     }
 
@@ -2061,7 +2054,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let default_name = env_text(&env, "SITE_NAME", "NodeFlare");
     let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180).clamp(30, 3600);
     let default_retention = env_number(&env, "HISTORY_RETENTION_DAYS", 30).clamp(1, 365);
-    let default_username = env_text(&env, "ADMIN_USERNAME", "admin");
+    let default_username = env_text(&env, "ADMIN_USERNAME", "");
     let settings = db::settings(
         &database,
         &default_name,
@@ -2160,11 +2153,7 @@ mod tests {
 
     #[test]
     fn validates_latency_targets() {
-        for target in [
-            "gd-ct-dualstack.ip.zstaticcdn.com",
-            "1.1.1.1",
-            "example.com:443",
-        ] {
+        for target in ["gd-ct-dualstack.ip.zstaticcdn.com", "1.1.1.1"] {
             assert!(valid_ping_target(target), "expected valid target: {target}");
         }
 
@@ -2172,6 +2161,7 @@ mod tests {
             "",
             "https://example.com",
             "example.com/path",
+            "example.com:443",
             "example.com:0",
             "example.com:65536",
             "example.com:abc",
@@ -2206,7 +2196,8 @@ mod tests {
         let mut task = LatencyTaskInput {
             name: "Cloudflare TCP".to_string(),
             task_type: "tcp".to_string(),
-            target: "1.1.1.1:443".to_string(),
+            target: "1.1.1.1".to_string(),
+            port: Some(443),
             interval_seconds: 60,
             default_enabled: false,
             server_ids: vec!["node-a".to_string()],
@@ -2214,8 +2205,8 @@ mod tests {
         assert_eq!(validate_latency_task(&task), None);
 
         task.task_type = "icmp".to_string();
-        assert_eq!(validate_latency_task(&task), Some("ICMP 目标不能包含端口"));
-        task.target = "1.1.1.1".to_string();
+        assert_eq!(validate_latency_task(&task), Some("ICMP 检测不使用端口"));
+        task.port = None;
         task.server_ids.clear();
         assert_eq!(
             validate_latency_task(&task),

@@ -346,10 +346,8 @@ label > span { color: var(--muted-foreground); font-size: 9px; }
 .theme-card-main a span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .theme-card-actions { display: flex; align-items: center; gap: 5px; }
 .theme-active-btn { display: inline-flex; min-height: 30px; align-items: center; gap: 4px; border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border)); border-radius: 6px; padding: 0 9px; color: var(--primary); background: color-mix(in srgb, var(--primary) 8%, transparent); font-size: 11px; font-weight: 600; }
-.theme-risk-note { border-left: 3px solid var(--warning); padding: 7px 10px; color: var(--muted-foreground); background: color-mix(in srgb, var(--warning) 7%, transparent); font-size: 11px; line-height: 1.5; }
 .theme-add-form code { border-radius: 3px; padding: 1px 3px; color: var(--foreground); background: color-mix(in srgb, var(--foreground) 8%, transparent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
 .theme-option-grid { display: grid; align-items: start; gap: 12px; grid-template-columns: 1fr 1fr; }
-.theme-option-empty { display: grid; min-height: 74px; place-items: center; border: 1px dashed var(--border); border-radius: 7px; color: var(--muted-foreground); font-size: 10px; }
 .theme-color-option input { width: 100%; min-height: 40px; padding: 4px; cursor: pointer; }
 .editor-modal, .install-modal { width: min(740px, 100%); max-height: calc(100vh - 48px); overflow: auto; border-radius: 8px; padding: 18px; background: var(--card-solid); }
 .editor-modal > header, .install-modal > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 2px; }
@@ -582,9 +580,7 @@ label > span { color: var(--muted-foreground); font-size: 9px; }
 .admin-page .theme-card-main p { color: var(--admin-muted); }
 .admin-page .theme-card-main a { color: var(--admin-accent); }
 .admin-page .theme-active-btn { border-color: var(--admin-accent-border); color: var(--admin-accent); background: var(--admin-active-bg); }
-.admin-page .theme-risk-note { color: var(--admin-muted); }
 .admin-page .theme-option-grid > .toggle-row { min-height: 40px; align-self: end; padding-block: 7px; }
-.theme-option-empty { color: var(--admin-muted); font-size: 13px; }
 .editor-modal, .install-modal, .latency-editor { border: 1px solid var(--admin-border); color: var(--admin-text); background: var(--admin-surface); }
 .editor-modal, .install-modal { padding: 22px; }
 .editor-modal h3, .install-modal h3, .latency-editor h3 { color: var(--admin-text); font-size: 18px; }

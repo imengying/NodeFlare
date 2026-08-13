@@ -10,7 +10,7 @@ export const demoConfig: Config = {
   offline_threshold_seconds: 180,
   history_retention_days: 30,
   default_theme: "system",
-  active_theme_id: "builtin-komari-glass",
+  active_theme_id: "builtin-nodeflare-glass",
   background_url: "",
   theme_options: {},
   show_search: true,
@@ -54,9 +54,9 @@ export const demoExchangeRates: ExchangeRates = {
 const now = Math.floor(Date.now() / 1000);
 
 export const demoLatencyTasks: LatencyTestPoint[] = [
-  { id: "demo-hk", name: "香港 TCP", task_type: "tcp", target: "hk.example.com:443", interval_seconds: 60 },
-  { id: "demo-tokyo", name: "东京 ICMP", task_type: "icmp", target: "tokyo.example.com", interval_seconds: 60 },
-  { id: "demo-sg", name: "新加坡 TCP", task_type: "tcp", target: "sg.example.com:443", interval_seconds: 60 },
+  { id: "demo-hk", name: "香港 TCP", task_type: "tcp", target: "hk.example.com", port: 443, interval_seconds: 60 },
+  { id: "demo-tokyo", name: "东京 ICMP", task_type: "icmp", target: "tokyo.example.com", port: null, interval_seconds: 60 },
+  { id: "demo-sg", name: "新加坡 TCP", task_type: "tcp", target: "sg.example.com", port: 443, interval_seconds: 60 },
 ];
 
 function demoLatestLatency(serverId: string): LatencySample[] {
@@ -66,6 +66,7 @@ function demoLatestLatency(serverId: string): LatencySample[] {
     name: task.name,
     task_type: task.task_type,
     target: task.target,
+    port: task.port,
     timestamp: now - 12,
     latency_ms: 38 + index * 7,
     packet_loss: index === 1 ? 0.4 : 0,
@@ -85,7 +86,6 @@ const baseServer: Server = {
   billing_cycle: 30,
   currency: "CNY",
   auto_renewal: false,
-  public_remark: "",
   reset_day: 1,
   timestamp: now - 12,
   cpu: 24,
@@ -192,6 +192,7 @@ export function demoLatencyHistory(serverId: string, hours: number): LatencySamp
       name: task.name,
       task_type: task.task_type,
       target: task.target,
+      port: task.port,
       timestamp: now - (count - index - 1) * step,
       latency_ms: 38 + taskIndex * 7 + wave * (4 + taskIndex),
       packet_loss: (index + taskIndex * 9) % 37 === 0 ? 2 + taskIndex : 0,

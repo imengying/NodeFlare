@@ -56,6 +56,7 @@ function tasksFromSamples(points: LatencySample[]): LatencyTestPoint[] {
     name: point.name,
     task_type: point.task_type,
     target: point.target,
+    port: point.port,
     interval_seconds: 60,
   }])).values());
 }

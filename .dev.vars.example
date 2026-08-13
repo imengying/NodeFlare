@@ -1,4 +1,4 @@
-ADMIN_USERNAME=admin
+ADMIN_USERNAME=change-this-local-username
 ADMIN_PASSWORD=change-this-local-password
 # Optional: configure Turnstile through Worker variables instead of the admin panel.
 # TURNSTILE_SITE_KEY=your-site-key

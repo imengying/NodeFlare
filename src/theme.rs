@@ -2,8 +2,8 @@ use futures_util::TryStreamExt;
 use serde_json::Value;
 use worker::{Error, Fetch, Method, Request, Response, Result, Url};
 
-pub const BUILTIN_THEME_ID: &str = "builtin-komari-glass";
-pub const BUILTIN_THEME_NAME: &str = "Komari Glass";
+pub const BUILTIN_THEME_ID: &str = "builtin-nodeflare-glass";
+pub const BUILTIN_THEME_NAME: &str = "NodeFlare Glass";
 pub const INDEX_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const ASSET_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SETTINGS_MAX_BYTES: usize = 64 * 1024;

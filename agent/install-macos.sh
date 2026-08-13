@@ -27,7 +27,7 @@ if [ "${1:-}" = "--status" ]; then
 fi
 
 [ "${1:-}" != "-h" ] && [ "${1:-}" != "--help" ] && [ "$#" -gt 0 ] || {
-  echo "Usage: install-macos.sh -e ENDPOINT -t TOKEN -s SERVER_ID [-i 60]"
+  echo "Usage: install-macos.sh -e ENDPOINT -t TOKEN [-i 60]"
   echo "       install-macos.sh --uninstall|--status"
   exit 0
 }
@@ -35,7 +35,6 @@ fi
 [ "$(uname -m)" = "arm64" ] || { echo "Only Apple Silicon (arm64) is supported" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 command -v shasum >/dev/null || { echo "shasum is required" >&2; exit 1; }
-server_id=""
 token=""
 endpoint=""
 interval=60
@@ -43,7 +42,7 @@ interval_set=false
 while [ "$#" -gt 0 ]; do
   option="$1"
   case "$option" in
-    -s|-t|-e|-i)
+    -t|-e|-i)
       [ "$#" -ge 2 ] || { echo "Missing value for $option" >&2; exit 1; }
       value="$2"
       shift 2
@@ -51,16 +50,15 @@ while [ "$#" -gt 0 ]; do
     *) echo "Unknown argument: $option" >&2; exit 1 ;;
   esac
   case "$option" in
-    -s) [ -z "$server_id" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; server_id="$value" ;;
     -t) [ -z "$token" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; token="$value" ;;
     -e) [ -z "$endpoint" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; endpoint="$value" ;;
     -i) [ "$interval_set" = false ] || { echo "Duplicate argument: $option" >&2; exit 1; }; interval="$value"; interval_set=true ;;
   esac
 done
-[ -n "$server_id" ] && [ -n "$token" ] && [ -n "$endpoint" ] || { echo "Missing required argument" >&2; exit 1; }
+[ -n "$token" ] && [ -n "$endpoint" ] || { echo "Missing required argument" >&2; exit 1; }
 endpoint=${endpoint%/}
-[ ${#server_id} -le 160 ] && [ ${#token} -le 512 ] && [ ${#endpoint} -le 2048 ] || { echo "Install argument is too long" >&2; exit 1; }
-safe_value "$server_id" && safe_value "$token" && safe_value "$endpoint" || { echo "Invalid argument" >&2; exit 1; }
+[ ${#token} -le 512 ] && [ ${#endpoint} -le 2048 ] || { echo "Install argument is too long" >&2; exit 1; }
+safe_value "$token" && safe_value "$endpoint" || { echo "Invalid argument" >&2; exit 1; }
 case "$endpoint" in
   https://?*|http://localhost|http://localhost/*|http://localhost:*|http://127.0.0.1|http://127.0.0.1/*|http://127.0.0.1:*) ;;
   *) echo "Worker URL must use HTTPS; HTTP is only allowed for loopback development" >&2; exit 1 ;;
@@ -117,7 +115,7 @@ cat > "$PLIST_FILE" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>$LABEL</string>
-<key>ProgramArguments</key><array><string>$AGENT_FILE</string><string>-e</string><string>$endpoint</string><string>-t</string><string>$token</string><string>-s</string><string>$server_id</string><string>-i</string><string>$interval</string></array>
+<key>ProgramArguments</key><array><string>$AGENT_FILE</string><string>-e</string><string>$endpoint</string><string>-t</string><string>$token</string><string>-i</string><string>$interval</string></array>
 <key>KeepAlive</key><true/><key>RunAtLoad</key><true/>
 <key>StandardOutPath</key><string>/var/log/nodeflare-agent.log</string>
 <key>StandardErrorPath</key><string>/var/log/nodeflare-agent.log</string>

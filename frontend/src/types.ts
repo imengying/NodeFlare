@@ -103,6 +103,7 @@ export interface LatencySample {
   name: string;
   task_type: "tcp" | "icmp";
   target: string;
+  port: number | null;
   timestamp: number;
   latency_ms: number;
   packet_loss: number;
@@ -113,6 +114,7 @@ export interface LatencyTestPoint {
   name: string;
   task_type: "tcp" | "icmp";
   target: string;
+  port: number | null;
   interval_seconds: number;
 }
 
@@ -121,12 +123,13 @@ export interface LatencyTask {
   name: string;
   task_type: "tcp" | "icmp";
   target: string;
+  port: number | null;
   interval_seconds: number;
   default_enabled: boolean;
   server_ids: string[];
 }
 
-export type LatencyTaskInput = Pick<LatencyTask, "name" | "task_type" | "target" | "interval_seconds" | "default_enabled" | "server_ids">;
+export type LatencyTaskInput = Pick<LatencyTask, "name" | "task_type" | "target" | "port" | "interval_seconds" | "default_enabled" | "server_ids">;
 
 interface ServerSummary {
   id: string;
@@ -141,7 +144,6 @@ interface ServerSummary {
   billing_cycle: number;
   currency: string;
   auto_renewal: boolean;
-  public_remark: string;
   reset_day: number;
   timestamp: number | null;
   cpu: number | null;
@@ -186,8 +188,8 @@ export interface Server extends ServerSummary {
 }
 
 export interface AdminServer extends ServerSummary {
-  note: string;
   hidden: boolean;
+  last_ip: string;
   network_interface: string;
   report_interval: number;
   collect_interval: number;
@@ -230,7 +232,6 @@ export interface ServerInput {
   region: string;
   group_name: string;
   tags: string;
-  note: string;
   hidden: boolean;
   expires_at: number | null;
   traffic_limit: number;
@@ -239,7 +240,6 @@ export interface ServerInput {
   billing_cycle: number;
   currency: string;
   auto_renewal: boolean;
-  public_remark: string;
   network_interface: string;
   reset_day: number;
   report_interval: number;
@@ -300,10 +300,4 @@ interface CloudflareUsagePeriod {
 export interface CloudflareUsage {
   today: CloudflareUsagePeriod;
   yesterday: CloudflareUsagePeriod;
-}
-
-export interface AgentInstallTarget {
-  id: string;
-  name: string;
-  agent_token: string;
 }

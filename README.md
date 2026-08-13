@@ -5,15 +5,15 @@
 ## 能力
 
 - 采集 CPU、GPU、负载、内存、磁盘、网络、连接数、进程和系统信息
-- TCP/ICMP 延迟监测，可按节点分配测试点和周期
-- Komari-Glass 风格总览、节点卡片、搜索/分组筛选、响应式深浅主题
+- TCP/ICMP 延迟检测，可按节点分配测试点和周期
+- NodeFlare Glass 风格总览、节点卡片、搜索/分组筛选、响应式深浅主题
 - 节点详情与历史图表，支持实时、1/4/24/168/720 小时范围
 - WebSocket 实时刷新，断线后自动轮询
 - 计费、到期、流量和多币种资产统计，Worker 每日更新汇率
-- 用户名密码登录、Cloudflare Turnstile、节点隐藏和公开备注
-- 节点管理、批量删除、拖拽排序、Agent 密钥轮换和在线配置
+- 用户名密码登录、Cloudflare Turnstile 和节点隐藏
+- 节点管理、批量删除、拖拽排序和 Agent 在线配置
 - Telegram 通知、资源告警、离线/到期提醒和数据维护
-- 内置 Komari Glass 主题，并提供远程主题商店
+- 内置 NodeFlare Glass 主题，并提供远程主题商店
 - 远程主题仅支持 GitHub `tree` 地址，Worker 代理 `index.html` 与 `assets/`
 - Rust Agent 支持 Linux x86_64/ARM64、Windows x86_64 和 macOS ARM64，可按节点自动更新
 
@@ -25,7 +25,7 @@
 
 | 变量 | 必填/可选 | 说明 |
 | --- | ---: | --- |
-| `ADMIN_USERNAME` | 可选 | 管理员登录用户名，未设置时使用 `admin` |
+| `ADMIN_USERNAME` | 必填 | 管理员登录用户名，不提供默认值 |
 | `ADMIN_PASSWORD` | 首次部署必填 | 初始管理员密码，勾选“加密”；后台保存密码哈希后可删除该变量 |
 | `SITE_NAME` | 可选 | 站点名称，未设置时使用 `NodeFlare` |
 | `TURNSTILE_SITE_KEY` | 可选 | Turnstile Site Key，无需加密；也可在后台设置 |
@@ -48,13 +48,13 @@
 | `POST` | `/api/agent/report` | 探针上报，节点 Bearer token |
 | `POST` | `/api/admin/login` | 管理登录 |
 | `GET/POST` | `/api/admin/servers` | 管理节点 |
+| `GET` | `/api/admin/servers/:id/token` | 读取节点 Agent Token |
 | `GET/POST` | `/api/admin/latency-tasks` | 查询或创建延迟任务 |
 | `PATCH/DELETE` | `/api/admin/latency-tasks/:id` | 编辑或删除延迟任务 |
 | `GET/POST` | `/api/admin/alert-rules` | 查询或创建资源告警规则 |
 | `PATCH/DELETE` | `/api/admin/alert-rules/:id` | 编辑或删除资源告警规则 |
 | `PATCH/DELETE` | `/api/admin/servers/:id` | 编辑或删除节点 |
 | `PATCH` | `/api/admin/servers/order` | 更新全部节点顺序 |
-| `POST` | `/api/admin/servers/:id/token` | 轮换探针密钥 |
 | `DELETE` | `/api/admin/servers` | 批量删除节点 |
 | `GET/PATCH` | `/api/admin/settings` | 读写站点与展示设置 |
 | `GET/POST` | `/api/admin/themes` | 查询或添加主题 |
