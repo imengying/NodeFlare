@@ -12,7 +12,7 @@ usage() {
 NodeFlare Agent 安装脚本
 
 用法：
-  agent.sh -e <Worker URL> -t <Agent Token> [-i <上报间隔>]
+  agent.sh -e <Worker URL> -t <Agent Token> [-i <上报间隔>] [-m <下载加速前缀>]
   agent.sh --status
   agent.sh --uninstall
 
@@ -20,6 +20,8 @@ NodeFlare Agent 安装脚本
   -e  NodeFlare Worker 地址（必填）
   -t  后台生成的 Agent Token（必填，请勿泄露）
   -i  初始上报间隔，15-3600 秒（默认 60）
+  -m  GitHub 下载加速前缀（可选，仅作用于 Release 下载；
+      形如 https://ghproxy.net，脚本会自动拼接完整地址，摘要校验不受影响）
 EOF
 }
 
@@ -88,10 +90,11 @@ install_agent() {
   endpoint=""
   interval=60
   interval_set=false
+  mirror=""
   while [ "$#" -gt 0 ]; do
     option="$1"
     case "$option" in
-      -t|-e|-i)
+      -t|-e|-i|-m)
         [ "$#" -ge 2 ] || { echo "参数 $option 缺少值" >&2; usage; exit 1; }
         value="$2"
         shift 2
@@ -102,6 +105,7 @@ install_agent() {
       -t) [ -z "$token" ] || fail "参数 $option 重复"; token="$value" ;;
       -e) [ -z "$endpoint" ] || fail "参数 $option 重复"; endpoint="$value" ;;
       -i) [ "$interval_set" = false ] || fail "参数 $option 重复"; interval="$value"; interval_set=true ;;
+      -m) [ -z "$mirror" ] || fail "参数 $option 重复"; mirror="$value" ;;
     esac
   done
   [ -n "$token" ] && [ -n "$endpoint" ] || { usage; exit 1; }
@@ -115,6 +119,17 @@ install_agent() {
   case "$endpoint" in *@*) fail "Worker 地址不能包含用户信息" ;; esac
   case "$interval" in ''|*[!0-9]*) fail "上报间隔必须是整数" ;; esac
   [ "$interval" -ge 15 ] && [ "$interval" -le 3600 ] || fail "上报间隔必须在 15-3600 秒之间"
+  mirror=${mirror%/}
+  if [ -n "$mirror" ]; then
+    [ ${#mirror} -le 2048 ] || fail "下载加速前缀长度超出限制"
+    safe_value "$mirror" || fail "下载加速前缀格式无效"
+    case "$mirror" in
+      https://?*) ;;
+      http://localhost|http://localhost/*|http://localhost:*|http://127.0.0.1|http://127.0.0.1/*|http://127.0.0.1:*) ;;
+      *) fail "下载加速前缀必须使用 HTTPS；仅本机调试可使用 HTTP" ;;
+    esac
+    case "$mirror" in *@*) fail "下载加速前缀不能包含用户信息" ;; esac
+  fi
   case "$(uname -m)" in x86_64|amd64) arch="x86_64" ;; aarch64|arm64) arch="aarch64" ;; *) fail "暂不支持当前 CPU 架构：$(uname -m)" ;; esac
   init_system=$(detect_init_system)
   [ "$init_system" != "unknown" ] || fail "未检测到正在运行的 systemd 或 OpenRC"
@@ -153,9 +168,15 @@ install_agent() {
   ')
   [ -n "$expected" ] || fail "Release 缺少 $artifact 的 SHA-256 摘要"
   release_base="https://github.com/imengying/NodeFlare/releases/download/$release_tag"
-  log "正在下载 NodeFlare Agent $release_tag"
+  download_url="$release_base/$artifact"
+  if [ -n "$mirror" ]; then
+    download_url="$mirror/$release_base/$artifact"
+    log "正在通过下载加速前缀拉取 Agent $release_tag"
+  else
+    log "正在下载 NodeFlare Agent $release_tag"
+  fi
   curl --fail --location --silent --show-error --max-time 120 \
-    "$release_base/$artifact" \
+    "$download_url" \
     -o "$temporary"
   actual=$(sha256sum "$temporary" | awk '{ print $1 }')
   [ -n "$expected" ] && [ "$actual" = "$expected" ] || fail "Agent SHA-256 校验失败，已停止安装"

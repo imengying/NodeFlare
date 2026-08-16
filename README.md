@@ -46,8 +46,9 @@
 | `GET` | `/api/latency/:id?hours=24` | 节点延迟任务历史 |
 | `GET` | `/api/ws` | 实时 WebSocket |
 | `GET` | `/api/agent/live` | Agent 实时指标 WebSocket |
-| `POST` | `/api/agent/report` | 探针上报，节点 Bearer token |
+| `POST` | `/api/agent/report` | Agent 上报，节点 Bearer Token |
 | `POST` | `/api/admin/login` | 管理登录 |
+| `POST` | `/api/admin/logout` | 退出登录（清除会话 Cookie） |
 | `GET/POST` | `/api/admin/servers` | 管理节点 |
 | `GET` | `/api/admin/servers/:id/token` | 读取节点 Agent Token |
 | `GET/POST` | `/api/admin/latency-tasks` | 查询或创建延迟任务 |

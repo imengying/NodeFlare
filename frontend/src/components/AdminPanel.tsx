@@ -31,7 +31,7 @@ import {
 } from "lucide-react";
 import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { ADMIN_UNAUTHORIZED_EVENT, api, ApiError, getToken, setToken } from "../api";
-import { formatBytes, isOnline } from "../format";
+import { isOnline } from "../format";
 import { derivePassword } from "../password";
 import { ASSET_CURRENCIES, type AdminServer, type CloudflareUsage, type Config, type DatabaseStats, type ExchangeRates, type ServerInput, type Settings, type Theme, type ThemeSettingField, type ThemeSettingsSchema, type ThemeSettingValue } from "../types";
 import { Checkbox } from "./Checkbox";
@@ -46,6 +46,7 @@ interface AgentInstallTarget {
   id: string;
   name: string;
   agent_token: string;
+  agent_mirror: string;
 }
 
 const adminPages: Record<AdminTab, { title: string; description: string }> = {
@@ -79,6 +80,7 @@ const emptyServer: ServerInput = {
   collect_interval: 5,
   rx_correction: 0,
   tx_correction: 0,
+  agent_mirror: "",
   offline_notify_disabled: false,
   auto_update: true,
 };
@@ -104,6 +106,7 @@ function toInput(server: AdminServer): ServerInput {
     collect_interval: server.collect_interval,
     rx_correction: server.rx_correction,
     tx_correction: server.tx_correction,
+    agent_mirror: server.agent_mirror,
     offline_notify_disabled: server.offline_notify_disabled,
     auto_update: server.auto_update,
   };
@@ -243,7 +246,7 @@ export function AdminPanel({
     try {
       if (editing === "new") {
         const result = await api.createServer(form);
-        setInstall([{ id: result.id, name: form.name, agent_token: result.agent_token }]);
+        setInstall([{ id: result.id, name: form.name, agent_token: result.agent_token, agent_mirror: form.agent_mirror }]);
       } else if (editing) {
         await api.updateServer(editing.id, form);
       }
@@ -278,7 +281,7 @@ export function AdminPanel({
     setError("");
     try {
       const { agent_token } = await api.serverToken(server.id);
-      setInstall([{ id: server.id, name: server.name, agent_token }]);
+      setInstall([{ id: server.id, name: server.name, agent_token, agent_mirror: server.agent_mirror }]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "读取 Agent Token 失败");
     } finally {
@@ -288,7 +291,10 @@ export function AdminPanel({
 
   async function copyInstallCommands() {
     try {
-      await navigator.clipboard.writeText(commands.map((item) => `# ${item.name}\n${item.command}`).join("\n\n"));
+      const text = commands.length === 1
+        ? commands[0].command
+        : commands.map((item) => `# ${item.name.replace(/\s+/g, " ").trim() || item.id}\n${item.command}`).join("\n\n");
+      await navigator.clipboard.writeText(text);
     } catch {
       setError("复制失败，请手动选择命令复制");
     }
@@ -464,21 +470,24 @@ export function AdminPanel({
   const commands = useMemo(() => install.map((server) => {
     const origin = window.location.origin;
     const installer = "https://raw.githubusercontent.com/imengying/NodeFlare/main/agent";
+    const mirror = server.agent_mirror.trim().replace(/\/+$/, "");
+    const shellMirror = mirror ? ` -m ${shellLiteral(mirror)}` : "";
+    const powershellMirror = mirror ? ` -Mirror ${powershellLiteral(mirror)}` : "";
     if (installPlatform === "windows") {
       return {
         ...server,
-        command: `Invoke-WebRequest -Uri "${installer}/install.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" -e ${powershellLiteral(origin)} -t ${powershellLiteral(server.agent_token)}`,
+        command: `Invoke-WebRequest -Uri "${installer}/install.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" -e ${powershellLiteral(origin)} -t ${powershellLiteral(server.agent_token)}${powershellMirror}`,
       };
     }
     if (installPlatform === "macos") {
       return {
         ...server,
-        command: `curl -fsSL ${installer}/install-macos.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}`,
+        command: `curl -fsSL ${installer}/install-macos.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}${shellMirror}`,
       };
     }
     return {
       ...server,
-      command: `curl -fsSL ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}`,
+      command: `curl -fsSL ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}${shellMirror}`,
     };
   }), [install, installPlatform]);
 
@@ -518,9 +527,9 @@ export function AdminPanel({
             <strong>{config.site_name}</strong>
           </div>
           <div className="admin-topbar-actions">
-            <button type="button" onClick={onToggleTheme} title={dark ? "切换浅色主题" : "切换深色主题"}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
-            <button type="button" onClick={onClose}><ArrowLeft size={17} />返回前台</button>
-            <button type="button" onClick={() => void logout()}><LogOut size={17} />退出登录</button>
+            <button type="button" onClick={onToggleTheme} title={dark ? "切换浅色主题" : "切换深色主题"} aria-label={dark ? "切换浅色主题" : "切换深色主题"}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
+            <button type="button" onClick={onClose} title="返回前台" aria-label="返回前台"><ArrowLeft size={17} />返回前台</button>
+            <button type="button" onClick={() => void logout()} title="退出登录" aria-label="退出登录"><LogOut size={17} />退出登录</button>
           </div>
         </header>
 
@@ -551,7 +560,6 @@ export function AdminPanel({
                         <Checkbox checked={selectedIds.includes(server.id)} onChange={() => toggleSelected(server.id)} ariaLabel={`选择 ${server.name}`} />
                         <span className={`status-dot ${settings && isOnline(server, settings.offline_threshold_seconds) ? "online" : ""}`} />
                         <div className="server-name"><strong>{server.name}</strong><small>{server.group_name} · {server.region || "未设置地区"} · {server.last_ip || "尚未上报 IP"} · {server.agent_version ? `Agent v${server.agent_version}` : "Agent 未上报版本"} · {server.report_interval}s</small></div>
-                        <span className="server-usage">{server.traffic_limit > 0 ? formatBytes(server.traffic_limit) : "不限流量"}</span>
                         <div className="row-actions"><button className="icon-btn" disabled={index === 0} onClick={() => void move(index, -1)} title="上移"><ChevronUp size={15} /></button><button className="icon-btn" disabled={index === servers.length - 1} onClick={() => void move(index, 1)} title="下移"><ChevronDown size={15} /></button><button className="icon-btn" disabled={busy} onClick={() => void showInstallCommand(server)} title="显示安装命令"><Download size={15} /></button><button className="icon-btn" onClick={() => openEditor(server)} title="编辑节点"><Pencil size={15} /></button><button className="icon-btn danger" onClick={() => void remove(server)} title="删除节点"><Trash2 size={15} /></button></div>
                       </div>
                     ))}
@@ -604,7 +612,7 @@ export function AdminPanel({
                     <p className="settings-hint">背景图可用 | 分隔浅色和深色地址，例如 light.jpg|dark.jpg。</p>
                     <div className="section-subtitle">当前主题选项</div><div className="theme-option-grid"><Toggle label="公开仪表盘" checked={settings.public_dashboard} onChange={(value) => updateSettings("public_dashboard", value)} />{themeSettingsSchema?.settings.map((field) => <ThemeOption key={field.key} field={field} value={settings.theme_options[field.key] ?? field.default} onChange={(value) => updateThemeOption(field.key, value)} />)}</div>
                     <div className="section-subtitle">公开界面元素</div>
-                    <div className="settings-toggles"><Toggle label="显示搜索" checked={settings.show_search} onChange={(value) => updateSettings("show_search", value)} /><Toggle label="显示分组" checked={settings.show_groups} onChange={(value) => updateSettings("show_groups", value)} /><Toggle label="总览统计" checked={settings.show_stats} onChange={(value) => updateSettings("show_stats", value)} /><Toggle label="在线资产" checked={settings.show_assets} onChange={(value) => updateSettings("show_assets", value)} /><Toggle label="累计流量" checked={settings.show_traffic} onChange={(value) => updateSettings("show_traffic", value)} /><Toggle label="实时网速" checked={settings.show_speed} onChange={(value) => updateSettings("show_speed", value)} /><Toggle label="价格信息" checked={settings.show_price} onChange={(value) => updateSettings("show_price", value)} /><Toggle label="到期信息" checked={settings.show_expiry} onChange={(value) => updateSettings("show_expiry", value)} /><Toggle label="延迟与丢包" checked={settings.show_latency} onChange={(value) => updateSettings("show_latency", value)} /><Toggle label="在线时长" checked={settings.show_uptime} onChange={(value) => updateSettings("show_uptime", value)} /></div>
+                    <div className="settings-toggles"><Toggle label="显示搜索" checked={settings.show_search} onChange={(value) => updateSettings("show_search", value)} /><Toggle label="显示分组" checked={settings.show_groups} onChange={(value) => updateSettings("show_groups", value)} /><Toggle label="总览统计" checked={settings.show_stats} onChange={(value) => updateSettings("show_stats", value)} /><Toggle label="资产统计" checked={settings.show_assets} onChange={(value) => updateSettings("show_assets", value)} /><Toggle label="累计流量" checked={settings.show_traffic} onChange={(value) => updateSettings("show_traffic", value)} /><Toggle label="实时网速" checked={settings.show_speed} onChange={(value) => updateSettings("show_speed", value)} /><Toggle label="价格信息" checked={settings.show_price} onChange={(value) => updateSettings("show_price", value)} /><Toggle label="到期信息" checked={settings.show_expiry} onChange={(value) => updateSettings("show_expiry", value)} /><Toggle label="延迟与丢包" checked={settings.show_latency} onChange={(value) => updateSettings("show_latency", value)} /><Toggle label="在线时长" checked={settings.show_uptime} onChange={(value) => updateSettings("show_uptime", value)} /></div>
                   </> : null}
 
                   {tab === "alerts" ? <>
@@ -655,7 +663,7 @@ export function AdminPanel({
         <div className="form-grid three"><label><span>流量限额（GB）</span><input min="0" type="number" value={Math.round(form.traffic_limit / 1024 ** 3)} onChange={(event) => updateForm("traffic_limit", Number(event.target.value) * 1024 ** 3)} /></label><label><span>流量口径</span><select value={form.traffic_limit_type} onChange={(event) => updateForm("traffic_limit_type", event.target.value as ServerInput["traffic_limit_type"])}><option value="sum">上下行合计</option><option value="max">取较大值</option><option value="min">取较小值</option><option value="up">仅上行</option><option value="down">仅下行</option></select></label><label><span>流量重置日</span><input min="1" max="31" type="number" value={form.reset_day} onChange={(event) => updateForm("reset_day", Number(event.target.value))} /></label></div>
         <div className="form-grid three"><label><span>价格（0 隐藏，-1 免费）</span><input min="-1" step="0.01" type="number" value={form.price} onChange={(event) => updateForm("price", Number(event.target.value))} /></label><label><span>币种</span><select value={form.currency} onChange={(event) => updateForm("currency", event.target.value)}>{ASSET_CURRENCIES.map((code) => <option key={code}>{code}</option>)}</select></label><label><span>计费周期（天）</span><input min="1" max="3650" type="number" value={form.billing_cycle} onChange={(event) => updateForm("billing_cycle", Number(event.target.value))} /></label></div>
         <div className="form-grid three"><label><span>到期日期</span><input type="date" value={formatDate(form.expires_at)} onChange={(event) => updateForm("expires_at", event.target.value ? Math.floor(new Date(`${event.target.value}T00:00:00Z`).getTime() / 1000) : null)} /></label><label><span>Agent 上报间隔（秒）</span><input min="15" max="3600" type="number" value={form.report_interval} onChange={(event) => updateForm("report_interval", Number(event.target.value))} /></label><label><span>指标采样间隔（秒）</span><input min="2" max="60" type="number" value={form.collect_interval} onChange={(event) => updateForm("collect_interval", Number(event.target.value))} /></label></div>
-        <div className="form-grid"><label><span>统计网卡（逗号分隔，留空自动）</span><input value={form.network_interface} onChange={(event) => updateForm("network_interface", event.target.value)} placeholder="eth0,ens3" /></label><label><span>下行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.rx_correction / 1024 ** 3} onChange={(event) => updateForm("rx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label><label><span>上行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.tx_correction / 1024 ** 3} onChange={(event) => updateForm("tx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label></div>
+        <div className="form-grid"><label><span>统计网卡（逗号分隔，留空自动）</span><input value={form.network_interface} onChange={(event) => updateForm("network_interface", event.target.value)} placeholder="eth0,ens3" /></label><label><span>下行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.rx_correction / 1024 ** 3} onChange={(event) => updateForm("rx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label><label><span>上行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.tx_correction / 1024 ** 3} onChange={(event) => updateForm("tx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label><label><span>Agent 下载加速（可选）</span><input value={form.agent_mirror} onChange={(event) => updateForm("agent_mirror", event.target.value.trim())} placeholder="https://ghproxy.net" /></label></div>
         <div className="settings-toggles editor-toggles"><Toggle label="自动续费" checked={form.auto_renewal} onChange={(value) => updateForm("auto_renewal", value)} /><Toggle label="Agent 自动更新" checked={form.auto_update} onChange={(value) => updateForm("auto_update", value)} /><Toggle label="隐藏节点" checked={form.hidden} onChange={(value) => updateForm("hidden", value)} /><Toggle label="关闭离线告警" checked={form.offline_notify_disabled} onChange={(value) => updateForm("offline_notify_disabled", value)} /></div>
         <div className="form-actions"><button type="button" className="secondary-btn" onClick={() => setEditing(null)}>取消</button><button className="primary-btn" disabled={busy}><Save size={16} />保存节点</button></div>
       </form></div> : null}

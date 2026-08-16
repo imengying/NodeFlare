@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { api } from "./api";
 import { AdminPanel } from "./components/AdminPanel";
 import type { Config } from "./types";
-import "./styles.css";
+import "./styles/admin.css";
 
 const THEME_KEY = "nodeflare-admin-theme";
 

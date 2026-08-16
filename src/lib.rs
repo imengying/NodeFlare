@@ -1,4 +1,5 @@
 mod auth;
+mod routes;
 mod cloudflare;
 mod db;
 mod exchange;
@@ -9,32 +10,29 @@ mod notify;
 mod theme;
 mod turnstile;
 
-use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::collections::HashSet;
+use std::net::Ipv4Addr;
 
 use futures_util::TryStreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use worker::*;
 
 use crate::auth::{
-    bearer_token, create_admin_jwt, create_theme_preview_proof, create_turnstile_proof,
-    hash_password, is_admin, random_salt, sha256_hex, verify_credentials,
-    verify_theme_preview_proof, verify_turnstile_proof, ADMIN_SESSION_SECONDS,
+    bearer_token, is_admin, sha256_hex, verify_turnstile_proof, ADMIN_SESSION_SECONDS,
 };
 use crate::models::{
-    AgentDiskMetric, AgentGpuMetric, AgentReport, AgentReportBatch, AlertRuleInput, ApiError,
-    LatencyTaskInput, LoginRequest, ServerBatchInput, ServerInput, ServerOrderInput, ServerView,
-    SettingsInput, ThemeInput, ThemeView, TurnstileVerifyRequest,
+    AgentDiskMetric, AgentGpuMetric, AgentReport, AlertRuleInput, ApiError, LatencyTaskInput,
+    ServerInput, ServerView, ThemeInput,
 };
 
-const ADMIN_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.html"));
-const ADMIN_SCRIPT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.js"));
-const ADMIN_STYLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.css"));
+pub(crate) const ADMIN_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.html"));
+pub(crate) const ADMIN_SCRIPT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.js"));
+pub(crate) const ADMIN_STYLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.css"));
 const HISTORY_CACHE_SECONDS: i64 = 30;
-const API_JSON_MAX_BYTES: usize = 1024 * 1024;
-const AGENT_JSON_MAX_BYTES: usize = 16 * 1024 * 1024;
-const MAX_AGENT_SAMPLES: usize = 720;
-const MAX_AGENT_LATENCY_RESULTS: usize = 4096;
+pub(crate) const API_JSON_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const AGENT_JSON_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_AGENT_SAMPLES: usize = 720;
+pub(crate) const MAX_AGENT_LATENCY_RESULTS: usize = 4096;
 
 #[derive(Serialize)]
 struct PublicServer {
@@ -115,7 +113,7 @@ fn env_secret_text(env: &Env, key: &str) -> String {
         .unwrap_or_default()
 }
 
-fn settings_for_admin_response(mut settings: db::SettingsView, env: &Env) -> db::SettingsView {
+pub(crate) fn settings_for_admin_response(mut settings: db::SettingsView, env: &Env) -> db::SettingsView {
     for (field, variable) in [
         (&mut settings.turnstile_site_key, "TURNSTILE_SITE_KEY"),
         (&mut settings.turnstile_secret_key, "TURNSTILE_SECRET_KEY"),
@@ -147,13 +145,13 @@ fn set_api_headers(response: &mut Response) -> Result<()> {
     Ok(())
 }
 
-fn no_content() -> Result<Response> {
+pub(crate) fn no_content() -> Result<Response> {
     let mut response = Response::empty()?.with_status(204);
     set_api_headers(&mut response)?;
     Ok(response)
 }
 
-fn set_admin_session_cookie(
+pub(crate) fn set_admin_session_cookie(
     response: &mut Response,
     req: &Request,
     token: Option<&str>,
@@ -200,7 +198,7 @@ async fn request_json<T: DeserializeOwned>(req: &mut Request, limit: usize) -> R
     serde_json::from_slice(&bytes).map_err(|error| Error::RustError(error.to_string()))
 }
 
-fn error(message: &str, status: u16) -> Result<Response> {
+pub(crate) fn error(message: &str, status: u16) -> Result<Response> {
     json(&ApiError { error: message }, status)
 }
 
@@ -222,7 +220,7 @@ fn mutable_response(response: Response) -> Result<Response> {
         .with_headers(headers))
 }
 
-fn embedded_admin_response(body: &[u8], content_type: &str) -> Result<Response> {
+pub(crate) fn embedded_admin_response(body: &[u8], content_type: &str) -> Result<Response> {
     let mut response = Response::from_bytes(body.to_vec())?;
     let headers = response.headers_mut();
     headers.set("Content-Type", content_type)?;
@@ -241,7 +239,7 @@ fn embedded_admin_response(body: &[u8], content_type: &str) -> Result<Response> 
     Ok(response)
 }
 
-fn secure_public_response(mut response: Response) -> Result<Response> {
+pub(crate) fn secure_public_response(mut response: Response) -> Result<Response> {
     let headers = response.headers_mut();
     headers.set("X-Content-Type-Options", "nosniff")?;
     headers.set("X-Frame-Options", "DENY")?;
@@ -363,7 +361,7 @@ async fn remote_theme_preview_response(
             .unwrap_or(remote_theme_failure("主题预览资源不存在")?));
     }
     if !relative.is_empty() && relative != "index.html" && !relative.starts_with("instance/") {
-        return Response::error("Theme preview path not found", 404);
+        return Response::error("主题预览资源不存在", 404);
     }
     let Some(index) = theme::index_url(base) else {
         return remote_theme_failure("远程主题来源不受支持");
@@ -458,19 +456,19 @@ fn public_probe_ipv4(address: Ipv4Addr) -> bool {
         || a >= 224)
 }
 
-fn valid_cloudflare_account_id(value: &str) -> bool {
+pub(crate) fn valid_cloudflare_account_id(value: &str) -> bool {
     let value = value.trim();
     value == db::SECRET_MASK
         || value.is_empty()
         || (value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit()))
 }
 
-fn valid_cloudflare_api_token(value: &str) -> bool {
+pub(crate) fn valid_cloudflare_api_token(value: &str) -> bool {
     let value = value.trim();
     value.chars().count() <= 512 && !value.chars().any(char::is_whitespace)
 }
 
-fn valid_password_derived(value: &str) -> bool {
+pub(crate) fn valid_password_derived(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -492,7 +490,7 @@ fn same_origin(origin: &str, request_url: &Url) -> bool {
     origin.trim().trim_end_matches('/') == request_url.origin().ascii_serialization()
 }
 
-fn validate_latency_task(input: &LatencyTaskInput) -> Option<&'static str> {
+pub(crate) fn validate_latency_task(input: &LatencyTaskInput) -> Option<&'static str> {
     let name_len = input.name.trim().chars().count();
     if !(1..=80).contains(&name_len) {
         return Some("任务名称长度应为 1 至 80 个字符");
@@ -529,7 +527,7 @@ fn validate_latency_task(input: &LatencyTaskInput) -> Option<&'static str> {
     None
 }
 
-fn validate_alert_rule(input: &AlertRuleInput) -> Option<&'static str> {
+pub(crate) fn validate_alert_rule(input: &AlertRuleInput) -> Option<&'static str> {
     if !(1..=80).contains(&input.name.trim().chars().count()) {
         return Some("规则名称长度应为 1 至 80 个字符");
     }
@@ -565,7 +563,7 @@ fn validate_alert_rule(input: &AlertRuleInput) -> Option<&'static str> {
     None
 }
 
-fn validate_theme(input: &ThemeInput) -> Option<&'static str> {
+pub(crate) fn validate_theme(input: &ThemeInput) -> Option<&'static str> {
     if !(1..=80).contains(&input.name.trim().chars().count()) {
         return Some("主题名称长度应为 1 至 80 个字符");
     }
@@ -578,7 +576,7 @@ fn validate_theme(input: &ThemeInput) -> Option<&'static str> {
     None
 }
 
-fn validate_server(input: &ServerInput) -> Option<&'static str> {
+pub(crate) fn validate_server(input: &ServerInput) -> Option<&'static str> {
     let name_len = input.name.trim().chars().count();
     if !(1..=80).contains(&name_len) {
         return Some("节点名称长度应为 1 至 80 个字符");
@@ -628,6 +626,24 @@ fn validate_server(input: &ServerInput) -> Option<&'static str> {
     if input.rx_correction < 0 || input.tx_correction < 0 {
         return Some("流量修正值不能为负数");
     }
+    let mirror = input.agent_mirror.trim();
+    if !mirror.is_empty() {
+        if mirror.len() > 2048
+            || !mirror
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || "_./:@-".contains(value))
+        {
+            return Some("Agent 下载加速地址格式无效");
+        }
+        let local_http = mirror.starts_with("http://localhost")
+            || mirror.starts_with("http://127.0.0.1");
+        if !mirror.starts_with("https://") && !local_http {
+            return Some("Agent 下载加速地址必须使用 HTTPS");
+        }
+        if mirror.contains('@') {
+            return Some("Agent 下载加速地址不能包含用户信息");
+        }
+    }
     None
 }
 
@@ -675,7 +691,7 @@ pub(crate) fn validate_report(report: &AgentReport) -> Option<&'static str> {
         return Some("GPU 型号字段过长");
     }
     if report.agent_version.chars().count() > 80 {
-        return Some("探针版本字段过长");
+        return Some("Agent 版本字段过长");
     }
     if report.disks.len() > 64
         || report.gpus.len() > 32
@@ -731,7 +747,7 @@ pub(crate) fn validate_report(report: &AgentReport) -> Option<&'static str> {
     None
 }
 
-fn public_server(server: ServerView, latency: Vec<latency::LatencySample>) -> PublicServer {
+pub(crate) fn public_server(server: ServerView, latency: Vec<latency::LatencySample>) -> PublicServer {
     let disks = server
         .disk_info
         .as_deref()
@@ -804,7 +820,7 @@ fn request_cookie(req: &Request, name: &str) -> Option<String> {
     })
 }
 
-fn client_ip(req: &Request) -> Option<String> {
+pub(crate) fn client_ip(req: &Request) -> Option<String> {
     req.headers()
         .get("CF-Connecting-IP")
         .ok()
@@ -868,7 +884,7 @@ async fn request_within_rate_limit(env: &Env, binding: &str, key: String) -> boo
     }
 }
 
-fn requested_hours(req: &Request, maximum: i64) -> Result<i64> {
+pub(crate) fn requested_hours(req: &Request, maximum: i64) -> Result<i64> {
     Ok(req
         .url()?
         .query_pairs()
@@ -878,7 +894,7 @@ fn requested_hours(req: &Request, maximum: i64) -> Result<i64> {
         .clamp(1, maximum))
 }
 
-fn history_cache_key(
+pub(crate) fn history_cache_key(
     request_url: &Url,
     kind: &str,
     server_id: &str,
@@ -937,7 +953,7 @@ fn request_turnstile_proof(req: &Request) -> Option<String> {
     request_cookie(req, "nodeflare_turnstile")
 }
 
-fn server_id(path: &str, prefix: &str) -> Option<String> {
+pub(crate) fn server_id(path: &str, prefix: &str) -> Option<String> {
     let id = path.strip_prefix(prefix)?.trim_matches('/');
     if id.is_empty() || id.contains('/') || id.len() > 80 {
         None
@@ -946,149 +962,30 @@ fn server_id(path: &str, prefix: &str) -> Option<String> {
     }
 }
 
-async fn handle_agent_report(
-    mut req: Request,
-    env: Env,
-    ctx: Context,
-    database: &D1Database,
-) -> Result<Response> {
-    let agent_config_hash = req
-        .headers()
-        .get("X-Agent-Config-Sha256")?
-        .unwrap_or_default();
-    let token = match bearer_token(&req) {
-        Some(value) => value,
-        None => return error("缺少探针凭据", 401),
-    };
-    let batch: AgentReportBatch = match request_json(&mut req, AGENT_JSON_MAX_BYTES).await {
-        Ok(value) => value,
-        Err(_) => return error("指标格式无效", 400),
-    };
-    if batch.samples.is_empty() || batch.samples.len() > MAX_AGENT_SAMPLES {
-        return error("每批应包含 1 至 720 个样本", 400);
-    }
-    let received_at = now();
-    for report in &batch.samples {
-        if report.timestamp <= 0 || (report.timestamp - received_at).abs() > 7200 {
-            return error("样本时间戳超出允许范围", 400);
-        }
-        if let Some(message) = validate_report(report) {
-            return error(message, 400);
-        }
-    }
-    let Some(identity) = db::get_agent_identity(database, &token).await? else {
-        return error("探针凭据无效", 401);
-    };
-    let server_id = identity.id;
-    if let Some(ip) = client_ip(&req).and_then(|value| value.parse::<IpAddr>().ok()) {
-        db::update_last_ip(database, &server_id, &ip.to_string()).await?;
-    }
-    let latency_results = batch
-        .samples
-        .iter()
-        .flat_map(|report| report.latency_results.iter())
-        .cloned()
-        .collect::<Vec<_>>();
-    if latency_results.len() > MAX_AGENT_LATENCY_RESULTS {
-        return error("每批最多包含 4096 条延迟结果", 400);
-    }
-    db::save_reports(database, &server_id, &batch.samples).await?;
-    latency::save_results(database, &server_id, &latency_results, received_at).await?;
-
-    let public_dashboard = db::get_setting(database, "public_dashboard")
-        .await?
-        .is_none_or(|value| value == "true");
-    if identity.hidden == 0 && public_dashboard {
-        let server = db::get_server(database, &server_id, false).await?;
-        let samples = latency::latest_for_server(database, &server_id).await?;
-        let payload = server
-            .map(|server| public_server(server, samples))
-            .map(|server| {
-                serde_json::to_string(&serde_json::json!({
-                    "type": "server",
-                    "server": server
-                }))
-            })
-            .transpose()?;
-        let broadcast_server_id = server_id.clone();
-        if let Some(payload) = payload {
-            ctx.wait_until(async move {
-                let _ = live::broadcast(&env, &broadcast_server_id, &payload).await;
-            });
-        }
-    }
-    let Some(config) = db::agent_config(database, &server_id).await? else {
-        return error("节点不存在", 404);
-    };
-    let config_json = serde_json::to_string(&config)?;
-    let config_hash = sha256_hex(&config_json);
-    if agent_config_hash == config_hash {
-        let mut response = no_content()?;
-        response
-            .headers_mut()
-            .set("X-Agent-Config-Sha256", &config_hash)?;
-        response
-            .headers_mut()
-            .set("X-NodeFlare-Server-Time", &received_at.to_string())?;
-        response.headers_mut().set("Cache-Control", "no-store")?;
-        return Ok(response);
-    }
-    let mut response = json(&config, 202)?;
-    response
-        .headers_mut()
-        .set("X-Agent-Config-Sha256", &config_hash)?;
-    response
-        .headers_mut()
-        .set("X-NodeFlare-Server-Time", &received_at.to_string())?;
-    Ok(response)
-}
-
-async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
+async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let method = req.method();
     let path = req.path();
 
     if method == Method::Get {
-        match path.as_str() {
-            "/admin" | "/admin/" | "/admin/index.html" => {
-                return embedded_admin_response(ADMIN_HTML, "text/html; charset=utf-8")
-            }
-            "/admin-assets/admin.js" => {
-                return embedded_admin_response(
-                    ADMIN_SCRIPT,
-                    "application/javascript; charset=utf-8",
-                )
-            }
-            "/admin-assets/admin.css" => {
-                return embedded_admin_response(ADMIN_STYLE, "text/css; charset=utf-8")
-            }
-            _ => {}
+        if let Some(response) = routes::site::embedded_asset(&path)? {
+            return Ok(response);
         }
     }
 
     let database = env.d1("DB")?;
 
     if method == Method::Post && path == "/api/agent/report" {
-        return handle_agent_report(req, env, ctx, &database).await;
+        return routes::agent::report(req, env, ctx, &database).await;
     }
     if method == Method::Get && path == "/api/agent/live" {
-        let token = match bearer_token(&req) {
-            Some(value) => value,
-            None => return error("缺少探针凭据", 401),
-        };
-        let Some(identity) = db::get_agent_identity(&database, &token).await? else {
-            return error("探针凭据无效", 401);
-        };
-        let Some(context) = db::agent_live_context(&database, &identity.id).await? else {
-            return error("节点不存在", 404);
-        };
-        return live::upgrade_agent(req, &env, &identity.id, identity.hidden != 0, context).await;
+        return routes::agent::live_websocket(req, &env, &database).await;
     }
 
     let default_name = env_text(&env, "SITE_NAME", "NodeFlare");
     let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180).clamp(30, 3600);
     let default_retention = env_number(&env, "HISTORY_RETENTION_DAYS", 30).clamp(1, 365);
     let default_username = env_text(&env, "ADMIN_USERNAME", "");
-    let settings = db::settings(
+    let settings = db::cached_settings(
         &database,
         &default_name,
         default_threshold,
@@ -1099,148 +996,19 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     let environment_turnstile_site_key = env_secret_text(&env, "TURNSTILE_SITE_KEY");
     let environment_turnstile_secret_key = env_secret_text(&env, "TURNSTILE_SECRET_KEY");
     let turnstile_site_key = if settings.turnstile_site_key.trim().is_empty() {
-        environment_turnstile_site_key.as_str()
+        environment_turnstile_site_key.clone()
     } else {
-        settings.turnstile_site_key.as_str()
+        settings.turnstile_site_key.clone()
     };
     let turnstile_secret_key = if settings.turnstile_secret_key.trim().is_empty() {
-        environment_turnstile_secret_key.as_str()
+        environment_turnstile_secret_key.clone()
     } else {
-        settings.turnstile_secret_key.as_str()
+        settings.turnstile_secret_key.clone()
     };
     let turnstile_configured =
         !turnstile_site_key.trim().is_empty() && !turnstile_secret_key.trim().is_empty();
     let public_turnstile_enabled = settings.turnstile_enabled && turnstile_configured;
     let login_protection_enabled = settings.turnstile_login_enabled && turnstile_configured;
-
-    if method == Method::Get && path == "/api/config" {
-        let mut response = json(
-            &serde_json::json!({
-                "site_name": settings.site_name,
-                "site_description": settings.site_description,
-                "site_announcement": settings.site_announcement,
-                "favicon_url": settings.favicon_url,
-                "locale": settings.locale,
-                "public_dashboard": settings.public_dashboard,
-                "offline_threshold_seconds": settings.offline_threshold_seconds,
-                "history_retention_days": settings.history_retention_days,
-                "default_theme": settings.default_theme,
-                "active_theme_id": settings.active_theme_id,
-                "background_url": settings.background_url,
-                "theme_options": settings.theme_options,
-                "show_search": settings.show_search,
-                "show_groups": settings.show_groups,
-                "show_stats": settings.show_stats,
-                "show_assets": settings.show_assets,
-                "show_traffic": settings.show_traffic,
-                "show_speed": settings.show_speed,
-                "show_price": settings.show_price,
-                "show_expiry": settings.show_expiry,
-                "show_latency": settings.show_latency,
-                "show_uptime": settings.show_uptime,
-                "turnstile_enabled": public_turnstile_enabled,
-                "turnstile_login_enabled": login_protection_enabled || public_turnstile_enabled,
-                "turnstile_site_key": turnstile_site_key,
-                "password_client_salt": settings.password_client_salt
-            }),
-            200,
-        )?;
-        response
-            .headers_mut()
-            .set("X-NodeFlare-Server-Time", &now().to_string())?;
-        return Ok(response);
-    }
-
-    if method == Method::Post && path == "/api/admin/login" {
-        if settings.admin_username.trim().is_empty() {
-            return error("尚未配置 ADMIN_USERNAME", 503);
-        }
-        if settings.admin_password_hash.is_empty() && env.secret("ADMIN_PASSWORD").is_err() {
-            return error("尚未配置 ADMIN_PASSWORD", 503);
-        }
-        let input: LoginRequest = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("请求格式无效", 400),
-        };
-        if input.username.trim().is_empty()
-            || input.password.is_empty()
-            || !valid_password_derived(&input.password_derived)
-        {
-            return error("请输入用户名和密码", 400);
-        }
-        let login_turnstile_enabled = public_turnstile_enabled || login_protection_enabled;
-        if login_turnstile_enabled {
-            let verified = turnstile::verify(
-                &input.turnstile_token,
-                turnstile_secret_key,
-                client_ip(&req).as_deref(),
-            )
-            .await
-            .unwrap_or(false);
-            if !verified {
-                return error("Cloudflare 人机验证失败，请重试", 403);
-            }
-        }
-        if !verify_credentials(
-            &env,
-            &settings.admin_username,
-            &settings.admin_password_hash,
-            &input.username,
-            &input.password,
-            &input.password_derived,
-        ) {
-            return error("用户名或密码错误", 401);
-        }
-        let session_password_hash = if settings.admin_password_hash.is_empty() {
-            let Some(salt) = random_salt() else {
-                return error("运行时随机源不可用，无法初始化管理员密码", 503);
-            };
-            let password_hash = hash_password(&input.password_derived, &salt);
-            db::save_setting(&database, "admin_password_hash", &password_hash).await?;
-            password_hash
-        } else {
-            settings.admin_password_hash.clone()
-        };
-        let Some(token) = create_admin_jwt(&env, &session_password_hash) else {
-            return error("会话密钥未配置", 503);
-        };
-        let mut response = json(&serde_json::json!({ "token": token }), 200)?;
-        set_admin_session_cookie(&mut response, &req, Some(&token))?;
-        return Ok(response);
-    }
-
-    if method == Method::Post && path == "/api/turnstile/verify" {
-        if !public_turnstile_enabled {
-            return error("全站人机验证未启用", 400);
-        }
-        let input: TurnstileVerifyRequest = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("验证请求格式无效", 400),
-        };
-        let verified = turnstile::verify(
-            &input.token,
-            turnstile_secret_key,
-            client_ip(&req).as_deref(),
-        )
-        .await
-        .unwrap_or(false);
-        if !verified {
-            return error("Cloudflare 人机验证失败，请重试", 403);
-        }
-        let Some(proof) = create_turnstile_proof(&env, &settings.admin_password_hash) else {
-            return error("验证凭据签名失败", 503);
-        };
-        let secure = req.url().ok().is_some_and(|url| url.scheme() == "https");
-        let mut response = no_content()?;
-        response.headers_mut().append(
-            "Set-Cookie",
-            &format!(
-                "nodeflare_turnstile={proof}; Path=/; Max-Age=3600; HttpOnly{}; SameSite=Strict",
-                if secure { "; Secure" } else { "" }
-            ),
-        )?;
-        return Ok(response);
-    }
 
     let admin = is_admin(&req, &env, &settings.admin_password_hash);
     let turnstile_verified = !public_turnstile_enabled
@@ -1249,846 +1017,42 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             verify_turnstile_proof(&value, &env, &settings.admin_password_hash)
         });
 
-    if method == Method::Post && path == "/api/admin/logout" {
-        let mut response = no_content()?;
-        set_admin_session_cookie(&mut response, &req, None)?;
-        return Ok(response);
-    }
+    let context = routes::RouteContext {
+        env: env.clone(),
+        database,
+        settings,
+        admin,
+        turnstile_verified,
+        turnstile_site_key,
+        turnstile_secret_key,
+        public_turnstile_enabled,
+        login_protection_enabled,
+        environment_turnstile_site_key,
+        environment_turnstile_secret_key,
+        default_name,
+        default_threshold,
+        default_retention,
+        default_username,
+    };
 
-    if method == Method::Get && path == "/api/exchange-rates" {
-        if !turnstile_verified {
-            return error("请先完成 Cloudflare 人机验证", 403);
-        }
-        if !settings.public_dashboard && !admin {
-            return error("仪表盘未公开", 401);
-        }
-        let rates = exchange::current(&database, now()).await?;
-        let mut response = json(&rates, 200)?;
-        if settings.public_dashboard {
-            response
-                .headers_mut()
-                .set("Cache-Control", "public, max-age=300")?;
-        }
-        return Ok(response);
-    }
-
-    if method == Method::Get && path == "/api/ws" {
-        if !turnstile_verified {
-            return error("请先完成 Cloudflare 人机验证", 403);
-        }
-        if !settings.public_dashboard && !admin {
-            return error("仪表盘未公开", 401);
-        }
-        return live::upgrade(req, &env).await;
-    }
-
-    if method == Method::Get && path == "/api/servers" {
-        if !turnstile_verified {
-            return error("请先完成 Cloudflare 人机验证", 403);
-        }
-        if !settings.public_dashboard && !admin {
-            return error("仪表盘未公开", 401);
-        }
-        let raw_servers = db::list_servers(&database, false).await?;
-        let mut latency_by_server: HashMap<String, Vec<latency::LatencySample>> = HashMap::new();
-        for sample in latency::latest_all(&database).await? {
-            latency_by_server
-                .entry(sample.server_id.clone())
-                .or_default()
-                .push(sample);
-        }
-        let servers: Vec<_> = raw_servers
-            .into_iter()
-            .map(|server| {
-                let samples = latency_by_server.remove(&server.id).unwrap_or_default();
-                public_server(server, samples)
-            })
-            .collect();
-        return json(&serde_json::json!({ "servers": servers }), 200);
-    }
-
-    if method == Method::Get && path.starts_with("/api/history/") {
-        if !turnstile_verified {
-            return error("请先完成 Cloudflare 人机验证", 403);
-        }
-        if !settings.public_dashboard && !admin {
-            return error("仪表盘未公开", 401);
-        }
-        let Some(id) = server_id(&path, "/api/history/") else {
-            return error("节点 ID 无效", 400);
-        };
-        if db::get_server(&database, &id, false).await?.is_none() {
-            return error("节点不存在", 404);
-        }
-        let hours = requested_hours(&req, 24 * 30)?;
-        let cache_key = if settings.public_dashboard {
-            Some(history_cache_key(
-                &req.url()?,
-                "metrics",
-                &id,
-                hours,
-                settings.history_cache_version,
-            ))
-        } else {
-            None
-        };
-        if let Some(cache_key) = cache_key.as_deref() {
-            if let Some(response) = cached_history_response(cache_key).await {
-                return Ok(response);
-            }
-        }
-        let points = db::history(&database, &id, hours).await?;
-        let mut response = json(&serde_json::json!({ "points": points }), 200)?;
-        if let Some(cache_key) = cache_key.as_deref() {
-            store_history_response(cache_key, &mut response).await;
-        }
-        return Ok(response);
-    }
-
-    if method == Method::Get && path.starts_with("/api/latency/") {
-        if !turnstile_verified {
-            return error("请先完成 Cloudflare 人机验证", 403);
-        }
-        if !settings.public_dashboard && !admin {
-            return error("仪表盘未公开", 401);
-        }
-        let Some(id) = server_id(&path, "/api/latency/") else {
-            return error("节点 ID 无效", 400);
-        };
-        if db::get_server(&database, &id, false).await?.is_none() {
-            return error("节点不存在", 404);
-        }
-        let hours = requested_hours(&req, 24 * 365)?;
-        let cache_key = if settings.public_dashboard {
-            Some(history_cache_key(
-                &req.url()?,
-                "latency",
-                &id,
-                hours,
-                settings.history_cache_version,
-            ))
-        } else {
-            None
-        };
-        if let Some(cache_key) = cache_key.as_deref() {
-            if let Some(response) = cached_history_response(cache_key).await {
-                return Ok(response);
-            }
-        }
-        let tasks = latency::tasks_for_server(&database, &id).await?;
-        let points = latency::history(&database, &id, hours).await?;
-        let mut response = json(
-            &serde_json::json!({ "tasks": tasks, "points": points }),
-            200,
-        )?;
-        if let Some(cache_key) = cache_key.as_deref() {
-            store_history_response(cache_key, &mut response).await;
-        }
-        return Ok(response);
-    }
-
-    if path.starts_with("/api/admin/") && !admin {
-        return error("未授权", 401);
-    }
-
-    if method == Method::Get && path == "/api/admin/latency-tasks" {
-        return json(
-            &serde_json::json!({ "tasks": latency::list_tasks(&database).await? }),
-            200,
-        );
-    }
-
-    if method == Method::Post && path == "/api/admin/latency-tasks" {
-        let input: LatencyTaskInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("延迟任务格式无效", 400),
-        };
-        if let Some(message) = validate_latency_task(&input) {
-            return error(message, 400);
-        }
-        if latency::task_count(&database).await? >= latency::MAX_LATENCY_TASKS as i64 {
-            return error("最多可创建 128 个延迟任务", 400);
-        }
-        let server_ids: HashSet<String> = db::list_servers(&database, true)
-            .await?
-            .into_iter()
-            .map(|server| server.id)
-            .collect();
-        if input.server_ids.iter().any(|id| !server_ids.contains(id)) {
-            return error("延迟任务包含不存在的服务器", 400);
-        }
-        let namespace = env.durable_object("LIVE_HUB")?;
-        let id = namespace
-            .unique_id()?
-            .to_string()
-            .chars()
-            .take(16)
-            .collect::<String>();
-        latency::create_task(&database, &id, &input, now()).await?;
-        db::increment_setting(&database, "history_cache_version").await?;
-        return json(&serde_json::json!({ "id": id }), 201);
-    }
-
-    if (method == Method::Patch || method == Method::Delete)
-        && path.starts_with("/api/admin/latency-tasks/")
-    {
-        let Some(id) = server_id(&path, "/api/admin/latency-tasks/") else {
-            return error("延迟任务 ID 无效", 400);
-        };
-        if method == Method::Delete {
-            return if latency::delete_task(&database, &id).await? {
-                db::increment_setting(&database, "history_cache_version").await?;
-                no_content()
-            } else {
-                error("延迟任务不存在", 404)
-            };
-        }
-        let input: LatencyTaskInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("延迟任务格式无效", 400),
-        };
-        if let Some(message) = validate_latency_task(&input) {
-            return error(message, 400);
-        }
-        let server_ids: HashSet<String> = db::list_servers(&database, true)
-            .await?
-            .into_iter()
-            .map(|server| server.id)
-            .collect();
-        if input
-            .server_ids
-            .iter()
-            .any(|server_id| !server_ids.contains(server_id))
-        {
-            return error("延迟任务包含不存在的服务器", 400);
-        }
-        return if latency::update_task(&database, &id, &input, now()).await? {
-            db::increment_setting(&database, "history_cache_version").await?;
-            no_content()
-        } else {
-            error("延迟任务不存在", 404)
-        };
-    }
-
-    if method == Method::Get && path == "/api/admin/alert-rules" {
-        return json(
-            &serde_json::json!({ "rules": db::list_alert_rules(&database).await? }),
-            200,
-        );
-    }
-
-    if method == Method::Post && path == "/api/admin/alert-rules" {
-        if db::list_alert_rules(&database).await?.len() >= 20 {
-            return error("最多可创建 20 条资源告警规则", 400);
-        }
-        let input: AlertRuleInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("告警规则格式无效", 400),
-        };
-        if let Some(message) = validate_alert_rule(&input) {
-            return error(message, 400);
-        }
-        let server_ids: HashSet<String> = db::list_servers(&database, true)
-            .await?
-            .into_iter()
-            .map(|server| server.id)
-            .collect();
-        if input.server_ids.iter().any(|id| !server_ids.contains(id)) {
-            return error("告警规则包含不存在的服务器", 400);
-        }
-        let id = env
-            .durable_object("LIVE_HUB")?
-            .unique_id()?
-            .to_string()
-            .chars()
-            .take(16)
-            .collect::<String>();
-        db::create_alert_rule(&database, &id, &input).await?;
-        return json(&serde_json::json!({ "id": id }), 201);
-    }
-
-    if (method == Method::Patch || method == Method::Delete)
-        && path.starts_with("/api/admin/alert-rules/")
-    {
-        let Some(id) = server_id(&path, "/api/admin/alert-rules/") else {
-            return error("告警规则 ID 无效", 400);
-        };
-        if method == Method::Delete {
-            return if db::delete_alert_rule(&database, &id).await? {
-                no_content()
-            } else {
-                error("告警规则不存在", 404)
-            };
-        }
-        let input: AlertRuleInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("告警规则格式无效", 400),
-        };
-        if let Some(message) = validate_alert_rule(&input) {
-            return error(message, 400);
-        }
-        let server_ids: HashSet<String> = db::list_servers(&database, true)
-            .await?
-            .into_iter()
-            .map(|server| server.id)
-            .collect();
-        if input
-            .server_ids
-            .iter()
-            .any(|server_id| !server_ids.contains(server_id))
-        {
-            return error("告警规则包含不存在的服务器", 400);
-        }
-        return if db::update_alert_rule(&database, &id, &input).await? {
-            no_content()
-        } else {
-            error("告警规则不存在", 404)
-        };
-    }
-
-    if method == Method::Get && path == "/api/admin/servers" {
-        let servers = db::list_servers(&database, true).await?;
-        return json(&serde_json::json!({ "servers": servers }), 200);
-    }
-
-    if method == Method::Delete && path == "/api/admin/servers" {
-        let input: ServerBatchInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("批量删除格式无效", 400),
-        };
-        if input.ids.is_empty()
-            || input.ids.len() > 500
-            || input.ids.iter().any(|id| id.is_empty() || id.len() > 80)
-            || input.ids.iter().collect::<HashSet<_>>().len() != input.ids.len()
-        {
-            return error("批量删除列表无效", 400);
-        }
-        db::delete_servers(&database, &input.ids).await?;
-        if let Err(error) = live::disconnect_agents(&env, &input.ids).await {
-            console_error!("failed to disconnect deleted Agents: {error}");
-        }
-        return no_content();
-    }
-
-    if method == Method::Patch && path == "/api/admin/servers/order" {
-        let input: ServerOrderInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("排序格式无效", 400),
-        };
-        if input.ids.len() > 500
-            || input.ids.iter().any(|id| id.is_empty() || id.len() > 80)
-            || input.ids.iter().collect::<HashSet<_>>().len() != input.ids.len()
-        {
-            return error("节点排序列表无效", 400);
-        }
-        let current = db::list_servers(&database, true).await?;
-        let current_ids: HashSet<_> = current.iter().map(|server| &server.id).collect();
-        if input.ids.len() != current_ids.len()
-            || input.ids.iter().any(|id| !current_ids.contains(id))
-        {
-            return error("排序列表必须包含全部节点", 400);
-        }
-        db::reorder_servers(&database, &input.ids).await?;
-        return no_content();
-    }
-
-    if method == Method::Post && path == "/api/admin/servers" {
-        let input: ServerInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("节点格式无效", 400),
-        };
-        if let Some(message) = validate_server(&input) {
-            return error(message, 400);
-        }
-        let namespace = env.durable_object("LIVE_HUB")?;
-        let id_source = namespace.unique_id()?.to_string();
-        let id = id_source.chars().take(16).collect::<String>();
-        let token = namespace.unique_id()?.to_string();
-        db::create_server(&database, &id, &token, &input).await?;
-        latency::assign_defaults(&database, &id).await?;
-        return json(&serde_json::json!({ "id": id, "agent_token": token }), 201);
-    }
-
-    if method == Method::Get && path.starts_with("/api/admin/servers/") && path.ends_with("/token")
-    {
-        let id = path
-            .strip_prefix("/api/admin/servers/")
-            .and_then(|value| value.strip_suffix("/token"))
-            .unwrap_or_default();
-        if id.is_empty() || id.contains('/') || id.len() > 80 {
-            return error("节点 ID 无效", 400);
-        }
-        return match db::get_agent_token(&database, id).await? {
-            Some(token) => json(&serde_json::json!({ "agent_token": token }), 200),
-            None => error("节点不存在", 404),
-        };
-    }
-
-    if (method == Method::Patch || method == Method::Delete)
-        && path.starts_with("/api/admin/servers/")
-    {
-        let Some(id) = server_id(&path, "/api/admin/servers/") else {
-            return error("节点 ID 无效", 400);
-        };
-        if method == Method::Delete {
-            if !db::delete_server(&database, &id).await? {
-                return error("节点不存在", 404);
-            }
-            if let Err(error) = live::disconnect_agents(&env, std::slice::from_ref(&id)).await {
-                console_error!("failed to disconnect deleted Agent: {error}");
-            }
-            return no_content();
-        }
-        let input: ServerInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("节点格式无效", 400),
-        };
-        if let Some(message) = validate_server(&input) {
-            return error(message, 400);
-        }
-        if !db::update_server(&database, &id, &input).await? {
-            return error("节点不存在", 404);
-        }
-        if let Err(error) = live::disconnect_agents(&env, std::slice::from_ref(&id)).await {
-            console_error!("failed to reconnect updated Agent: {error}");
-        }
-        return no_content();
-    }
-
-    if method == Method::Get && path == "/api/admin/settings" {
-        return json(&settings_for_admin_response(settings.clone(), &env), 200);
-    }
-
-    if method == Method::Get && path == "/api/admin/themes" {
-        let mut themes = vec![ThemeView {
-            id: theme::BUILTIN_THEME_ID.to_string(),
-            name: theme::BUILTIN_THEME_NAME.to_string(),
-            description: "NodeFlare 内置默认主题".to_string(),
-            url: String::new(),
-            builtin: true,
-            active: settings.active_theme_id == theme::BUILTIN_THEME_ID,
-        }];
-        themes.extend(db::list_themes(&database, &settings.active_theme_id).await?);
-        return json(&serde_json::json!({ "themes": themes }), 200);
-    }
-
-    if method == Method::Post && path == "/api/admin/themes" {
-        if db::list_themes(&database, &settings.active_theme_id)
-            .await?
-            .len()
-            >= 32
-        {
-            return error("最多可添加 32 个第三方主题", 400);
-        }
-        let input: ThemeInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("主题格式无效", 400),
-        };
-        if let Some(message) = validate_theme(&input) {
-            return error(message, 400);
-        }
-        let resolved = match theme::resolve_url(&input.url) {
-            Ok(value) => value,
-            Err(err) => {
-                console_warn!("theme URL resolution failed: {err}");
-                return error("无法解析主题地址，请检查 URL", 422);
-            }
-        };
-        let digest = sha256_hex(&resolved.source_url);
-        let id = format!("theme-{}", &digest[..16]);
-        if db::theme_exists(&database, &id).await? {
-            return error("该主题 URL 已添加", 409);
-        }
-        if let Err(err) = theme::validate_remote(&resolved.resolved_url).await {
-            console_warn!(
-                "theme validation failed for {}: {err}",
-                resolved.resolved_url
-            );
-            return error("无法读取主题 index.html，请检查 URL 和主题构建产物", 422);
-        }
-        db::create_theme(&database, &id, &input, &resolved.source_url, now()).await?;
-        return json(&serde_json::json!({ "id": id }), 201);
-    }
-
-    if method == Method::Post
-        && path.starts_with("/api/admin/themes/")
-        && path.ends_with("/preview")
-    {
-        let id = path
-            .strip_prefix("/api/admin/themes/")
-            .and_then(|value| value.strip_suffix("/preview"))
-            .unwrap_or("")
-            .trim_matches('/');
-        if id.is_empty() || id.contains('/') || id.len() > 80 {
-            return error("主题 ID 无效", 400);
-        }
-        if id == theme::BUILTIN_THEME_ID || !db::theme_exists(&database, id).await? {
-            return error("远程主题不存在", 404);
-        }
-        let Some(proof) = create_theme_preview_proof(&env, &settings.admin_password_hash, id)
-        else {
-            return error("无法创建主题预览凭据", 503);
-        };
-        return json(
-            &serde_json::json!({
-                "preview_url": format!("/__theme-preview/{proof}/")
-            }),
-            200,
-        );
-    }
-
-    if method == Method::Post
-        && path.starts_with("/api/admin/themes/")
-        && path.ends_with("/activate")
-    {
-        let id = path
-            .strip_prefix("/api/admin/themes/")
-            .and_then(|value| value.strip_suffix("/activate"))
-            .unwrap_or("")
-            .trim_matches('/');
-        if id.is_empty() || id.contains('/') || id.len() > 80 {
-            return error("主题 ID 无效", 400);
-        }
-        if id != theme::BUILTIN_THEME_ID {
-            let Some(url) = db::theme_url(&database, id).await? else {
-                return error("主题不存在", 404);
-            };
-            if let Err(err) = theme::validate_remote(&url).await {
-                console_warn!("theme activation failed for {url}: {err}");
-                return error("主题当前不可访问，未切换主题", 422);
-            }
-        }
-        if !db::set_active_theme(&database, id).await? {
-            return error("主题不存在", 404);
-        }
-        return no_content();
-    }
-
-    if method == Method::Delete && path.starts_with("/api/admin/themes/") {
-        let Some(id) = server_id(&path, "/api/admin/themes/") else {
-            return error("主题 ID 无效", 400);
-        };
-        if id == theme::BUILTIN_THEME_ID {
-            return error("内置主题不能删除", 400);
-        }
-        return if db::delete_theme(&database, &id).await? {
-            no_content()
-        } else {
-            error("主题不存在", 404)
-        };
-    }
-
-    if method == Method::Get && path == "/api/admin/theme-settings" {
-        if settings.active_theme_id == theme::BUILTIN_THEME_ID {
-            return json(&theme::builtin_settings_schema(), 200);
-        }
-        let Some(url) = db::theme_url(&database, &settings.active_theme_id).await? else {
-            return error("当前主题不存在", 404);
-        };
-        return match theme::remote_settings_schema(&url).await {
-            Ok(schema) => json(&schema, 200),
-            Err(err) => {
-                console_warn!("theme settings validation failed for {url}: {err}");
-                error("当前主题的 theme.json 设置格式无效", 422)
-            }
-        };
-    }
-
-    if method == Method::Post && path == "/api/admin/exchange-rates/refresh" {
-        return match exchange::refresh(&database, now(), true).await {
-            Ok((rates, _)) => json(&rates, 200),
-            Err(err) => {
-                console_error!("manual exchange-rate refresh failed: {err}");
-                error("汇率更新失败，已保留数据库中的旧汇率", 502)
-            }
-        };
-    }
-
-    if method == Method::Get && path == "/api/admin/database" {
-        let stats = db::database_stats(&database, settings.offline_threshold_seconds).await?;
-        return json(&stats, 200);
-    }
-
-    if method == Method::Get && path == "/api/admin/cloudflare-usage" {
-        let account_id = if settings.cloudflare_account_id.trim().is_empty() {
-            env.secret("CF_USAGE_ACCOUNT_ID")
-                .or_else(|_| env.var("CF_USAGE_ACCOUNT_ID"))
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-        } else {
-            settings.cloudflare_account_id.clone()
-        };
-        let token = if settings.cloudflare_api_token.trim().is_empty() {
-            env.secret("CF_USAGE_API_TOKEN")
-                .or_else(|_| env.var("CF_USAGE_API_TOKEN"))
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-        } else {
-            settings.cloudflare_api_token.clone()
-        };
-        if account_id.trim().is_empty() || token.trim().is_empty() {
-            return error("尚未配置 Cloudflare 用量查询凭据", 503);
-        }
-        return match cloudflare::usage(token.trim(), account_id.trim(), now()).await {
-            Ok(usage) => json(&usage, 200),
-            Err(err) => {
-                console_error!("cloudflare usage query failed: {err}");
-                let detail = err.to_string().chars().take(240).collect::<String>();
-                error(&format!("Cloudflare 用量查询失败：{detail}"), 502)
-            }
-        };
-    }
-
-    if method == Method::Delete && path == "/api/admin/history" {
-        db::clear_history(&database).await?;
-        db::increment_setting(&database, "history_cache_version").await?;
-        return no_content();
-    }
-
-    if method == Method::Post && path == "/api/admin/notifications/test" {
-        if settings.notification_endpoint.trim().is_empty() {
-            return error("请先填写 Telegram Bot Token 和 Chat ID", 400);
-        }
-        if let Err(err) = notify::send(&settings, "NodeFlare 测试通知：通知渠道配置成功。").await
-        {
-            console_error!("test notification failed: {err}");
-            return error("测试通知发送失败，请检查 Bot Token 和 Chat ID", 502);
-        }
-        return no_content();
-    }
-
-    if method == Method::Patch && path == "/api/admin/settings" {
-        let input: SettingsInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
-            Ok(value) => value,
-            Err(_) => return error("设置格式无效", 400),
-        };
-        if input
-            .site_name
-            .as_ref()
-            .is_some_and(|value| value.trim().is_empty() || value.chars().count() > 80)
-        {
-            return error("站点名称长度应为 1 至 80 个字符", 400);
-        }
-        if input
-            .site_description
-            .as_ref()
-            .is_some_and(|value| value.chars().count() > 240)
-        {
-            return error("站点描述不能超过 240 个字符", 400);
-        }
-        if input
-            .site_announcement
-            .as_ref()
-            .is_some_and(|value| value.chars().count() > 1000)
-        {
-            return error("站点公告不能超过 1000 个字符", 400);
-        }
-        if input
-            .default_theme
-            .as_deref()
-            .is_some_and(|value| !matches!(value, "system" | "light" | "dark"))
-        {
-            return error("默认主题无效", 400);
-        }
-        if let Some(id) = input.active_theme_id.as_deref() {
-            let valid = id == theme::BUILTIN_THEME_ID || db::theme_exists(&database, id).await?;
-            if !valid {
-                return error("活动主题不存在", 400);
-            }
-        }
-        if input
-            .background_url
-            .as_ref()
-            .is_some_and(|value| value.chars().count() > 1000)
-        {
-            return error("背景地址过长", 400);
-        }
-        if input.theme_options.as_ref().is_some_and(|value| {
-            let Some(options) = value.as_object() else {
-                return true;
-            };
-            options.len() > 40
-                || value.to_string().len() > 12_000
-                || options.iter().any(|(key, value)| {
-                    key.is_empty()
-                        || key.len() > 64
-                        || !key
-                            .chars()
-                            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-                        || !(value.is_boolean()
-                            || value.is_number()
-                            || value
-                                .as_str()
-                                .is_some_and(|text| text.chars().count() <= 500))
-                })
-        }) {
-            return error("主题设置格式无效", 400);
-        }
-        if input.admin_username.as_ref().is_some_and(|value| {
-            value.trim().is_empty()
-                || value.chars().count() > 64
-                || value.chars().any(char::is_whitespace)
-        }) {
-            return error("用户名应为 1 至 64 个不含空格的字符", 400);
-        }
-        if input
-            .new_password
-            .as_ref()
-            .is_some_and(|value| !value.is_empty() && !(8..=128).contains(&value.chars().count()))
-        {
-            return error("新密码长度应为 8 至 128 个字符", 400);
-        }
-        if input
-            .new_password
-            .as_ref()
-            .is_some_and(|value| !value.is_empty())
-            && input
-                .new_password_derived
-                .as_deref()
-                .is_none_or(|value| !valid_password_derived(value))
-        {
-            return error("新密码派生值无效", 400);
-        }
-        let configured_site_key = submitted_secret(
-            input.turnstile_site_key.as_deref(),
-            &settings.turnstile_site_key,
-        );
-        let configured_secret_key = submitted_secret(
-            input.turnstile_secret_key.as_deref(),
-            &settings.turnstile_secret_key,
-        );
-        let site_key = if configured_site_key.is_empty() {
-            environment_turnstile_site_key.trim()
-        } else {
-            configured_site_key
-        };
-        let secret_key = if configured_secret_key.is_empty() {
-            environment_turnstile_secret_key.trim()
-        } else {
-            configured_secret_key
-        };
-        let protection_activated = input.turnstile_enabled == Some(true)
-            && !settings.turnstile_enabled
-            || input.turnstile_login_enabled == Some(true) && !settings.turnstile_login_enabled;
-        if protection_activated && (site_key.is_empty() || secret_key.is_empty()) {
-            return error("启用 Turnstile 前必须填写站点密钥和私钥", 400);
-        }
-        if input
-            .notification_enabled
-            .unwrap_or(settings.notification_enabled)
-        {
-            let token = submitted_secret(
-                input.notification_endpoint.as_deref(),
-                &settings.notification_endpoint,
-            );
-            let chat_id = input
-                .notification_target
-                .as_deref()
-                .unwrap_or(&settings.notification_target)
-                .trim();
-            if !notify::valid_config(token, chat_id) {
-                return error("Telegram Bot Token 或 Chat ID 格式无效", 400);
-            }
-        }
-        if input
-            .cloudflare_account_id
-            .as_deref()
-            .is_some_and(|value| !valid_cloudflare_account_id(value))
-        {
-            return error("Cloudflare Account ID 应为 32 位十六进制字符", 400);
-        }
-        if input.cloudflare_api_token.as_deref().is_some_and(|value| {
-            value.trim() != db::SECRET_MASK && !valid_cloudflare_api_token(value)
-        }) {
-            return error("Cloudflare API Token 格式无效", 400);
-        }
-        if input
-            .locale
-            .as_deref()
-            .is_some_and(|value| !matches!(value, "zh-CN" | "en"))
-        {
-            return error("界面语言仅支持简体中文或 English", 400);
-        }
-        if input.favicon_url.as_deref().is_some_and(|value| {
-            !value.trim().is_empty()
-                && Url::parse(value.trim())
-                    .ok()
-                    .is_none_or(|url| url.scheme() != "https")
-        }) {
-            return error("站点图标必须使用 HTTPS 地址", 400);
-        }
-        let password_hash = if input
-            .new_password
-            .as_ref()
-            .is_some_and(|value| !value.is_empty())
-        {
-            let password_derived = input.new_password_derived.as_deref().unwrap_or_default();
-            let Some(salt) = random_salt() else {
-                return error("运行时随机源不可用，无法保存新密码", 503);
-            };
-            Some(hash_password(password_derived, &salt))
-        } else {
-            None
-        };
-        db::update_settings(&database, &input, password_hash.as_deref()).await?;
-        let updated = db::settings(
-            &database,
-            &default_name,
-            default_threshold,
-            default_retention,
-            &default_username,
-        )
-        .await?;
-        let token = if password_hash.is_some() {
-            create_admin_jwt(&env, &updated.admin_password_hash)
-        } else {
-            None
-        };
-        let response_settings = settings_for_admin_response(updated, &env);
-        let mut response = json(
-            &serde_json::json!({ "settings": response_settings, "token": token }),
-            200,
-        )?;
-        if let Some(token) = token.as_deref() {
-            set_admin_session_cookie(&mut response, &req, Some(token))?;
-        }
-        return Ok(response);
-    }
-
+    let req = match routes::public::route(req, &context).await? {
+        routes::RouteOutcome::Handled(response) => return Ok(response),
+        routes::RouteOutcome::Unmatched(req) => req,
+    };
+    let req = match routes::admin::route(req, &context).await? {
+        routes::RouteOutcome::Handled(response) => return Ok(response),
+        routes::RouteOutcome::Unmatched(req) => req,
+    };
     if path.starts_with("/api/") {
         return error("接口不存在", 404);
     }
-
-    if method == Method::Get {
-        if let Some(preview_path) = path.strip_prefix("/__theme-preview/") {
-            let (proof, relative) = preview_path.split_once('/').unwrap_or((preview_path, ""));
-            let Some(theme_id) =
-                verify_theme_preview_proof(proof, &env, &settings.admin_password_hash)
-            else {
-                return secure_public_response(Response::error(
-                    "Theme preview link has expired",
-                    403,
-                )?);
-            };
-            let Some(url) = db::theme_url(&database, &theme_id).await? else {
-                return secure_public_response(Response::error("Theme not found", 404)?);
-            };
-            let prefix = format!("/__theme-preview/{proof}");
-            return remote_theme_preview_response(relative, &url, &prefix).await;
-        }
-    }
-
-    if settings.active_theme_id != theme::BUILTIN_THEME_ID {
-        if let Some(url) = db::theme_url(&database, &settings.active_theme_id).await? {
-            if let Some(response) = remote_theme_response(&path, &url).await? {
-                return Ok(response);
-            }
-        }
-    }
+    let req = match routes::site::route(req, &context).await? {
+        routes::RouteOutcome::Handled(response) => return Ok(response),
+        routes::RouteOutcome::Unmatched(req) => req,
+    };
     let response = env.assets("ASSETS")?.fetch_request(req).await?;
-    secure_public_response(mutable_response(response)?)
+    Ok(secure_public_response(mutable_response(response)?)?)
 }
-
 #[event(fetch, respond_with_errors)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let method = req.method();

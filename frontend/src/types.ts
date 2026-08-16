@@ -202,6 +202,7 @@ export interface AdminServer extends ServerSummary {
   collect_interval: number;
   rx_correction: number;
   tx_correction: number;
+  agent_mirror: string;
   offline_notify_disabled: boolean;
   auto_update: boolean;
 }
@@ -253,6 +254,7 @@ export interface ServerInput {
   collect_interval: number;
   rx_correction: number;
   tx_correction: number;
+  agent_mirror: string;
   offline_notify_disabled: boolean;
   auto_update: boolean;
 }

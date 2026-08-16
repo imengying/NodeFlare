@@ -20,11 +20,13 @@ usage() {
 NodeFlare Agent macOS 安装脚本
 
 用法：
-  install-macos.sh -e <Worker URL> -t <Agent Token> [-i <上报间隔>]
+  install-macos.sh -e <Worker URL> -t <Agent Token> [-i <上报间隔>] [-m <下载加速前缀>]
   install-macos.sh --status
   install-macos.sh --uninstall
 
 仅支持 Apple Silicon（arm64）。Agent Token 请勿泄露。
+-m 为可选的 GitHub 下载加速前缀（形如 https://ghproxy.net），
+仅作用于 Release 下载，摘要校验不受影响。
 EOF
 }
 
@@ -62,10 +64,11 @@ token=""
 endpoint=""
 interval=60
 interval_set=false
+mirror=""
 while [ "$#" -gt 0 ]; do
   option="$1"
   case "$option" in
-    -t|-e|-i)
+    -t|-e|-i|-m)
       [ "$#" -ge 2 ] || fail "参数 $option 缺少值"
       value="$2"
       shift 2
@@ -76,6 +79,7 @@ while [ "$#" -gt 0 ]; do
     -t) [ -z "$token" ] || fail "参数 $option 重复"; token="$value" ;;
     -e) [ -z "$endpoint" ] || fail "参数 $option 重复"; endpoint="$value" ;;
     -i) [ "$interval_set" = false ] || fail "参数 $option 重复"; interval="$value"; interval_set=true ;;
+    -m) [ -z "$mirror" ] || fail "参数 $option 重复"; mirror="$value" ;;
   esac
 done
 [ -n "$token" ] && [ -n "$endpoint" ] || { usage; exit 1; }
@@ -89,6 +93,17 @@ esac
 case "$endpoint" in *@*) fail "Worker 地址不能包含用户信息" ;; esac
 case "$interval" in ''|*[!0-9]*) fail "上报间隔必须是整数" ;; esac
 [ "$interval" -ge 15 ] && [ "$interval" -le 3600 ] || fail "上报间隔必须在 15-3600 秒之间"
+mirror=${mirror%/}
+if [ -n "$mirror" ]; then
+  [ ${#mirror} -le 2048 ] || fail "下载加速前缀长度超出限制"
+  safe_value "$mirror" || fail "下载加速前缀格式无效"
+  case "$mirror" in
+    https://?*) ;;
+    http://localhost|http://localhost/*|http://localhost:*|http://127.0.0.1|http://127.0.0.1/*|http://127.0.0.1:*) ;;
+    *) fail "下载加速前缀必须使用 HTTPS；仅本机调试可使用 HTTP" ;;
+  esac
+  case "$mirror" in *@*) fail "下载加速前缀不能包含用户信息" ;; esac
+fi
 
 mkdir -p "$INSTALL_DIR"
 temporary="$INSTALL_DIR/.agent.$$.download"
@@ -122,9 +137,15 @@ expected=$(printf '%s\n' "$release_json" | tr '{' '\n' | awk -v name="$artifact"
 ')
 [ -n "$expected" ] || fail "Release 缺少 $artifact 的 SHA-256 摘要"
 release_base="https://github.com/imengying/NodeFlare/releases/download/$release_tag"
-log "正在下载 NodeFlare Agent $release_tag"
+download_url="$release_base/$artifact"
+if [ -n "$mirror" ]; then
+  download_url="$mirror/$release_base/$artifact"
+  log "正在通过下载加速前缀拉取 Agent $release_tag"
+else
+  log "正在下载 NodeFlare Agent $release_tag"
+fi
 curl --fail --location --silent --show-error --max-time 120 \
-  "$release_base/$artifact" \
+  "$download_url" \
   -o "$temporary"
 actual=$(shasum -a 256 "$temporary" | awk '{ print $1 }')
 [ -n "$expected" ] && [ "$actual" = "$expected" ] || fail "Agent SHA-256 校验失败，已停止安装"

@@ -23,7 +23,7 @@ export function StatsBar({ servers, config, exchangeRates }: { servers: Server[]
   const trafficDown = servers.reduce((sum, server) => sum + number(server.net_rx_total), 0);
   const speedUp = onlineServers.reduce((sum, server) => sum + number(server.net_out), 0);
   const speedDown = onlineServers.reduce((sum, server) => sum + number(server.net_in), 0);
-  const paid = onlineServers.filter((server) => server.price > 0);
+  const paid = servers.filter((server) => server.price > 0);
   const toDisplayCurrency = (value: number, currency: string) => {
     const code = currency.trim().toUpperCase();
     const sourceRate = code === "CNY" ? 1 : exchangeRates?.rates[code];
@@ -53,9 +53,9 @@ export function StatsBar({ servers, config, exchangeRates }: { servers: Server[]
 
   if (config.show_assets) stats.push({
     icon: WalletCards,
-    label: ui(locale, "在线资产", "Online assets"),
+    label: ui(locale, "资产", "Assets"),
     value: formatCurrency(totalValue, displayCurrency),
-    detail: <><span>{ui(locale, `剩余 ${formatCurrency(remainingValue, displayCurrency)}`, `Remaining ${formatCurrency(remainingValue, displayCurrency)}`)}</span><span>{ui(locale, `${paid.length} 台计费${missingRates ? ` · ${missingRates} 台汇率缺失` : ""}`, `${paid.length} billed${missingRates ? ` · ${missingRates} missing rates` : ""}`)}</span></>,
+    detail: <><span>{ui(locale, `剩余 ${formatCurrency(remainingValue, displayCurrency)}`, `Remaining ${formatCurrency(remainingValue, displayCurrency)}`)}</span>{missingRates ? <span>{ui(locale, `${missingRates} 台汇率缺失`, `${missingRates} missing rates`)}</span> : null}</>,
   });
   if (config.show_traffic) stats.push({
     icon: Database,

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize, Serializer};
 use worker::{wasm_bindgen::JsValue, D1Database, Date, Result};
@@ -15,7 +16,7 @@ SELECT
   s.price, s.billing_cycle, s.currency, s.auto_renewal,
   s.last_ip,
   s.network_interface, s.reset_day, s.report_interval, s.collect_interval,
-  s.rx_correction, s.tx_correction, s.offline_notify_disabled, s.auto_update,
+  s.rx_correction, s.tx_correction, s.agent_mirror, s.offline_notify_disabled, s.auto_update,
   s.created_at,
   m.timestamp, m.cpu, m.load1, m.load5, m.load15, m.mem_used, m.mem_total,
   m.swap_used, m.swap_total, m.disk_used, m.disk_total, m.net_in, m.net_out,
@@ -354,12 +355,13 @@ pub async fn create_server(
           id, name, region, group_name, tags, hidden, sort_order,
           expires_at, traffic_limit, traffic_limit_type, price, billing_cycle,
           currency, auto_renewal, network_interface, reset_day,
-          report_interval, collect_interval, rx_correction, tx_correction, offline_notify_disabled, auto_update,
+          report_interval, collect_interval, rx_correction, tx_correction, agent_mirror,
+          offline_notify_disabled, auto_update,
           token, created_at, updated_at
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6,
           COALESCE((SELECT MAX(sort_order) + 1 FROM servers), 0),
           ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-          ?18, ?19, ?20, ?21, ?22, ?23, ?23)"#,
+          ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?24)"#,
     )
     .bind(&[
         text(id),
@@ -381,6 +383,7 @@ pub async fn create_server(
         number(input.collect_interval),
         number(input.rx_correction),
         number(input.tx_correction),
+        text(input.agent_mirror.trim()),
         JsValue::from_bool(input.offline_notify_disabled),
         JsValue::from_bool(input.auto_update),
         text(token),
@@ -401,7 +404,7 @@ pub async fn update_server(db: &D1Database, id: &str, input: &ServerInput) -> Re
               currency = ?12, auto_renewal = ?13,
               network_interface = ?14, reset_day = ?15, report_interval = ?16,
               collect_interval = ?17, rx_correction = ?18, tx_correction = ?19,
-              offline_notify_disabled = ?20, auto_update = ?21, updated_at = ?22
+              agent_mirror = ?20, offline_notify_disabled = ?21, auto_update = ?22, updated_at = ?23
             WHERE id = ?1"#,
         )
         .bind(&[
@@ -424,6 +427,7 @@ pub async fn update_server(db: &D1Database, id: &str, input: &ServerInput) -> Re
             number(input.collect_interval),
             number(input.rx_correction),
             number(input.tx_correction),
+            text(input.agent_mirror.trim()),
             JsValue::from_bool(input.offline_notify_disabled),
             JsValue::from_bool(input.auto_update),
             number(now()),
@@ -1067,6 +1071,48 @@ pub async fn settings(
     })
 }
 
+const SETTINGS_CACHE_TTL_SECONDS: i64 = 30;
+
+static SETTINGS_CACHE: Mutex<Option<(i64, SettingsView)>> = Mutex::new(None);
+
+/// Settings gate every request (including the static-asset fallback), so keep an
+/// isolate-local copy to avoid one D1 read per request. Writes invalidate it;
+/// other isolates observe changes after at most the TTL.
+pub async fn cached_settings(
+    db: &D1Database,
+    default_name: &str,
+    default_threshold: i64,
+    default_retention: i64,
+    default_username: &str,
+) -> Result<SettingsView> {
+    let current = now();
+    if let Ok(slot) = SETTINGS_CACHE.lock() {
+        if let Some((loaded_at, cached)) = slot.as_ref() {
+            if current - *loaded_at < SETTINGS_CACHE_TTL_SECONDS {
+                return Ok(cached.clone());
+            }
+        }
+    }
+    let settings = settings(
+        db,
+        default_name,
+        default_threshold,
+        default_retention,
+        default_username,
+    )
+    .await?;
+    if let Ok(mut slot) = SETTINGS_CACHE.lock() {
+        *slot = Some((current, settings.clone()));
+    }
+    Ok(settings)
+}
+
+pub fn invalidate_settings_cache() {
+    if let Ok(mut slot) = SETTINGS_CACHE.lock() {
+        *slot = None;
+    }
+}
+
 pub async fn update_settings(
     db: &D1Database,
     input: &SettingsInput,
@@ -1222,6 +1268,7 @@ pub async fn update_settings(
     }
     if !statements.is_empty() {
         db.batch(statements).await?;
+        invalidate_settings_cache();
     }
     Ok(())
 }
@@ -1473,6 +1520,7 @@ pub async fn save_setting(db: &D1Database, key: &str, value: &str) -> Result<()>
     .bind(&[text(key), text(value), number(now())])?
     .run()
     .await?;
+    invalidate_settings_cache();
     Ok(())
 }
 
@@ -1486,6 +1534,7 @@ pub async fn increment_setting(db: &D1Database, key: &str) -> Result<()> {
     .bind(&[text(key), number(now())])?
     .run()
     .await?;
+    invalidate_settings_cache();
     Ok(())
 }
 

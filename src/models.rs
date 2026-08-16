@@ -43,6 +43,8 @@ pub struct ServerInput {
     pub collect_interval: i64,
     pub rx_correction: i64,
     pub tx_correction: i64,
+    #[serde(default)]
+    pub agent_mirror: String,
     pub offline_notify_disabled: bool,
     pub auto_update: bool,
 }
@@ -245,6 +247,7 @@ pub struct ServerView {
     pub collect_interval: i64,
     pub rx_correction: i64,
     pub tx_correction: i64,
+    pub agent_mirror: String,
     #[serde(serialize_with = "serialize_sqlite_bool")]
     pub offline_notify_disabled: i64,
     #[serde(serialize_with = "serialize_sqlite_bool")]

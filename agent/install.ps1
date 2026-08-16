@@ -3,6 +3,7 @@ param(
   [Parameter(ParameterSetName = "Install", Mandatory = $true)][Alias("t")][string]$Token,
   [Parameter(ParameterSetName = "Install", Mandatory = $true)][Alias("e")][string]$Endpoint,
   [Parameter(ParameterSetName = "Install")][Alias("i")][ValidateRange(15, 3600)][int]$Interval = 60,
+  [Parameter(ParameterSetName = "Install")][Alias("m")][string]$Mirror = "",
   [Parameter(ParameterSetName = "Uninstall", Mandatory = $true)][switch]$Uninstall,
   [Parameter(ParameterSetName = "Status", Mandatory = $true)][switch]$Status
 )
@@ -47,6 +48,23 @@ function Assert-Endpoint([string]$Value) {
   }
 }
 
+function Assert-Mirror([string]$Value) {
+  $Parsed = $null
+  $SecureScheme = $false
+  if ([Uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$Parsed)) {
+    $SecureScheme = $Parsed.Scheme -eq "https" -or (
+      $Parsed.Scheme -eq "http" -and $Parsed.Host -in @("localhost", "127.0.0.1", "::1")
+    )
+  }
+  if (
+    $Value -notmatch '^[A-Za-z0-9_./:@-]+$' -or
+    -not $SecureScheme -or
+    -not [string]::IsNullOrEmpty($Parsed.UserInfo)
+  ) {
+    Write-InstallError "下载加速前缀必须使用 HTTPS，且不能包含用户信息或查询参数"
+  }
+}
+
 if ($Uninstall) {
   Write-Step "正在停止并移除 NodeFlare Agent"
   Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -76,6 +94,8 @@ if ($NativeArchitecture -ne "AMD64") {
 Write-Step "正在检查运行环境"
 Assert-Safe "Token" $Token
 Assert-Endpoint $Endpoint
+$Mirror = $Mirror.Trim().TrimEnd('/')
+if ($Mirror) { Assert-Mirror $Mirror }
 $TokenLength = $Token.Length
 if ($TokenLength -gt 512) {
   Write-InstallError "安装参数长度超出限制"
@@ -100,7 +120,12 @@ try {
   }
   $ExpectedChecksum = $DigestMatch.Groups[1].Value
   $DownloadUrl = "https://github.com/imengying/NodeFlare/releases/download/$($Release.tag_name)/$Artifact"
-  Write-Step "正在下载 NodeFlare Agent $($Release.tag_name)"
+  if ($Mirror) {
+    $DownloadUrl = "$Mirror/$DownloadUrl"
+    Write-Step "正在通过下载加速前缀拉取 NodeFlare Agent $($Release.tag_name)"
+  } else {
+    Write-Step "正在下载 NodeFlare Agent $($Release.tag_name)"
+  }
   Invoke-WebRequest -Uri $DownloadUrl -OutFile $Temporary -TimeoutSec 120
   $ActualChecksum = (Get-FileHash -LiteralPath $Temporary -Algorithm SHA256).Hash
   if ($ActualChecksum -ne $ExpectedChecksum) {
