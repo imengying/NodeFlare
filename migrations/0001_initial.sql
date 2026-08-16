@@ -28,6 +28,7 @@ CREATE TABLE servers (
   collect_interval INTEGER NOT NULL DEFAULT 5,
   rx_correction INTEGER NOT NULL DEFAULT 0,
   tx_correction INTEGER NOT NULL DEFAULT 0,
+  agent_mirror TEXT NOT NULL DEFAULT '',
   offline_notify_disabled INTEGER NOT NULL DEFAULT 0,
   auto_update INTEGER NOT NULL DEFAULT 1,
   token TEXT NOT NULL UNIQUE,

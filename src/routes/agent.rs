@@ -2,16 +2,16 @@ use std::net::IpAddr;
 
 use worker::{Context, D1Database, Env, Request, Response, Result};
 
+use crate::auth::bearer_token;
 use crate::db;
-use crate::live;
 use crate::latency;
+use crate::live;
+use crate::models::AgentReportBatch;
+use crate::sha256_hex;
 use crate::{
     client_ip, error, no_content, now, public_server, request_json, validate_report,
     AGENT_JSON_MAX_BYTES, MAX_AGENT_LATENCY_RESULTS, MAX_AGENT_SAMPLES,
 };
-use crate::auth::bearer_token;
-use crate::models::AgentReportBatch;
-use crate::sha256_hex;
 
 pub(crate) async fn report(
     mut req: Request,

@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize, Serializer};
 use worker::{wasm_bindgen::JsValue, D1Database, Date, Result};
@@ -68,6 +67,7 @@ struct AgentConfigRow {
     report_interval: i64,
     collect_interval: i64,
     network_interface: String,
+    agent_mirror: String,
     auto_update: i64,
 }
 
@@ -325,7 +325,7 @@ pub async fn update_last_ip(db: &D1Database, id: &str, ip: &str) -> Result<()> {
 pub async fn agent_config(db: &D1Database, id: &str) -> Result<Option<AgentConfigView>> {
     let row: Option<AgentConfigRow> = db
         .prepare(
-            "SELECT report_interval, collect_interval, network_interface, auto_update \
+            "SELECT report_interval, collect_interval, network_interface, agent_mirror, auto_update \
              FROM servers WHERE id = ?1",
         )
         .bind(&[text(id)])?
@@ -338,6 +338,7 @@ pub async fn agent_config(db: &D1Database, id: &str) -> Result<Option<AgentConfi
         report_interval: row.report_interval,
         collect_interval: row.collect_interval,
         network_interface: row.network_interface.trim().to_string(),
+        agent_mirror: row.agent_mirror.trim().trim_end_matches('/').to_string(),
         auto_update: row.auto_update != 0,
         latency_tasks: crate::latency::tasks_for_server(db, id).await?,
     }))
@@ -383,7 +384,7 @@ pub async fn create_server(
         number(input.collect_interval),
         number(input.rx_correction),
         number(input.tx_correction),
-        text(input.agent_mirror.trim()),
+        text(input.agent_mirror.trim().trim_end_matches('/')),
         JsValue::from_bool(input.offline_notify_disabled),
         JsValue::from_bool(input.auto_update),
         text(token),
@@ -427,7 +428,7 @@ pub async fn update_server(db: &D1Database, id: &str, input: &ServerInput) -> Re
             number(input.collect_interval),
             number(input.rx_correction),
             number(input.tx_correction),
-            text(input.agent_mirror.trim()),
+            text(input.agent_mirror.trim().trim_end_matches('/')),
             JsValue::from_bool(input.offline_notify_disabled),
             JsValue::from_bool(input.auto_update),
             number(now()),
@@ -1071,48 +1072,6 @@ pub async fn settings(
     })
 }
 
-const SETTINGS_CACHE_TTL_SECONDS: i64 = 30;
-
-static SETTINGS_CACHE: Mutex<Option<(i64, SettingsView)>> = Mutex::new(None);
-
-/// Settings gate every request (including the static-asset fallback), so keep an
-/// isolate-local copy to avoid one D1 read per request. Writes invalidate it;
-/// other isolates observe changes after at most the TTL.
-pub async fn cached_settings(
-    db: &D1Database,
-    default_name: &str,
-    default_threshold: i64,
-    default_retention: i64,
-    default_username: &str,
-) -> Result<SettingsView> {
-    let current = now();
-    if let Ok(slot) = SETTINGS_CACHE.lock() {
-        if let Some((loaded_at, cached)) = slot.as_ref() {
-            if current - *loaded_at < SETTINGS_CACHE_TTL_SECONDS {
-                return Ok(cached.clone());
-            }
-        }
-    }
-    let settings = settings(
-        db,
-        default_name,
-        default_threshold,
-        default_retention,
-        default_username,
-    )
-    .await?;
-    if let Ok(mut slot) = SETTINGS_CACHE.lock() {
-        *slot = Some((current, settings.clone()));
-    }
-    Ok(settings)
-}
-
-pub fn invalidate_settings_cache() {
-    if let Ok(mut slot) = SETTINGS_CACHE.lock() {
-        *slot = None;
-    }
-}
-
 pub async fn update_settings(
     db: &D1Database,
     input: &SettingsInput,
@@ -1268,7 +1227,6 @@ pub async fn update_settings(
     }
     if !statements.is_empty() {
         db.batch(statements).await?;
-        invalidate_settings_cache();
     }
     Ok(())
 }
@@ -1520,7 +1478,6 @@ pub async fn save_setting(db: &D1Database, key: &str, value: &str) -> Result<()>
     .bind(&[text(key), text(value), number(now())])?
     .run()
     .await?;
-    invalidate_settings_cache();
     Ok(())
 }
 
@@ -1534,7 +1491,6 @@ pub async fn increment_setting(db: &D1Database, key: &str) -> Result<()> {
     .bind(&[text(key), number(now())])?
     .run()
     .await?;
-    invalidate_settings_cache();
     Ok(())
 }
 

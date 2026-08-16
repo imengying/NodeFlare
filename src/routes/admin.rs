@@ -11,29 +11,10 @@ use crate::models::{
 };
 use crate::routes::{RouteContext, RouteOutcome};
 use crate::{
-    cloudflare,
-    db,
-    error,
-    exchange,
-    json,
-    latency,
-    live,
-    no_content,
-    now,
-    notify,
-    request_json,
-    server_id,
-    settings_for_admin_response,
-    theme,
-    validate_alert_rule,
-    validate_latency_task,
-    validate_server,
-    validate_theme,
-    valid_cloudflare_account_id,
-    valid_cloudflare_api_token,
-    valid_password_derived,
-    submitted_secret,
-    API_JSON_MAX_BYTES,
+    cloudflare, db, error, exchange, json, latency, live, no_content, notify, now, request_json,
+    server_id, settings_for_admin_response, submitted_secret, theme, valid_cloudflare_account_id,
+    valid_cloudflare_api_token, valid_password_derived, validate_alert_rule, validate_latency_task,
+    validate_server, validate_theme, API_JSON_MAX_BYTES,
 };
 
 pub(crate) async fn route(mut req: Request, ctx: &RouteContext) -> Result<RouteOutcome> {
@@ -122,7 +103,9 @@ pub(crate) async fn route(mut req: Request, ctx: &RouteContext) -> Result<RouteO
     if method == Method::Post && path == "/api/admin/themes" {
         return handled(themes_post(&mut req, ctx).await);
     }
-    if method == Method::Post && path.starts_with("/api/admin/themes/") && path.ends_with("/preview")
+    if method == Method::Post
+        && path.starts_with("/api/admin/themes/")
+        && path.ends_with("/preview")
     {
         return handled(theme_preview_post(ctx, &path).await);
     }
@@ -336,8 +319,7 @@ async fn servers_order_patch(req: &mut Request, ctx: &RouteContext) -> Result<Re
     }
     let current = db::list_servers(&ctx.database, true).await?;
     let current_ids: HashSet<_> = current.iter().map(|server| &server.id).collect();
-    if input.ids.len() != current_ids.len()
-        || input.ids.iter().any(|id| !current_ids.contains(id))
+    if input.ids.len() != current_ids.len() || input.ids.iter().any(|id| !current_ids.contains(id))
     {
         return error("排序列表必须包含全部节点", 400);
     }
@@ -354,11 +336,7 @@ async fn servers_post(req: &mut Request, ctx: &RouteContext) -> Result<Response>
         return error(message, 400);
     }
     let id = short_durable_id(ctx)?;
-    let token = ctx
-        .env
-        .durable_object("LIVE_HUB")?
-        .unique_id()?
-        .to_string();
+    let token = ctx.env.durable_object("LIVE_HUB")?.unique_id()?.to_string();
     db::create_server(&ctx.database, &id, &token, &input).await?;
     latency::assign_defaults(&ctx.database, &id).await?;
     json(&serde_json::json!({ "id": id, "agent_token": token }), 201)
@@ -587,7 +565,8 @@ async fn notifications_test(ctx: &RouteContext) -> Result<Response> {
     if ctx.settings.notification_endpoint.trim().is_empty() {
         return error("请先填写 Telegram Bot Token 和 Chat ID", 400);
     }
-    if let Err(err) = notify::send(&ctx.settings, "NodeFlare 测试通知：通知渠道配置成功。").await {
+    if let Err(err) = notify::send(&ctx.settings, "NodeFlare 测试通知：通知渠道配置成功。").await
+    {
         console_error!("test notification failed: {err}");
         return error("测试通知发送失败，请检查 Bot Token 和 Chat ID", 502);
     }
@@ -705,8 +684,7 @@ async fn settings_patch(req: &mut Request, ctx: &RouteContext) -> Result<Respons
     } else {
         configured_secret_key
     };
-    let protection_activated = input.turnstile_enabled == Some(true)
-        && !settings.turnstile_enabled
+    let protection_activated = input.turnstile_enabled == Some(true) && !settings.turnstile_enabled
         || input.turnstile_login_enabled == Some(true) && !settings.turnstile_login_enabled;
     if protection_activated && (site_key.is_empty() || secret_key.is_empty()) {
         return error("启用 Turnstile 前必须填写站点密钥和私钥", 400);
@@ -735,9 +713,11 @@ async fn settings_patch(req: &mut Request, ctx: &RouteContext) -> Result<Respons
     {
         return error("Cloudflare Account ID 应为 32 位十六进制字符", 400);
     }
-    if input.cloudflare_api_token.as_deref().is_some_and(|value| {
-        value.trim() != db::SECRET_MASK && !valid_cloudflare_api_token(value)
-    }) {
+    if input
+        .cloudflare_api_token
+        .as_deref()
+        .is_some_and(|value| value.trim() != db::SECRET_MASK && !valid_cloudflare_api_token(value))
+    {
         return error("Cloudflare API Token 格式无效", 400);
     }
     if input

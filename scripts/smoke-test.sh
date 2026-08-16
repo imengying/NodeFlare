@@ -67,7 +67,7 @@ request -H "Authorization: Bearer $admin_token" \
   "$MONITOR_BASE_URL/api/admin/themes" | \
   jq -e '.themes | any(.builtin == true and .id == "builtin-nodeflare-glass" and .name == "NodeFlare Glass" and .active == true)' >/dev/null
 
-server_input='{"name":"Smoke Test Node","region":"JP","group_name":"Test","tags":"smoke","hidden":false,"expires_at":1893456000,"traffic_limit":107374182400,"traffic_limit_type":"max","price":9.9,"billing_cycle":30,"currency":"USD","auto_renewal":true,"network_interface":"","reset_day":1,"report_interval":60,"collect_interval":5,"rx_correction":0,"tx_correction":0,"offline_notify_disabled":false,"auto_update":true}'
+server_input='{"name":"Smoke Test Node","region":"JP","group_name":"Test","tags":"smoke","hidden":false,"expires_at":1893456000,"traffic_limit":107374182400,"traffic_limit_type":"max","price":9.9,"billing_cycle":30,"currency":"USD","auto_renewal":true,"network_interface":"","reset_day":1,"report_interval":60,"collect_interval":5,"rx_correction":0,"tx_correction":0,"agent_mirror":"https://mirror.example.com","offline_notify_disabled":false,"auto_update":true}'
 
 server_id=
 latency_task_id=
@@ -130,7 +130,7 @@ report_response=$(request -H "Authorization: Bearer $agent_token" -H 'Content-Ty
   --data "$report" "$MONITOR_BASE_URL/api/agent/report")
 printf '%s' "$report_response" | jq -e \
   --arg task_id "$latency_task_id" \
-  '.collect_interval == 5 and .auto_update == true and (.latency_tasks | any(.id == $task_id and .task_type == "tcp" and .target == "example.com" and .port == 443))' >/dev/null
+  '.collect_interval == 5 and .agent_mirror == "https://mirror.example.com" and .auto_update == true and (.latency_tasks | any(.id == $task_id and .task_type == "tcp" and .target == "example.com" and .port == 443))' >/dev/null
 request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/admin/servers" | \
   jq -e --arg id "$server_id" '.servers | any(.id == $id and .last_ip == "8.8.8.8")' >/dev/null
 

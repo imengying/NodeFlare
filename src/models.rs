@@ -43,7 +43,6 @@ pub struct ServerInput {
     pub collect_interval: i64,
     pub rx_correction: i64,
     pub tx_correction: i64,
-    #[serde(default)]
     pub agent_mirror: String,
     pub offline_notify_disabled: bool,
     pub auto_update: bool,
@@ -334,6 +333,7 @@ pub struct AgentConfigView {
     pub report_interval: i64,
     pub collect_interval: i64,
     pub network_interface: String,
+    pub agent_mirror: String,
     pub auto_update: bool,
     pub latency_tasks: Vec<AgentLatencyTask>,
 }

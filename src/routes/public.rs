@@ -2,31 +2,18 @@ use std::collections::HashMap;
 
 use worker::{Method, Request, Response, Result};
 
-use crate::routes::{RouteContext, RouteOutcome};
-use crate::{
-    db,
-    error,
-    json,
-    latency,
-    live,
-    no_content,
-    now,
-    public_server,
-    requested_hours,
-    server_id,
-    cached_history_response,
-    history_cache_key,
-    request_json,
-    set_admin_session_cookie,
-    store_history_response,
-    API_JSON_MAX_BYTES,
-};
 use crate::auth::{
     create_admin_jwt, create_turnstile_proof, hash_password, random_salt, verify_credentials,
 };
-use crate::models::LoginRequest;
-use crate::turnstile;
 use crate::client_ip;
+use crate::models::LoginRequest;
+use crate::routes::{RouteContext, RouteOutcome};
+use crate::turnstile;
+use crate::{
+    cached_history_response, db, error, history_cache_key, json, latency, live, no_content, now,
+    public_server, request_json, requested_hours, server_id, set_admin_session_cookie,
+    store_history_response, API_JSON_MAX_BYTES,
+};
 
 pub(crate) async fn route(mut req: Request, ctx: &RouteContext) -> Result<RouteOutcome> {
     let method = req.method();
@@ -39,14 +26,19 @@ pub(crate) async fn route(mut req: Request, ctx: &RouteContext) -> Result<RouteO
         return Ok(RouteOutcome::Handled(admin_login(&mut req, ctx).await?));
     }
     if method == Method::Post && path == "/api/turnstile/verify" {
-        return Ok(RouteOutcome::Handled(turnstile_verify(&mut req, ctx).await?));
+        return Ok(RouteOutcome::Handled(
+            turnstile_verify(&mut req, ctx).await?,
+        ));
     }
     if method == Method::Get && path == "/api/exchange-rates" {
         return Ok(RouteOutcome::Handled(exchange_rates(ctx).await?));
     }
     if method == Method::Get && path == "/api/ws" {
         if !ctx.turnstile_verified {
-            return Ok(RouteOutcome::Handled(error("请先完成 Cloudflare 人机验证", 403)?));
+            return Ok(RouteOutcome::Handled(error(
+                "请先完成 Cloudflare 人机验证",
+                403,
+            )?));
         }
         if !ctx.settings.public_dashboard && !ctx.admin {
             return Ok(RouteOutcome::Handled(error("此仪表盘需要登录后访问", 401)?));

@@ -1,5 +1,4 @@
 mod auth;
-mod routes;
 mod cloudflare;
 mod db;
 mod exchange;
@@ -7,6 +6,7 @@ mod latency;
 mod live;
 mod models;
 mod notify;
+mod routes;
 mod theme;
 mod turnstile;
 
@@ -113,7 +113,10 @@ fn env_secret_text(env: &Env, key: &str) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn settings_for_admin_response(mut settings: db::SettingsView, env: &Env) -> db::SettingsView {
+pub(crate) fn settings_for_admin_response(
+    mut settings: db::SettingsView,
+    env: &Env,
+) -> db::SettingsView {
     for (field, variable) in [
         (&mut settings.turnstile_site_key, "TURNSTILE_SITE_KEY"),
         (&mut settings.turnstile_secret_key, "TURNSTILE_SECRET_KEY"),
@@ -626,25 +629,44 @@ pub(crate) fn validate_server(input: &ServerInput) -> Option<&'static str> {
     if input.rx_correction < 0 || input.tx_correction < 0 {
         return Some("流量修正值不能为负数");
     }
-    let mirror = input.agent_mirror.trim();
-    if !mirror.is_empty() {
-        if mirror.len() > 2048
-            || !mirror
-                .chars()
-                .all(|value| value.is_ascii_alphanumeric() || "_./:@-".contains(value))
-        {
-            return Some("Agent 下载加速地址格式无效");
-        }
-        let local_http = mirror.starts_with("http://localhost")
-            || mirror.starts_with("http://127.0.0.1");
-        if !mirror.starts_with("https://") && !local_http {
-            return Some("Agent 下载加速地址必须使用 HTTPS");
-        }
-        if mirror.contains('@') {
-            return Some("Agent 下载加速地址不能包含用户信息");
-        }
+    if !valid_agent_mirror(&input.agent_mirror) {
+        return Some("Agent 下载加速地址必须是无凭据、查询参数和片段的 HTTPS URL");
     }
     None
+}
+
+pub(crate) fn valid_agent_mirror(value: &str) -> bool {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() {
+        return true;
+    }
+    if value.len() > 2048
+        || value.chars().any(char::is_whitespace)
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_./:@-".contains(character))
+    {
+        return false;
+    }
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    if url.scheme() == "https" {
+        return true;
+    }
+    url.scheme() == "http"
+        && matches!(
+            url.host_str(),
+            Some(host) if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+        )
 }
 
 pub(crate) fn validate_report(report: &AgentReport) -> Option<&'static str> {
@@ -747,7 +769,10 @@ pub(crate) fn validate_report(report: &AgentReport) -> Option<&'static str> {
     None
 }
 
-pub(crate) fn public_server(server: ServerView, latency: Vec<latency::LatencySample>) -> PublicServer {
+pub(crate) fn public_server(
+    server: ServerView,
+    latency: Vec<latency::LatencySample>,
+) -> PublicServer {
     let disks = server
         .disk_info
         .as_deref()
@@ -985,7 +1010,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let default_threshold = env_number(&env, "OFFLINE_THRESHOLD_SECONDS", 180).clamp(30, 3600);
     let default_retention = env_number(&env, "HISTORY_RETENTION_DAYS", 30).clamp(1, 365);
     let default_username = env_text(&env, "ADMIN_USERNAME", "");
-    let settings = db::cached_settings(
+    let settings = db::settings(
         &database,
         &default_name,
         default_threshold,
@@ -1051,7 +1076,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         routes::RouteOutcome::Unmatched(req) => req,
     };
     let response = env.assets("ASSETS")?.fetch_request(req).await?;
-    Ok(secure_public_response(mutable_response(response)?)?)
+    secure_public_response(mutable_response(response)?)
 }
 #[event(fetch, respond_with_errors)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
@@ -1147,9 +1172,9 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 mod tests {
     use super::{
         allow_on_rate_limit_failure, history_cache_key, rate_limit_binding, same_origin,
-        submitted_secret, valid_cloudflare_account_id, valid_cloudflare_api_token,
-        valid_password_derived, valid_ping_target, valid_server_price, validate_latency_task,
-        ADMIN_HTML, ADMIN_SCRIPT, ADMIN_STYLE,
+        submitted_secret, valid_agent_mirror, valid_cloudflare_account_id,
+        valid_cloudflare_api_token, valid_password_derived, valid_ping_target, valid_server_price,
+        validate_latency_task, ADMIN_HTML, ADMIN_SCRIPT, ADMIN_STYLE,
     };
     use crate::{db::SECRET_MASK, models::LatencyTaskInput};
     use worker::{Method, Url};
@@ -1196,6 +1221,35 @@ mod tests {
         assert!(valid_server_price(1_000_000_000.0));
         assert!(!valid_server_price(-1.01));
         assert!(!valid_server_price(f64::NAN));
+    }
+
+    #[test]
+    fn validates_agent_mirrors() {
+        for mirror in [
+            "",
+            "https://mirror.example.com",
+            "https://mirror.example.com/github",
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+        ] {
+            assert!(
+                valid_agent_mirror(mirror),
+                "expected valid mirror: {mirror}"
+            );
+        }
+        for mirror in [
+            "https://",
+            "http://mirror.example.com",
+            "https://user@mirror.example.com",
+            "https://mirror.example.com/?token=secret",
+            "https://mirror.example.com/#fragment",
+            "https://bad host.example.com",
+        ] {
+            assert!(
+                !valid_agent_mirror(mirror),
+                "expected invalid mirror: {mirror}"
+            );
+        }
     }
 
     #[test]

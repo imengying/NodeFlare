@@ -63,6 +63,7 @@ struct RuntimeConfig {
     report_interval: u64,
     collect_interval: u64,
     network_interface: String,
+    agent_mirror: String,
     auto_update: bool,
     latency_tasks: Vec<LatencyTask>,
 }
@@ -179,6 +180,7 @@ struct RemoteConfig {
     report_interval: u64,
     collect_interval: u64,
     network_interface: String,
+    agent_mirror: String,
     auto_update: bool,
     latency_tasks: Vec<LatencyTask>,
 }
@@ -1258,6 +1260,7 @@ fn runtime_config(options: &CliOptions) -> Result<RuntimeConfig> {
         report_interval: interval,
         collect_interval: 5,
         network_interface: String::new(),
+        agent_mirror: String::new(),
         auto_update: true,
         latency_tasks: Vec::new(),
     })
@@ -1561,6 +1564,10 @@ fn apply_remote(config: &mut RuntimeConfig, remote: &RemoteConfig) -> bool {
     config
         .network_interface
         .clone_from(&remote.network_interface);
+    let mirror = remote.agent_mirror.trim().trim_end_matches('/');
+    if mirror.is_empty() || valid_endpoint(mirror) {
+        config.agent_mirror = mirror.to_string();
+    }
     config.auto_update = remote.auto_update;
     let tasks = sanitize_latency_tasks(&remote.latency_tasks);
     let changed = config.latency_tasks != tasks;
@@ -1761,7 +1768,16 @@ fn download_agent(
     Ok(valid)
 }
 
-fn update(agent: &ureq::Agent) -> Result<bool> {
+fn mirrored_download_url(mirror: &str, url: &str) -> String {
+    let mirror = mirror.trim().trim_end_matches('/');
+    if mirror.is_empty() {
+        url.to_string()
+    } else {
+        format!("{mirror}/{url}")
+    }
+}
+
+fn update(agent: &ureq::Agent, mirror: &str) -> Result<bool> {
     let mut response = agent
         .get(LATEST_RELEASE_API)
         .header("Accept", "application/vnd.github+json")
@@ -1800,7 +1816,7 @@ fn update(agent: &ureq::Agent) -> Result<bool> {
     };
     if !download_agent(
         agent,
-        &release_asset.browser_download_url,
+        &mirrored_download_url(mirror, &release_asset.browser_download_url),
         &temporary,
         &release.tag_name,
         &expected_sha256,
@@ -1943,7 +1959,7 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
                         }
                     }
                     if !once && config.auto_update && Instant::now() >= next_update_check {
-                        match update(&agent) {
+                        match update(&agent, &config.agent_mirror) {
                             Ok(true) => return Ok(()),
                             Ok(false) => {
                                 next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
@@ -2005,12 +2021,12 @@ mod tests {
     use super::{
         ack_interval, agent_artifact_name, clock_offset_from_http_date, corrected_timestamp,
         executable_format_valid, gpu_name_from_uevent, is_public_probe_ip, live_endpoint,
-        live_update_payload, median, normalized_version, parse_lspci_gpu_names, parse_probe_target,
-        parse_system_profiler_gpu_names, ping_latency, prune_report_samples, release_asset_sha256,
-        report_retry_delay, sanitize_latency_tasks, selected_interface, tcp_latency_probe_address,
-        valid_endpoint, version_triplet, CliOptions, ClockCalibration, GithubReleaseAsset,
-        LatencyResult, LatencyTask, LiveAck, Report, CLOCK_CALIBRATION_MAX_AGE, MAX_LATENCY_TASKS,
-        MAX_PENDING_LATENCY_RESULTS, PROBE_ATTEMPTS,
+        live_update_payload, median, mirrored_download_url, normalized_version,
+        parse_lspci_gpu_names, parse_probe_target, parse_system_profiler_gpu_names, ping_latency,
+        prune_report_samples, release_asset_sha256, report_retry_delay, sanitize_latency_tasks,
+        selected_interface, tcp_latency_probe_address, valid_endpoint, version_triplet, CliOptions,
+        ClockCalibration, GithubReleaseAsset, LatencyResult, LatencyTask, LiveAck, Report,
+        CLOCK_CALIBRATION_MAX_AGE, MAX_LATENCY_TASKS, MAX_PENDING_LATENCY_RESULTS, PROBE_ATTEMPTS,
     };
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2101,6 +2117,17 @@ mod tests {
         assert!(!valid_endpoint("https://user@example.com"));
         assert!(!valid_endpoint("https://monitor.example.com/?token=abc"));
         assert!(!valid_endpoint("https://bad host.example"));
+    }
+
+    #[test]
+    fn builds_mirrored_download_urls() {
+        let release =
+            "https://github.com/imengying/NodeFlare/releases/download/v1.2.3/agent-linux-x86_64";
+        assert_eq!(mirrored_download_url("", release), release);
+        assert_eq!(
+            mirrored_download_url("https://mirror.example.com/", release),
+            format!("https://mirror.example.com/{release}")
+        );
     }
 
     #[test]
