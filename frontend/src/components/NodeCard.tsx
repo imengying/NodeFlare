@@ -117,7 +117,7 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
           </div> : null}
         </div>
 
-        {config.show_latency && quality.configured ? <div className="quality-grid">
+        {config.show_latency ? <div className="quality-grid">
           <QualityPanel label={ui(locale, "延迟", "Latency")} value={quality.latencyDisplay} bars={quality.latencyBars} />
           <QualityPanel label={ui(locale, "丢包", "Packet loss")} value={quality.lossDisplay} bars={quality.lossBars} />
         </div> : null}

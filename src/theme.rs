@@ -31,7 +31,12 @@ pub fn normalize_url(value: &str) -> Option<String> {
     }
 
     let path = parsed.path().trim_matches('/');
-    let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() == 2 {
+        // 纯仓库地址默认使用 main 分支。
+        parts.push("tree");
+        parts.push("main");
+    }
     if parts.len() < 4
         || parts[2] != "tree"
         || parts.iter().any(|part| {
@@ -378,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_github_tree_urls() {
+    fn accepts_only_github_urls() {
         assert_eq!(
             normalize_url("https://github.com/acme/theme/tree/abc123").as_deref(),
             Some("https://github.com/acme/theme/tree/abc123")
@@ -386,7 +391,10 @@ mod tests {
         assert!(normalize_url("https://themes.example.com/nodeflare").is_none());
         assert!(normalize_url("http://themes.example.com/theme").is_none());
         assert!(normalize_url("https://user@example.com/theme").is_none());
-        assert!(normalize_url("https://github.com/acme/theme").is_none());
+        assert_eq!(
+            normalize_url("https://github.com/acme/theme").as_deref(),
+            Some("https://github.com/acme/theme/tree/main")
+        );
         assert_eq!(
             resolve_url("https://github.com/acme/theme/tree/main/dist")
                 .expect("GitHub theme URL")

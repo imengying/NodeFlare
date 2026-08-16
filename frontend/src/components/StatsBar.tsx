@@ -55,7 +55,7 @@ export function StatsBar({ servers, config, exchangeRates }: { servers: Server[]
     icon: WalletCards,
     label: ui(locale, "资产", "Assets"),
     value: formatCurrency(totalValue, displayCurrency),
-    detail: <><span>{ui(locale, `剩余 ${formatCurrency(remainingValue, displayCurrency)}`, `Remaining ${formatCurrency(remainingValue, displayCurrency)}`)}</span>{missingRates ? <span>{ui(locale, `${missingRates} 台汇率缺失`, `${missingRates} missing rates`)}</span> : null}</>,
+    detail: <><span>{ui(locale, `剩余价值 ${formatCurrency(remainingValue, displayCurrency)}`, `Remaining value ${formatCurrency(remainingValue, displayCurrency)}`)}</span>{missingRates ? <span>{ui(locale, `${missingRates} 台汇率缺失`, `${missingRates} missing rates`)}</span> : null}</>,
   });
   if (config.show_traffic) stats.push({
     icon: Database,

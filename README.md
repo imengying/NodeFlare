@@ -2,6 +2,12 @@
 
 基于 Rust、WebAssembly 和 Cloudflare Workers 的服务器监控，支持 Linux、Windows 和 macOS Agent。
 
+## 界面预览
+
+![仪表盘](docs/dashboard-light.png)
+
+![主题商店](docs/theme-store-light.png)
+
 ## 能力
 
 - 采集 CPU、GPU、负载、内存、磁盘、网络、连接数、进程和系统信息
@@ -14,7 +20,7 @@
 - 节点管理、批量删除、拖拽排序和 Agent 在线配置
 - Telegram 通知、资源告警、离线/到期提醒和数据维护
 - 内置 NodeFlare Glass 主题，并提供远程主题商店
-- 远程主题仅支持 GitHub `tree` 地址，Worker 代理 `index.html` 与 `assets/`
+- 远程主题支持 GitHub 仓库地址（默认 `main` 分支，也可用 `tree` 指定分支或子目录），Worker 代理 `index.html` 与 `assets/`
 - Rust Agent 支持 Linux x86_64/ARM64、Windows x86_64 和 macOS ARM64，可按节点自动更新
 
 ## 部署到 Cloudflare
@@ -73,7 +79,7 @@
 
 ## 主题
 
-GitHub `tree` 地址对应的目录需提供 `index.html` 和 `assets/`，并使用 NodeFlare 公开 API 读取数据。可选的 `theme.json` 可声明后台显示的主题设置项。启用第三方主题前请确认来源可信。
+GitHub 仓库地址对应的仓库需提供 `index.html` 和 `assets/`（默认 `main` 分支，可用 `tree` 地址指定分支或子目录），并使用 NodeFlare 公开 API 读取数据。可选的 `theme.json` 可声明后台显示的主题设置项。启用第三方主题前请确认来源可信。
 
 ## 鸣谢
 

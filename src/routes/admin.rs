@@ -394,7 +394,7 @@ async fn themes_get(ctx: &RouteContext) -> Result<Response> {
     let mut themes = vec![ThemeView {
         id: theme::BUILTIN_THEME_ID.to_string(),
         name: theme::BUILTIN_THEME_NAME.to_string(),
-        description: "NodeFlare 内置默认主题".to_string(),
+        description: "默认主题".to_string(),
         url: String::new(),
         builtin: true,
         active: ctx.settings.active_theme_id == theme::BUILTIN_THEME_ID,

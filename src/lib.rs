@@ -574,7 +574,7 @@ pub(crate) fn validate_theme(input: &ThemeInput) -> Option<&'static str> {
         return Some("主题说明不能超过 300 个字符");
     }
     if theme::normalize_url(&input.url).is_none() {
-        return Some("主题 URL 必须是 GitHub tree 地址");
+        return Some("主题 URL 仅支持 GitHub 地址");
     }
     None
 }

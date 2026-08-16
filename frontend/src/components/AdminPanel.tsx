@@ -514,7 +514,7 @@ export function AdminPanel({
         <button className="admin-login-theme" type="button" onClick={onToggleTheme} title={dark ? "切换浅色主题" : "切换深色主题"}>{dark ? <Sun size={16} /> : <Moon size={16} />}</button>
         <form className="login-form glass-panel" onSubmit={login}>
           <img src="/logo.svg" alt="" width="48" height="48" />
-          <div className="login-copy"><h1>管理员登录</h1><p>{config.site_name} 控制台</p></div>
+          <div className="login-copy"><h1>管理员登录</h1></div>
           <label><span>用户名</span><input autoFocus type="text" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
           <label><span>密码</span><input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
           {config.turnstile_login_enabled || config.turnstile_enabled ? <div className="login-turnstile"><TurnstileWidget siteKey={config.turnstile_site_key} theme={dark ? "dark" : "light"} resetKey={turnstileReset} onVerify={setTurnstileToken} onError={setError} /></div> : null}
@@ -571,16 +571,15 @@ export function AdminPanel({
               ) : tab === "themes" && settings ? (
                 <div className="theme-store-page">
                   <section className="admin-section">
-                    <div className="section-head"><div><h3>主题列表</h3><span>内置主题始终可用，远程主题由 Worker 代理前台页面和资源；可选的 theme.json 提供主题设置。</span></div></div>
-                    <div className="theme-store-grid">
-                      {themes.map((theme) => <article className={`theme-store-card ${theme.active ? "active" : ""}`} key={theme.id}>
-                        <div className="theme-card-icon"><Palette size={20} /></div>
-                        <div className="theme-card-main">
-                          <div className="theme-card-title"><strong>{theme.name}</strong><span className={`theme-badge ${theme.builtin ? "builtin" : "remote"}`}>{theme.builtin ? "默认主题" : "远程主题"}</span></div>
-                          <p>{theme.description || "暂无主题说明"}</p>
-                          {!theme.builtin ? <a href={theme.url} target="_blank" rel="noreferrer"><span>{theme.url}</span><ExternalLink size={13} /></a> : <small>NodeFlare 内置主题</small>}
+                    <div className="section-head"><h3>主题列表</h3></div>
+                    <div className="theme-list">
+                      {themes.map((theme) => <article className={`theme-row ${theme.active ? "active" : ""}`} key={theme.id}>
+                        <div className="theme-row-main">
+                          <div className="theme-row-title"><strong>{theme.name}</strong><span className={`theme-badge ${theme.builtin ? "builtin" : "remote"}`}>{theme.builtin ? "默认主题" : "远程主题"}</span></div>
+                          {!theme.builtin ? <p title={theme.description || undefined}>{theme.description || "暂无主题说明"}</p> : null}
+                          {!theme.builtin ? <a href={theme.url} target="_blank" rel="noreferrer"><span>{theme.url}</span><ExternalLink size={13} /></a> : null}
                         </div>
-                        <div className="theme-card-actions">
+                        <div className="theme-row-actions">
                           {!theme.builtin ? <button type="button" className="secondary-btn compact" disabled={busy} onClick={() => void previewTheme(theme)}><Eye size={14} />预览</button> : null}
                           <button type="button" className={theme.active ? "theme-active-btn" : "primary-btn compact"} disabled={busy || theme.active} onClick={() => void activateTheme(theme)}>{theme.active ? <><Check size={14} />使用中</> : "启用"}</button>
                           {!theme.builtin ? <button type="button" className="icon-btn danger" disabled={busy} title="删除主题" onClick={() => void removeTheme(theme)}><Trash2 size={15} /></button> : null}
@@ -589,9 +588,9 @@ export function AdminPanel({
                     </div>
                   </section>
                   <form className="admin-section theme-add-form" onSubmit={addTheme}>
-                    <div className="section-title"><Plus size={15} />添加远程主题</div>
-                    <p className="settings-hint">填写 GitHub <code>tree</code> 地址，对应目录需包含 <code>index.html</code> 和 <code>assets/</code> 目录。</p>
-                    <div className="form-grid"><label><span>主题名称</span><input required maxLength={80} value={themeName} onChange={(event) => setThemeName(event.target.value)} placeholder="例如：Ocean" /></label><label><span>主题 URL</span><input required type="url" maxLength={2048} value={themeUrl} onChange={(event) => setThemeUrl(event.target.value)} placeholder="https://github.com/user/theme/tree/main" /></label></div>
+                    <div className="section-head"><h3>添加远程主题</h3></div>
+                    <p className="settings-hint">仅支持 GitHub 地址</p>
+                    <div className="form-grid"><label><span>主题名称</span><input required maxLength={80} value={themeName} onChange={(event) => setThemeName(event.target.value)} placeholder="例如：Ocean" /></label><label><span>主题 URL</span><input required type="url" maxLength={2048} value={themeUrl} onChange={(event) => setThemeUrl(event.target.value)} placeholder="https://github.com/user/theme" /></label></div>
                     <label><span>主题说明（可选）</span><textarea rows={2} maxLength={300} value={themeDescription} onChange={(event) => setThemeDescription(event.target.value)} placeholder="简短描述主题风格和来源" /></label>
                     <div className="form-actions"><button className="primary-btn" disabled={busy}><Plus size={16} />添加主题</button></div>
                   </form>
@@ -609,7 +608,7 @@ export function AdminPanel({
                   {tab === "themeSettings" ? <>
                     <div className="section-title"><SlidersHorizontal size={15} />通用主题设置</div>
                     <div className="form-grid"><label><span>默认主题</span><select value={settings.default_theme} onChange={(event) => updateSettings("default_theme", event.target.value as Settings["default_theme"])}><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label><label><span>背景图地址</span><input type="text" value={settings.background_url} onChange={(event) => updateSettings("background_url", event.target.value)} /></label></div>
-                    <p className="settings-hint">背景图可用 | 分隔浅色和深色地址，例如 light.jpg|dark.jpg。</p>
+                    <p className="settings-hint">背景图可用 | 分隔浅色和深色地址，例如 light.jpg | dark.jpg。</p>
                     <div className="section-subtitle">当前主题选项</div><div className="theme-option-grid"><Toggle label="公开仪表盘" checked={settings.public_dashboard} onChange={(value) => updateSettings("public_dashboard", value)} />{themeSettingsSchema?.settings.map((field) => <ThemeOption key={field.key} field={field} value={settings.theme_options[field.key] ?? field.default} onChange={(value) => updateThemeOption(field.key, value)} />)}</div>
                     <div className="section-subtitle">公开界面元素</div>
                     <div className="settings-toggles"><Toggle label="显示搜索" checked={settings.show_search} onChange={(value) => updateSettings("show_search", value)} /><Toggle label="显示分组" checked={settings.show_groups} onChange={(value) => updateSettings("show_groups", value)} /><Toggle label="总览统计" checked={settings.show_stats} onChange={(value) => updateSettings("show_stats", value)} /><Toggle label="资产统计" checked={settings.show_assets} onChange={(value) => updateSettings("show_assets", value)} /><Toggle label="累计流量" checked={settings.show_traffic} onChange={(value) => updateSettings("show_traffic", value)} /><Toggle label="实时网速" checked={settings.show_speed} onChange={(value) => updateSettings("show_speed", value)} /><Toggle label="价格信息" checked={settings.show_price} onChange={(value) => updateSettings("show_price", value)} /><Toggle label="到期信息" checked={settings.show_expiry} onChange={(value) => updateSettings("show_expiry", value)} /><Toggle label="延迟与丢包" checked={settings.show_latency} onChange={(value) => updateSettings("show_latency", value)} /><Toggle label="在线时长" checked={settings.show_uptime} onChange={(value) => updateSettings("show_uptime", value)} /></div>
@@ -627,10 +626,9 @@ export function AdminPanel({
                   {tab === "security" ? <>
                     <div className="section-title"><ShieldCheck size={15} />账号与 Cloudflare 防护</div>
                     <div className="form-grid"><label><span>管理员用户名</span><input autoComplete="username" value={settings.admin_username} onChange={(event) => updateSettings("admin_username", event.target.value)} /></label><label><span>新密码（留空不修改）</span><input autoComplete="new-password" type="password" value={settings.new_password || ""} onChange={(event) => updateSettings("new_password", event.target.value)} placeholder="至少 8 个字符" /></label></div>
-                    <div className="security-note">当前密码状态：{settings.admin_password_configured ? "已使用 D1 加盐哈希" : "使用 ADMIN_PASSWORD 初始化密钥"}</div>
                     <div className="form-grid"><Toggle label="保护公开仪表盘" checked={settings.turnstile_enabled} onChange={(value) => updateSettings("turnstile_enabled", value)} /><Toggle label="保护管理员登录" checked={settings.turnstile_login_enabled} onChange={(value) => updateSettings("turnstile_login_enabled", value)} /></div>
                     <div className="form-grid"><label><span>Turnstile Site Key</span><input autoComplete="off" type="password" value={settings.turnstile_site_key} onChange={(event) => updateSettings("turnstile_site_key", event.target.value)} /></label><label><span>Turnstile Secret Key</span><input autoComplete="off" type="password" value={settings.turnstile_secret_key} onChange={(event) => updateSettings("turnstile_secret_key", event.target.value)} /></label></div>
-                    <p className="settings-hint">留空时读取 Worker 的 TURNSTILE_SITE_KEY 和 TURNSTILE_SECRET_KEY，后台配置优先。</p>
+                    <p className="settings-hint">留空则读取后台配置。</p>
                   </> : null}
 
                   {tab === "data" ? <>

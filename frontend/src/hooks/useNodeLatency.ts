@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import type { LatencySample, LatencyTestPoint, Server } from "../types";
+import type { LatencySample, Server } from "../types";
 
 export interface LatencyBar {
   key: string;
@@ -8,7 +8,7 @@ export interface LatencyBar {
   tooltip: string;
 }
 
-const cache = new Map<string, { at: number; tasks: LatencyTestPoint[]; points: LatencySample[] }>();
+const cache = new Map<string, { at: number; points: LatencySample[] }>();
 const BAR_COUNT = 20;
 
 function latencyTone(value: number): LatencyBar["tone"] {
@@ -50,26 +50,12 @@ function summarize(points: LatencySample[], field: "latency_ms" | "packet_loss")
   return { average: valid.reduce((sum, point) => sum + point[field], 0) / valid.length, bars };
 }
 
-function tasksFromSamples(points: LatencySample[]): LatencyTestPoint[] {
-  return Array.from(new Map(points.map((point) => [point.task_id, {
-    id: point.task_id,
-    name: point.name,
-    task_type: point.task_type,
-    target: point.target,
-    port: point.port,
-    interval_seconds: 60,
-  }])).values());
-}
-
 export function useNodeLatency(server: Server, enabled: boolean) {
   const initial = server.latency;
-  const [tasks, setTasks] = useState<LatencyTestPoint[]>(() => tasksFromSamples(initial));
   const [points, setPoints] = useState<LatencySample[]>(initial);
   const [loading, setLoading] = useState(enabled);
 
   useEffect(() => {
-    if (!server.latency.length) return;
-    setTasks(tasksFromSamples(server.latency));
     setPoints(server.latency);
   }, [server.latency]);
 
@@ -78,15 +64,14 @@ export function useNodeLatency(server: Server, enabled: boolean) {
     let active = true;
     const hit = cache.get(server.id);
     if (hit && Date.now() - hit.at < 60_000) {
-      setTasks(hit.tasks);
       setPoints(hit.points);
       setLoading(false);
       return;
     }
     setLoading(true);
     api.latencyHistory(server.id, 1).then((result) => {
-      cache.set(server.id, { at: Date.now(), tasks: result.tasks, points: result.points });
-      if (active) { setTasks(result.tasks); setPoints(result.points); }
+      cache.set(server.id, { at: Date.now(), points: result.points });
+      if (active) setPoints(result.points);
     }).catch(() => {}).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [enabled, server.id]);
@@ -95,11 +80,10 @@ export function useNodeLatency(server: Server, enabled: boolean) {
     const latency = summarize(points, "latency_ms");
     const loss = summarize(points, "packet_loss");
     return {
-      configured: tasks.length > 0,
       latencyDisplay: latency.average >= 0 ? `${Math.round(latency.average)} ms` : loading ? "加载中" : "-",
       lossDisplay: loss.average >= 0 ? `${loss.average.toFixed(1)}%` : loading ? "加载中" : "-",
       latencyBars: latency.bars,
       lossBars: loss.bars,
     };
-  }, [loading, points, tasks.length]);
+  }, [loading, points]);
 }
