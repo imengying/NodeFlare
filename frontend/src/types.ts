@@ -109,6 +109,13 @@ export interface LatencySample {
   packet_loss: number;
 }
 
+export interface LiveLatencyResult {
+  task_id: string;
+  timestamp: number;
+  latency_ms: number;
+  packet_loss: number;
+}
+
 export interface LatencyTestPoint {
   id: string;
   name: string;
@@ -295,6 +302,15 @@ interface CloudflareUsagePeriod {
   rows_read: number;
   rows_written: number;
   workers_requests: number;
+  durable_objects_requests: number;
+  durable_objects_http_requests: number;
+  durable_objects_hibernation_wakeups: number;
+  durable_objects_inbound_websocket_messages: number;
+  durable_objects_outbound_websocket_messages: number;
+  durable_objects_raw_requests: number;
+  durable_objects_requests_estimated: boolean;
+  durable_objects_request_billing_ratio: number;
+  durable_objects_duration: number;
 }
 
 export interface CloudflareUsage {

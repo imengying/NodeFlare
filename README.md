@@ -33,7 +33,7 @@
 | `OFFLINE_THRESHOLD_SECONDS` | 可选 | 离线判定秒数，未设置时使用 180，范围 30-3600 |
 | `HISTORY_RETENTION_DAYS` | 可选 | 历史保留天数，未设置时使用 30，范围 1-365 |
 | `CF_USAGE_ACCOUNT_ID` | 可选 | Cloudflare 用量查询的账户 ID，不设置则不启用用量查询 |
-| `CF_USAGE_API_TOKEN` | 可选 | 用量查询 Token，勾选“加密”；需要 Account Analytics Read 权限 |
+| `CF_USAGE_API_TOKEN` | 可选 | 用量查询 Token，勾选“加密”；需要 Account Analytics: Read，并授权对应账户 |
 
 ## API
 
@@ -45,6 +45,7 @@
 | `GET` | `/api/history/:id?hours=24` | 节点历史 |
 | `GET` | `/api/latency/:id?hours=24` | 节点延迟任务历史 |
 | `GET` | `/api/ws` | 实时 WebSocket |
+| `GET` | `/api/agent/live` | Agent 实时指标 WebSocket |
 | `POST` | `/api/agent/report` | 探针上报，节点 Bearer token |
 | `POST` | `/api/admin/login` | 管理登录 |
 | `GET/POST` | `/api/admin/servers` | 管理节点 |
@@ -64,7 +65,7 @@
 | `GET` | `/api/admin/theme-settings` | 读取当前前端提供的主题设置描述 |
 | `POST` | `/api/turnstile/verify` | 校验全站 Turnstile 令牌 |
 | `GET` | `/api/admin/database` | 查询 D1 节点、历史和数据库统计 |
-| `GET` | `/api/admin/cloudflare-usage` | 查询 UTC 今日/昨日的 D1 与 Workers 用量 |
+| `GET` | `/api/admin/cloudflare-usage` | 查询 UTC 今日/昨日的 D1、Workers 与 Durable Objects 用量 |
 | `POST` | `/api/admin/exchange-rates/refresh` | 立即拉取并更新 D1 汇率快照 |
 | `DELETE` | `/api/admin/history` | 清理历史指标 |
 | `POST` | `/api/admin/notifications/test` | 发送一条通知测试消息 |

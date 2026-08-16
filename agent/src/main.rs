@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use sysinfo::{Disks, Networks, System};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::{connect, Error as WebSocketError, Message};
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 compile_error!("nodeflare-agent supports Linux, Windows, and macOS");
@@ -40,6 +42,16 @@ const REPORT_RETRY_MIN: Duration = Duration::from_secs(5);
 const REPORT_RETRY_MAX: Duration = Duration::from_secs(300);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const LIVE_RECONNECT_DELAY: Duration = Duration::from_secs(3);
+const LIVE_QUEUE_CAPACITY: usize = 720;
+// Keep each WebSocket frame comfortably below the Worker 1 MiB validation limit;
+// the queue preserves the remaining samples for the next frame.
+const LIVE_BATCH_CAPACITY: usize = 32;
+// D1 persistence can take a few hundred milliseconds; allow the ACK to arrive
+// before falling back to the configured interval.
+const LIVE_ACK_READ_TIMEOUT: Duration = Duration::from_millis(1_000);
+const CLOCK_CALIBRATION_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const CLOCK_CALIBRATION_MIN_CHANGE_MS: i64 = 20_000;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
@@ -187,6 +199,75 @@ struct GithubReleaseAsset {
 struct SubmitResult {
     config: Option<RemoteConfig>,
     config_hash: String,
+    clock_offset_ms: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct ClockCalibration {
+    offset_ms: i64,
+    calibrated_at: Option<Instant>,
+}
+
+impl ClockCalibration {
+    fn observe(&mut self, offset_ms: i64) -> bool {
+        let should_update = self.calibrated_at.is_none()
+            || self
+                .calibrated_at
+                .is_some_and(|at| at.elapsed() >= CLOCK_CALIBRATION_MAX_AGE)
+            || self.offset_ms.abs_diff(offset_ms) >= CLOCK_CALIBRATION_MIN_CHANGE_MS as u64;
+        if should_update {
+            self.offset_ms = offset_ms;
+            self.calibrated_at = Some(Instant::now());
+        }
+        should_update
+    }
+}
+
+type SharedClock = Arc<Mutex<ClockCalibration>>;
+
+struct LiveSender {
+    pending: Arc<(Mutex<Vec<Report>>, Condvar)>,
+    report_interval: Arc<Mutex<Duration>>,
+}
+
+impl LiveSender {
+    fn start(config: &RuntimeConfig, clock: SharedClock) -> Result<Self> {
+        let pending = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let report_interval = Arc::new(Mutex::new(Duration::from_secs(
+            config.report_interval.clamp(15, 3600),
+        )));
+        let endpoint = live_endpoint(&config.endpoint)?;
+        let token = config.token.clone();
+        let sender_state = Arc::clone(&pending);
+        let sender_interval = Arc::clone(&report_interval);
+        thread::Builder::new()
+            .name("nodeflare-live".to_string())
+            .spawn(move || {
+                live_sender_loop(&endpoint, &token, sender_state, sender_interval, clock)
+            })?;
+        Ok(Self {
+            pending,
+            report_interval,
+        })
+    }
+
+    fn send(&self, report: &Report) {
+        let (pending, ready) = &*self.pending;
+        if let Ok(mut pending) = pending.lock() {
+            if pending.len() >= LIVE_QUEUE_CAPACITY {
+                pending.remove(0);
+            }
+            pending.push(report.clone());
+            ready.notify_one();
+        }
+    }
+
+    fn set_report_interval(&self, seconds: u64) {
+        if let Ok(mut interval) = self.report_interval.lock() {
+            *interval = Duration::from_secs(seconds.clamp(15, 3600));
+        }
+        self.pending.1.notify_one();
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -216,7 +297,7 @@ struct GpuMetric {
     memory_total: i64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 struct Report {
     timestamp: i64,
     cpu: f64,
@@ -675,6 +756,52 @@ fn unix_timestamp() -> i64 {
         .as_secs() as i64
 }
 
+fn unix_timestamp_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn clock_offset_from_http_date(value: &str, started_ms: i64, ended_ms: i64) -> Option<i64> {
+    let server_ms: i64 = httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()?;
+    let midpoint_ms = started_ms.saturating_add(ended_ms.saturating_sub(started_ms) / 2);
+    Some(server_ms.saturating_sub(midpoint_ms))
+}
+
+fn clock_offset_from_server_seconds(value: &str, started_ms: i64, ended_ms: i64) -> Option<i64> {
+    let server_ms = value.trim().parse::<i64>().ok()?.saturating_mul(1_000);
+    let midpoint_ms = started_ms.saturating_add(ended_ms.saturating_sub(started_ms) / 2);
+    Some(server_ms.saturating_sub(midpoint_ms))
+}
+
+fn corrected_timestamp(timestamp: i64, offset_ms: i64) -> i64 {
+    timestamp
+        .saturating_mul(1_000)
+        .saturating_add(offset_ms)
+        .div_euclid(1_000)
+}
+
+fn shared_clock_offset(clock: &SharedClock) -> i64 {
+    clock.lock().map_or(0, |calibration| calibration.offset_ms)
+}
+
+fn observe_clock(clock: &SharedClock, offset_ms: Option<i64>) {
+    let Some(offset_ms) = offset_ms else {
+        return;
+    };
+    if let Ok(mut calibration) = clock.lock() {
+        calibration.observe(offset_ms);
+    }
+}
+
 fn execute_latency_task(task: LatencyTask) -> LatencyResult {
     let (latency_ms, packet_loss) = match task.task_type.as_str() {
         "tcp" => tcp_latency_probe(&task.target, task.port),
@@ -894,7 +1021,7 @@ fn u64_to_i64(value: u64) -> i64 {
 }
 
 #[cfg(target_os = "linux")]
-fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Report {
+fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>, timestamp: i64) -> Report {
     let cpu_before = cpu_sample();
     let io_before = io_sample(&config.network_interface);
     thread::sleep(Duration::from_secs(1));
@@ -955,7 +1082,7 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
         .saturating_add(io_after.write_millis.saturating_sub(io_before.write_millis));
 
     Report {
-        timestamp: unix_timestamp(),
+        timestamp,
         cpu,
         load1: loads.first().copied().unwrap_or(0.0),
         load5: loads.get(1).copied().unwrap_or(0.0),
@@ -1009,7 +1136,7 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Report {
+fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>, timestamp: i64) -> Report {
     let mut system = System::new_all();
     let mut networks = Networks::new_with_refreshed_list();
     thread::sleep(Duration::from_secs(1));
@@ -1066,7 +1193,7 @@ fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>) -> Repor
     let (tcp_connections, udp_connections) = connection_counts();
 
     Report {
-        timestamp: unix_timestamp(),
+        timestamp,
         cpu: system.global_cpu_usage() as f64,
         load1: load.one,
         load5: load.five,
@@ -1143,12 +1270,26 @@ fn submit(
     config_hash: &str,
 ) -> Result<SubmitResult> {
     let batch = ReportBatch { samples: reports };
+    let started_ms = unix_timestamp_millis();
     let mut response = agent
         .post(&format!("{}/api/agent/report", config.endpoint))
         .header("Authorization", format!("Bearer {}", config.token))
         .header("User-Agent", format!("nodeflare-agent/{VERSION}"))
         .header("X-Agent-Config-Sha256", config_hash)
         .send_json(batch)?;
+    let ended_ms = unix_timestamp_millis();
+    let clock_offset_ms = response
+        .headers()
+        .get("x-nodeflare-server-time")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| clock_offset_from_server_seconds(value, started_ms, ended_ms))
+        .or_else(|| {
+            response
+                .headers()
+                .get("date")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| clock_offset_from_http_date(value, started_ms, ended_ms))
+        });
     let next_hash = response
         .headers()
         .get("X-Agent-Config-Sha256")
@@ -1163,7 +1304,251 @@ fn submit(
     Ok(SubmitResult {
         config: remote,
         config_hash: next_hash,
+        clock_offset_ms,
     })
+}
+
+fn fetch_clock_offset(agent: &ureq::Agent, endpoint: &str) -> Result<Option<i64>> {
+    let started_ms = unix_timestamp_millis();
+    let response = agent
+        .get(&format!("{endpoint}/api/config"))
+        .header("User-Agent", format!("nodeflare-agent/{VERSION}"))
+        .call()?;
+    let ended_ms = unix_timestamp_millis();
+    Ok(response
+        .headers()
+        .get("x-nodeflare-server-time")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| clock_offset_from_server_seconds(value, started_ms, ended_ms))
+        .or_else(|| {
+            response
+                .headers()
+                .get("date")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| clock_offset_from_http_date(value, started_ms, ended_ms))
+        }))
+}
+
+fn live_endpoint(endpoint: &str) -> Result<String> {
+    let mut url = url::Url::parse(endpoint)?;
+    url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
+        .map_err(|_| "unsupported live endpoint scheme")?;
+    let path = format!("{}/api/agent/live", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    Ok(url.to_string())
+}
+
+type LiveSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
+
+fn connect_live(endpoint: &str, token: &str) -> Result<(LiveSocket, Option<i64>)> {
+    let mut request = endpoint.into_client_request()?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse()?);
+    request
+        .headers_mut()
+        .insert("User-Agent", format!("nodeflare-agent/{VERSION}").parse()?);
+    let started_ms = unix_timestamp_millis();
+    let (socket, response) = connect(request)?;
+    let ended_ms = unix_timestamp_millis();
+    let clock_offset_ms = response
+        .headers()
+        .get("date")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| clock_offset_from_http_date(value, started_ms, ended_ms));
+    Ok((socket, clock_offset_ms))
+}
+
+fn set_live_read_timeout(socket: &mut LiveSocket, timeout: Option<Duration>) -> io::Result<()> {
+    match socket.get_mut() {
+        tungstenite::stream::MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
+        tungstenite::stream::MaybeTlsStream::Rustls(stream) => {
+            stream.sock.set_read_timeout(timeout)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveAck {
+    #[serde(rename = "type")]
+    message_type: String,
+    ts: i64,
+    persisted: bool,
+    #[serde(rename = "nextD1WriteAfterMs")]
+    next_d1_write_after_ms: u64,
+    #[serde(rename = "nextWssReportAfterMs")]
+    next_wss_report_after_ms: Option<u64>,
+}
+
+fn ack_interval(ack: &LiveAck, fallback: Duration) -> Duration {
+    ack.next_wss_report_after_ms
+        .map(Duration::from_millis)
+        .map(|interval| interval.clamp(Duration::from_secs(2), Duration::from_secs(3600)))
+        .unwrap_or(fallback)
+}
+
+fn read_live_ack(socket: &mut LiveSocket, current_interval: Duration) -> Result<Option<Duration>> {
+    match socket.read() {
+        Ok(Message::Text(text)) => {
+            let Ok(ack) = serde_json::from_str::<LiveAck>(text.as_ref()) else {
+                return Ok(None);
+            };
+            if ack.message_type != "ack" || ack.ts <= 0 {
+                return Ok(None);
+            }
+            let _ = (ack.persisted, ack.next_d1_write_after_ms);
+            Ok(Some(ack_interval(&ack, current_interval)))
+        }
+        Ok(Message::Ping(payload)) => {
+            socket.send(Message::Pong(payload))?;
+            Ok(None)
+        }
+        Ok(Message::Close(_)) => Ok(Some(Duration::ZERO)),
+        Ok(_) => Ok(None),
+        Err(WebSocketError::Io(error))
+            if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn live_update_payload(reports: &[Report]) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "type": "update",
+        "samples": reports,
+    }))?)
+}
+
+fn requeue_reports(pending: &Arc<(Mutex<Vec<Report>>, Condvar)>, reports: Vec<Report>) {
+    if reports.is_empty() {
+        return;
+    }
+    let (queue, ready) = &**pending;
+    if let Ok(mut queue) = queue.lock() {
+        let mut merged = reports;
+        merged.append(&mut queue);
+        if merged.len() > LIVE_QUEUE_CAPACITY {
+            merged.truncate(LIVE_QUEUE_CAPACITY);
+        }
+        *queue = merged;
+        ready.notify_one();
+    }
+}
+
+fn live_sender_loop(
+    endpoint: &str,
+    token: &str,
+    pending: Arc<(Mutex<Vec<Report>>, Condvar)>,
+    configured_interval: Arc<Mutex<Duration>>,
+    clock: SharedClock,
+) {
+    let mut socket: Option<LiveSocket> = None;
+    let mut send_interval = configured_interval
+        .lock()
+        .map(|interval| *interval)
+        .unwrap_or(Duration::from_secs(60));
+    let mut next_send_at = Instant::now();
+    loop {
+        let (queue, ready) = &*pending;
+        let mut queue = match queue.lock() {
+            Ok(queue) => queue,
+            Err(_) => return,
+        };
+        while queue.is_empty() || Instant::now() < next_send_at {
+            let wait = if queue.is_empty() {
+                Duration::from_millis(250)
+            } else {
+                next_send_at
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(250))
+            };
+            queue = match ready.wait_timeout(queue, wait) {
+                Ok((queue, _)) => queue,
+                Err(_) => return,
+            };
+        }
+        let count = queue.len().min(LIVE_BATCH_CAPACITY);
+        let batch = queue.drain(..count).collect::<Vec<_>>();
+        drop(queue);
+
+        if let Ok(interval) = configured_interval.lock() {
+            send_interval = (*interval).min(Duration::from_secs(3600));
+        }
+        if socket.is_none() {
+            match connect_live(endpoint, token) {
+                Ok((mut connected, offset_ms)) => {
+                    observe_clock(&clock, offset_ms);
+                    if set_live_read_timeout(&mut connected, Some(LIVE_ACK_READ_TIMEOUT)).is_err() {
+                        socket = None;
+                        thread::sleep(LIVE_RECONNECT_DELAY);
+                        requeue_reports(&pending, batch);
+                        continue;
+                    }
+                    socket = Some(connected);
+                }
+                Err(error) => {
+                    eprintln!("live connection failed: {error}");
+                    requeue_reports(&pending, batch);
+                    thread::sleep(LIVE_RECONNECT_DELAY);
+                    continue;
+                }
+            }
+        }
+
+        let payload = match live_update_payload(&batch) {
+            Ok(payload) => payload,
+            Err(error) => {
+                eprintln!("live payload encode failed: {error}");
+                requeue_reports(&pending, batch);
+                continue;
+            }
+        };
+        let sent = socket
+            .as_mut()
+            .is_some_and(|socket| socket.send(Message::Text(payload.clone().into())).is_ok());
+        if !sent {
+            socket = None;
+            thread::sleep(LIVE_RECONNECT_DELAY);
+            let mut resent = false;
+            if let Ok((mut connected, offset_ms)) = connect_live(endpoint, token) {
+                observe_clock(&clock, offset_ms);
+                if set_live_read_timeout(&mut connected, Some(LIVE_ACK_READ_TIMEOUT)).is_ok()
+                    && connected.send(Message::Text(payload.into())).is_ok()
+                {
+                    socket = Some(connected);
+                    resent = true;
+                }
+            }
+            if !resent {
+                requeue_reports(&pending, batch);
+            }
+            continue;
+        }
+
+        next_send_at = Instant::now() + send_interval;
+        let mut drop_socket = false;
+        if let Some(socket) = socket.as_mut() {
+            match read_live_ack(socket, send_interval) {
+                Ok(Some(Duration::ZERO)) => drop_socket = true,
+                Ok(Some(interval)) => {
+                    send_interval = interval;
+                    next_send_at = Instant::now() + send_interval;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("live ACK read failed: {error}");
+                    drop_socket = true;
+                }
+            }
+        }
+        if drop_socket {
+            socket = None;
+        }
+    }
 }
 
 fn apply_remote(config: &mut RuntimeConfig, remote: &RemoteConfig) -> bool {
@@ -1480,6 +1865,16 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
     let mut report_failures = 0_u32;
     let mut next_update_check = Instant::now();
     let mut config_hash = String::new();
+    let clock = Arc::new(Mutex::new(ClockCalibration::default()));
+    if !print_only {
+        match fetch_clock_offset(&agent, &config.endpoint) {
+            Ok(offset_ms) => observe_clock(&clock, offset_ms),
+            Err(error) => eprintln!("server time calibration failed: {error}"),
+        }
+    }
+    let live = (!once && !print_only)
+        .then(|| LiveSender::start(&config, Arc::clone(&clock)))
+        .transpose()?;
     loop {
         pending_results.extend(latency_executor.drain());
         let current = Instant::now();
@@ -1505,17 +1900,26 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
         }
 
         if Instant::now() >= next_collect {
+            let offset_ms = shared_clock_offset(&clock);
             let mut latest_results = HashMap::new();
-            for result in std::mem::take(&mut pending_results) {
+            for mut result in std::mem::take(&mut pending_results) {
+                result.timestamp = corrected_timestamp(result.timestamp, offset_ms);
                 latest_results.insert(result.task_id.clone(), result);
             }
-            let report = collect(&config, latest_results.into_values().collect());
+            let mut report = collect(&config, latest_results.into_values().collect(), 0);
+            report.timestamp = corrected_timestamp(unix_timestamp(), offset_ms);
             if print_only {
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 return Ok(());
             }
+            if let Some(live) = &live {
+                live.send(&report);
+            }
             pending_samples.push(report);
-            prune_report_samples(&mut pending_samples, unix_timestamp());
+            prune_report_samples(
+                &mut pending_samples,
+                corrected_timestamp(unix_timestamp(), offset_ms),
+            );
             if pending_samples.len() > 720 {
                 let overflow = pending_samples.len() - 720;
                 pending_samples.drain(..overflow);
@@ -1526,12 +1930,16 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
         if Instant::now() >= next_report && !pending_samples.is_empty() {
             match submit(&agent, &config, &pending_samples, &config_hash) {
                 Ok(result) => {
+                    observe_clock(&clock, result.clock_offset_ms);
                     pending_samples.clear();
                     report_failures = 0;
                     config_hash = result.config_hash;
                     if let Some(remote) = result.config {
                         if apply_remote(&mut config, &remote) {
                             next_latency.clear();
+                        }
+                        if let Some(live) = &live {
+                            live.set_report_interval(config.report_interval);
                         }
                     }
                     if !once && config.auto_update && Instant::now() >= next_update_check {
@@ -1592,15 +2000,17 @@ mod tests {
     use clap::Parser;
     use std::net::TcpListener;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
-        agent_artifact_name, executable_format_valid, gpu_name_from_uevent, is_public_probe_ip,
-        median, normalized_version, parse_lspci_gpu_names, parse_probe_target,
+        ack_interval, agent_artifact_name, clock_offset_from_http_date, corrected_timestamp,
+        executable_format_valid, gpu_name_from_uevent, is_public_probe_ip, live_endpoint,
+        live_update_payload, median, normalized_version, parse_lspci_gpu_names, parse_probe_target,
         parse_system_profiler_gpu_names, ping_latency, prune_report_samples, release_asset_sha256,
         report_retry_delay, sanitize_latency_tasks, selected_interface, tcp_latency_probe_address,
-        valid_endpoint, version_triplet, CliOptions, GithubReleaseAsset, LatencyResult,
-        LatencyTask, Report, MAX_LATENCY_TASKS, MAX_PENDING_LATENCY_RESULTS, PROBE_ATTEMPTS,
+        valid_endpoint, version_triplet, CliOptions, ClockCalibration, GithubReleaseAsset,
+        LatencyResult, LatencyTask, LiveAck, Report, CLOCK_CALIBRATION_MAX_AGE, MAX_LATENCY_TASKS,
+        MAX_PENDING_LATENCY_RESULTS, PROBE_ATTEMPTS,
     };
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1691,6 +2101,89 @@ mod tests {
         assert!(!valid_endpoint("https://user@example.com"));
         assert!(!valid_endpoint("https://monitor.example.com/?token=abc"));
         assert!(!valid_endpoint("https://bad host.example"));
+    }
+
+    #[test]
+    fn builds_live_websocket_endpoints() {
+        assert_eq!(
+            live_endpoint("https://monitor.example.com").unwrap(),
+            "wss://monitor.example.com/api/agent/live"
+        );
+        assert_eq!(
+            live_endpoint("https://monitor.example.com/base/").unwrap(),
+            "wss://monitor.example.com/base/api/agent/live"
+        );
+        assert_eq!(
+            live_endpoint("http://127.0.0.1:8787").unwrap(),
+            "ws://127.0.0.1:8787/api/agent/live"
+        );
+    }
+
+    #[test]
+    fn accepts_server_realtime_ack_interval() {
+        let ack: LiveAck = serde_json::from_str(
+            r#"{"type":"ack","ts":100,"persisted":false,"nextD1WriteAfterMs":60000,"nextWssReportAfterMs":5000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ack_interval(&ack, Duration::from_secs(60)),
+            Duration::from_secs(5)
+        );
+        let slow: LiveAck = serde_json::from_str(
+            r#"{"type":"ack","ts":100,"persisted":true,"nextD1WriteAfterMs":60000,"nextWssReportAfterMs":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ack_interval(&slow, Duration::from_secs(60)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn encodes_realtime_samples_as_a_batch() {
+        let payload = live_update_payload(&[
+            Report {
+                timestamp: 10,
+                cpu: 20.0,
+                ..Report::default()
+            },
+            Report {
+                timestamp: 15,
+                cpu: 30.0,
+                ..Report::default()
+            },
+        ])
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["type"], "update");
+        assert_eq!(value["samples"].as_array().unwrap().len(), 2);
+        assert_eq!(value["samples"][1]["cpu"], 30.0);
+    }
+
+    #[test]
+    fn calibrates_timestamps_from_http_date() {
+        let server_ms = 784_111_777_000_i64;
+        assert_eq!(
+            clock_offset_from_http_date(
+                "Sun, 06 Nov 1994 08:49:37 GMT",
+                server_ms - 1_000,
+                server_ms + 1_000,
+            ),
+            Some(0),
+        );
+        assert_eq!(corrected_timestamp(100, 2_500), 102);
+        assert_eq!(corrected_timestamp(100, -2_500), 97);
+    }
+
+    #[test]
+    fn ignores_small_clock_jitter_until_the_calibration_expires() {
+        let mut calibration = ClockCalibration::default();
+        assert!(calibration.observe(1_000));
+        assert!(!calibration.observe(2_000));
+        assert_eq!(calibration.offset_ms, 1_000);
+        assert!(calibration.observe(25_000));
+        calibration.calibrated_at = Some(Instant::now() - CLOCK_CALIBRATION_MAX_AGE);
+        assert!(calibration.observe(25_001));
     }
 
     #[test]

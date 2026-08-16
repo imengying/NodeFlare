@@ -9,7 +9,7 @@ use worker::{
     Date, Env, Request,
 };
 
-const SESSION_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const ADMIN_SESSION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const TURNSTILE_PROOF_SECONDS: i64 = 60 * 60;
 const THEME_PREVIEW_SECONDS: i64 = 10 * 60;
 const SERVER_PASSWORD_ROUNDS: u32 = 10_000;
@@ -137,7 +137,7 @@ fn create_admin_jwt_with_secret(secret: &str, issued_at: i64) -> Option<String> 
         serde_json::to_vec(&AdminClaims {
             sub: "admin".to_string(),
             iat: issued_at,
-            exp: issued_at + SESSION_SECONDS,
+            exp: issued_at + ADMIN_SESSION_SECONDS,
         })
         .ok()?,
     );
@@ -177,7 +177,7 @@ fn verify_admin_jwt(token: &str, secret: &str, now: i64) -> bool {
     claims.sub == "admin"
         && claims.iat <= now + 60
         && claims.exp >= now
-        && claims.exp == claims.iat + SESSION_SECONDS
+        && claims.exp == claims.iat + ADMIN_SESSION_SECONDS
 }
 
 pub fn create_admin_jwt(env: &Env, password_hash: &str) -> Option<String> {
@@ -189,14 +189,33 @@ pub fn is_admin(req: &Request, env: &Env, password_hash: &str) -> bool {
     let Some(secret) = signing_secret(env, password_hash) else {
         return false;
     };
-    let Ok(Some(header)) = req.headers().get("Authorization") else {
-        return false;
-    };
-    let Some(token) = header.strip_prefix("Bearer ") else {
-        return false;
-    };
     let now = Date::now().as_millis() as i64 / 1000;
-    verify_admin_jwt(token, &secret, now)
+    let bearer_valid = req
+        .headers()
+        .get("Authorization")
+        .ok()
+        .flatten()
+        .is_some_and(|header| {
+            header
+                .strip_prefix("Bearer ")
+                .is_some_and(|token| verify_admin_jwt(token, &secret, now))
+        });
+    if bearer_valid {
+        return true;
+    }
+    req.headers()
+        .get("Cookie")
+        .ok()
+        .flatten()
+        .is_some_and(|cookies| {
+            cookies
+                .split(';')
+                .find_map(|entry| {
+                    let (name, value) = entry.trim().split_once('=')?;
+                    (name == "nodeflare_admin").then_some(value)
+                })
+                .is_some_and(|token| verify_admin_jwt(token, &secret, now))
+        })
 }
 
 pub fn create_turnstile_proof(env: &Env, password_hash: &str) -> Option<String> {
@@ -273,7 +292,7 @@ pub fn bearer_token(req: &Request) -> Option<String> {
 mod tests {
     use super::{
         create_admin_jwt_with_secret, hash_password, verify_admin_jwt, verify_password_hash,
-        SESSION_SECONDS,
+        ADMIN_SESSION_SECONDS,
     };
 
     #[test]
@@ -303,12 +322,12 @@ mod tests {
         assert!(verify_admin_jwt(
             &token,
             "d1-password-hash",
-            issued_at + SESSION_SECONDS
+            issued_at + ADMIN_SESSION_SECONDS
         ));
         assert!(!verify_admin_jwt(
             &token,
             "d1-password-hash",
-            issued_at + SESSION_SECONDS + 1
+            issued_at + ADMIN_SESSION_SECONDS + 1
         ));
         assert!(!verify_admin_jwt(&token, "different-secret", issued_at));
     }

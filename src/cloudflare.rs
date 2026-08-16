@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use worker::{wasm_bindgen::JsValue, Fetch, Method, Request, RequestInit, Result};
 
 const GRAPHQL_URL: &str = "https://api.cloudflare.com/client/v4/graphql";
+const DURABLE_OBJECTS_WEBSOCKET_MESSAGE_BILLING_RATIO: i64 = 20;
 const USAGE_QUERY: &str = r#"
 query CloudflareUsage(
   $accountTag: string!,
@@ -24,6 +25,19 @@ query CloudflareUsage(
       ) {
         sum { requests }
       }
+      durableObjectsInvocationsAdaptiveGroups(
+        limit: 10000,
+        filter: { date_geq: $start, date_leq: $end }
+      ) {
+        sum { requests }
+        dimensions { type }
+      }
+      durableObjectsPeriodicGroups(
+        limit: 10000,
+        filter: { date_geq: $start, date_leq: $end }
+      ) {
+        sum { duration inboundWebsocketMsgCount outboundWebsocketMsgCount }
+      }
     }
   }
 }
@@ -34,6 +48,15 @@ pub struct UsagePeriod {
     pub rows_read: i64,
     pub rows_written: i64,
     pub workers_requests: i64,
+    pub durable_objects_requests: i64,
+    pub durable_objects_http_requests: i64,
+    pub durable_objects_hibernation_wakeups: i64,
+    pub durable_objects_inbound_websocket_messages: i64,
+    pub durable_objects_outbound_websocket_messages: i64,
+    pub durable_objects_raw_requests: i64,
+    pub durable_objects_requests_estimated: bool,
+    pub durable_objects_request_billing_ratio: i64,
+    pub durable_objects_duration: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,8 +84,7 @@ struct GraphQlVariables<'a> {
 #[derive(Deserialize)]
 struct GraphQlResponse {
     data: Option<GraphQlData>,
-    #[serde(default)]
-    errors: Vec<GraphQlError>,
+    errors: Option<Vec<GraphQlError>>,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +109,10 @@ struct AccountUsage {
     d1_analytics_adaptive_groups: Vec<D1Group>,
     #[serde(default)]
     workers_invocations_adaptive: Vec<WorkersGroup>,
+    #[serde(default)]
+    durable_objects_invocations_adaptive_groups: Vec<DurableObjectsInvocationGroup>,
+    #[serde(default)]
+    durable_objects_periodic_groups: Vec<DurableObjectsPeriodicGroup>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +138,104 @@ struct WorkersGroup {
 struct WorkersSum {
     #[serde(default)]
     requests: i64,
+}
+
+#[derive(Deserialize)]
+struct DurableObjectsInvocationGroup {
+    sum: DurableObjectsInvocationSum,
+    dimensions: DurableObjectsInvocationDimensions,
+}
+
+#[derive(Deserialize)]
+struct DurableObjectsInvocationSum {
+    #[serde(default)]
+    requests: i64,
+}
+
+#[derive(Deserialize)]
+struct DurableObjectsInvocationDimensions {
+    #[serde(rename = "type", default)]
+    invocation_type: String,
+}
+
+#[derive(Deserialize)]
+struct DurableObjectsPeriodicGroup {
+    sum: DurableObjectsPeriodicSum,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableObjectsPeriodicSum {
+    #[serde(default)]
+    duration: f64,
+    #[serde(default)]
+    inbound_websocket_msg_count: i64,
+    #[serde(default)]
+    outbound_websocket_msg_count: i64,
+}
+
+#[derive(Default)]
+struct DurableObjectsSummary {
+    http_requests: i64,
+    hibernation_wakeups: i64,
+    inbound_websocket_messages: i64,
+    outbound_websocket_messages: i64,
+    raw_requests: i64,
+    billable_requests: i64,
+    duration: f64,
+}
+
+fn is_hibernation_invocation_type(value: &str) -> bool {
+    let normalized = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized.contains("hibernation")
+        || (normalized.contains("websocket") && normalized.contains("message"))
+}
+
+fn ceil_div_nonnegative(value: i64, divisor: i64) -> i64 {
+    if value <= 0 {
+        0
+    } else {
+        value.saturating_add(divisor - 1) / divisor
+    }
+}
+
+fn summarize_durable_objects(
+    invocation_groups: Vec<DurableObjectsInvocationGroup>,
+    periodic_groups: Vec<DurableObjectsPeriodicGroup>,
+) -> DurableObjectsSummary {
+    let mut summary = DurableObjectsSummary::default();
+    for group in invocation_groups {
+        let requests = group.sum.requests.max(0);
+        summary.raw_requests = summary.raw_requests.saturating_add(requests);
+        if is_hibernation_invocation_type(&group.dimensions.invocation_type) {
+            summary.hibernation_wakeups = summary.hibernation_wakeups.saturating_add(requests);
+        } else {
+            summary.http_requests = summary.http_requests.saturating_add(requests);
+        }
+    }
+    for group in periodic_groups {
+        summary.inbound_websocket_messages = summary
+            .inbound_websocket_messages
+            .saturating_add(group.sum.inbound_websocket_msg_count.max(0));
+        summary.outbound_websocket_messages = summary
+            .outbound_websocket_messages
+            .saturating_add(group.sum.outbound_websocket_msg_count.max(0));
+        if group.sum.duration.is_finite() && group.sum.duration > 0.0 {
+            summary.duration += group.sum.duration;
+        }
+    }
+    summary.billable_requests = summary
+        .http_requests
+        .saturating_add(summary.hibernation_wakeups)
+        .saturating_add(ceil_div_nonnegative(
+            summary.inbound_websocket_messages,
+            DURABLE_OBJECTS_WEBSOCKET_MESSAGE_BILLING_RATIO,
+        ));
+    summary
 }
 
 pub fn date_from_unix_days(days: i64) -> String {
@@ -155,9 +279,9 @@ async fn query_period(token: &str, account_id: &str, date: &str) -> Result<Usage
     let mut response = Fetch::Request(request).send().await?;
     let status = response.status_code();
     let payload: GraphQlResponse = response.json().await?;
-    if !(200..300).contains(&status) || !payload.errors.is_empty() {
-        let message = payload
-            .errors
+    let errors = payload.errors.unwrap_or_default();
+    if !(200..300).contains(&status) || !errors.is_empty() {
+        let message = errors
             .into_iter()
             .map(|value| value.message)
             .collect::<Vec<_>>()
@@ -187,18 +311,33 @@ async fn query_period(token: &str, account_id: &str, date: &str) -> Result<Usage
         .fold(0_i64, |total, group| {
             total.saturating_add(group.sum.requests)
         });
+    let durable_objects = summarize_durable_objects(
+        account.durable_objects_invocations_adaptive_groups,
+        account.durable_objects_periodic_groups,
+    );
     Ok(UsagePeriod {
         rows_read,
         rows_written,
         workers_requests,
+        durable_objects_requests: durable_objects.billable_requests,
+        durable_objects_http_requests: durable_objects.http_requests,
+        durable_objects_hibernation_wakeups: durable_objects.hibernation_wakeups,
+        durable_objects_inbound_websocket_messages: durable_objects.inbound_websocket_messages,
+        durable_objects_outbound_websocket_messages: durable_objects.outbound_websocket_messages,
+        durable_objects_raw_requests: durable_objects.raw_requests,
+        durable_objects_requests_estimated: true,
+        durable_objects_request_billing_ratio: DURABLE_OBJECTS_WEBSOCKET_MESSAGE_BILLING_RATIO,
+        durable_objects_duration: durable_objects.duration,
     })
 }
 
 pub async fn usage(token: &str, account_id: &str, now: i64) -> Result<CloudflareUsage> {
     let today = date_from_unix_days(now.div_euclid(86_400));
     let yesterday = date_from_unix_days(now.div_euclid(86_400) - 1);
-    let today_usage = query_period(token, account_id, &today).await?;
-    let yesterday_usage = query_period(token, account_id, &yesterday).await?;
+    let (today_usage, yesterday_usage) = futures_util::try_join!(
+        query_period(token, account_id, &today),
+        query_period(token, account_id, &yesterday)
+    )?;
     Ok(CloudflareUsage {
         today: today_usage,
         yesterday: yesterday_usage,
@@ -207,11 +346,67 @@ pub async fn usage(token: &str, account_id: &str, now: i64) -> Result<Cloudflare
 
 #[cfg(test)]
 mod tests {
-    use super::date_from_unix_days;
+    use super::{
+        ceil_div_nonnegative, date_from_unix_days, is_hibernation_invocation_type,
+        summarize_durable_objects, DurableObjectsInvocationDimensions,
+        DurableObjectsInvocationGroup, DurableObjectsInvocationSum, DurableObjectsPeriodicGroup,
+        DurableObjectsPeriodicSum, GraphQlResponse,
+    };
 
     #[test]
     fn converts_unix_days_to_utc_date() {
         assert_eq!(date_from_unix_days(0), "1970-01-01");
         assert_eq!(date_from_unix_days(20_673), "2026-08-08");
+    }
+
+    #[test]
+    fn accepts_null_errors_in_successful_graphql_responses() {
+        let response: GraphQlResponse =
+            serde_json::from_str(r#"{"data":{"viewer":{"accounts":[]}},"errors":null}"#)
+                .expect("Cloudflare GraphQL response");
+        assert!(response.errors.is_none());
+    }
+
+    #[test]
+    fn classifies_durable_objects_hibernation_invocations() {
+        assert!(is_hibernation_invocation_type("webSocketMessage"));
+        assert!(is_hibernation_invocation_type("hibernationWakeup"));
+        assert!(!is_hibernation_invocation_type("fetch"));
+    }
+
+    #[test]
+    fn calculates_durable_objects_billable_requests() {
+        let summary = summarize_durable_objects(
+            vec![
+                DurableObjectsInvocationGroup {
+                    sum: DurableObjectsInvocationSum { requests: 7 },
+                    dimensions: DurableObjectsInvocationDimensions {
+                        invocation_type: "fetch".to_string(),
+                    },
+                },
+                DurableObjectsInvocationGroup {
+                    sum: DurableObjectsInvocationSum { requests: 3 },
+                    dimensions: DurableObjectsInvocationDimensions {
+                        invocation_type: "webSocketMessage".to_string(),
+                    },
+                },
+            ],
+            vec![DurableObjectsPeriodicGroup {
+                sum: DurableObjectsPeriodicSum {
+                    duration: 2.5,
+                    inbound_websocket_msg_count: 21,
+                    outbound_websocket_msg_count: 11,
+                },
+            }],
+        );
+        assert_eq!(summary.http_requests, 7);
+        assert_eq!(summary.hibernation_wakeups, 3);
+        assert_eq!(summary.raw_requests, 10);
+        assert_eq!(summary.billable_requests, 12);
+        assert_eq!(summary.outbound_websocket_messages, 11);
+        assert_eq!(summary.duration, 2.5);
+        assert_eq!(ceil_div_nonnegative(0, 20), 0);
+        assert_eq!(ceil_div_nonnegative(20, 20), 1);
+        assert_eq!(ceil_div_nonnegative(21, 20), 2);
     }
 }

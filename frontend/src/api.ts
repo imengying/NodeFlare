@@ -54,6 +54,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ username, password, password_derived: passwordDerived, turnstile_token: turnstileToken }),
     }),
+  logout: () => request<void>("/api/admin/logout", { method: "POST" }),
   settings: () => request<Settings>("/api/admin/settings", {}, true),
   latencyTasks: () => request<{ tasks: LatencyTask[] }>("/api/admin/latency-tasks", {}, true),
   createLatencyTask: (input: LatencyTaskInput) =>

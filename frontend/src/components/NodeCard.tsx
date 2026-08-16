@@ -74,7 +74,7 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
   const locale = config.locale;
   const price = formatPrice(server, locale);
   const remainingValue = remainingAssetValue(server.price, server.billing_cycle, server.expires_at);
-  const showExpiryPanel = config.show_expiry && (server.price !== 0 || server.expires_at !== null);
+  const showExpiryPanel = config.show_expiry || config.show_price;
 
   return (
     <button className={`node-card glass-panel ${online ? "" : "offline"}`} onClick={onOpen} type="button" aria-label={ui(locale, `查看 ${server.name} 详情`, `View ${server.name} details`)}>
@@ -87,7 +87,9 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
 
       <div className="node-body">
         <div className="node-chips">
-          {config.show_uptime ? <span>{ui(locale, `在线 ${Math.floor(number(server.uptime) / 86400)} 天`, `Online ${Math.floor(number(server.uptime) / 86400)} days`)}</span> : null}
+          {config.show_uptime ? <span>{online
+            ? ui(locale, `在线 ${Math.floor(number(server.uptime) / 86400)} 天`, `Online ${Math.floor(number(server.uptime) / 86400)} days`)
+            : ui(locale, `离线 · ${timeAgo(server.timestamp, locale)}`, `Offline · ${timeAgo(server.timestamp, locale)}`)}</span> : null}
           {config.show_price && price ? <span title={price}>{price}</span> : null}
         </div>
 
@@ -108,8 +110,10 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
             <CompactLine icon={<Download size={11} />}>{formatBytes(server.net_rx_total)}</CompactLine>
           </div>
           {showExpiryPanel ? <div className="data-panel" aria-label="剩余周期">
-            <CompactLine icon={<CalendarDays size={11} />}>{formatExpire(server, locale)}</CompactLine>
-            {server.price !== 0 ? <CompactLine icon={<Coins size={11} />}>{server.price === -1 ? ui(locale, "免费", "Free") : formatCurrency(remainingValue, server.currency)}</CompactLine> : null}
+            {config.show_expiry ? <CompactLine icon={<CalendarDays size={11} />}>{formatExpire(server, locale)}</CompactLine> : null}
+            {config.show_price ? <CompactLine icon={<Coins size={11} />}>{server.price === -1
+              ? ui(locale, "免费", "Free")
+              : server.price > 0 ? formatCurrency(remainingValue, server.currency) : ui(locale, "未设置", "Not set")}</CompactLine> : null}
           </div> : null}
         </div>
 
@@ -117,8 +121,6 @@ export function NodeCard({ server, config, onOpen }: { server: Server; config: C
           <QualityPanel label={ui(locale, "延迟", "Latency")} value={quality.latencyDisplay} bars={quality.latencyBars} />
           <QualityPanel label={ui(locale, "丢包", "Packet loss")} value={quality.lossDisplay} bars={quality.lossBars} />
         </div> : null}
-
-        {!online ? <div className="offline-layer"><strong>{ui(locale, "离线", "Offline")}</strong><span>{ui(locale, `最后更新 ${timeAgo(server.timestamp, locale)}`, `Last update ${timeAgo(server.timestamp, locale)}`)}</span></div> : null}
       </div>
     </button>
   );

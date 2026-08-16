@@ -70,6 +70,21 @@ struct AgentConfigRow {
     auto_update: i64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AgentLiveContext {
+    pub report_interval: i64,
+    pub collect_interval: i64,
+    pub reset_day: i64,
+    pub cycle_key: i64,
+    pub raw_rx: i64,
+    pub raw_tx: i64,
+    pub used_rx: i64,
+    pub used_tx: i64,
+    pub rx_correction: i64,
+    pub tx_correction: i64,
+    pub last_persisted_at: i64,
+}
+
 #[derive(Serialize)]
 struct TrafficCounterSample {
     timestamp: i64,
@@ -113,6 +128,7 @@ pub struct SettingsView {
     pub password_client_salt: String,
     pub turnstile_enabled: bool,
     pub turnstile_login_enabled: bool,
+    #[serde(serialize_with = "serialize_secret")]
     pub turnstile_site_key: String,
     #[serde(serialize_with = "serialize_secret")]
     pub turnstile_secret_key: String,
@@ -122,6 +138,7 @@ pub struct SettingsView {
     pub notification_target: String,
     pub offline_alert_minutes: i64,
     pub expiry_alert_days: i64,
+    #[serde(serialize_with = "serialize_secret")]
     pub cloudflare_account_id: String,
     #[serde(serialize_with = "serialize_secret")]
     pub cloudflare_api_token: String,
@@ -215,7 +232,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
-fn traffic_cycle_key(timestamp: i64, reset_day: i64) -> i64 {
+pub(crate) fn traffic_cycle_key(timestamp: i64, reset_day: i64) -> i64 {
     let (year, month, day) = civil_date_from_unix_days(timestamp.div_euclid(86_400));
     let boundary = reset_day.clamp(1, 31).min(days_in_month(year, month));
     let current_month = year * 12 + month - 1;
@@ -255,6 +272,38 @@ pub async fn get_agent_identity(db: &D1Database, token: &str) -> Result<Option<A
         .bind(&[text(token)])?
         .first(None)
         .await
+}
+
+pub async fn agent_live_context(db: &D1Database, id: &str) -> Result<Option<AgentLiveContext>> {
+    let mut context: Option<AgentLiveContext> = db
+        .prepare(
+            r#"SELECT
+             s.report_interval,
+             s.collect_interval,
+             s.reset_day,
+             COALESCE(c.cycle_key, 0) AS cycle_key,
+             COALESCE(c.raw_rx, m.net_rx_total, 0) AS raw_rx,
+             COALESCE(c.raw_tx, m.net_tx_total, 0) AS raw_tx,
+             COALESCE(c.used_rx, m.net_rx_total, 0) AS used_rx,
+             COALESCE(c.used_tx, m.net_tx_total, 0) AS used_tx,
+             s.rx_correction,
+             s.tx_correction,
+             COALESCE(m.timestamp, 0) AS last_persisted_at
+           FROM servers s
+           LEFT JOIN latest_metrics m ON m.server_id = s.id
+           LEFT JOIN traffic_cycles c ON c.server_id = s.id
+           WHERE s.id = ?1
+           LIMIT 1"#,
+        )
+        .bind(&[text(id)])?
+        .first(None)
+        .await?;
+    if let Some(context) = context.as_mut() {
+        if context.cycle_key == 0 {
+            context.cycle_key = traffic_cycle_key(crate::now(), context.reset_day);
+        }
+    }
+    Ok(context)
 }
 
 pub async fn get_agent_token(db: &D1Database, id: &str) -> Result<Option<String>> {
@@ -1122,7 +1171,11 @@ pub async fn update_settings(
             if value { "true" } else { "false" }
         );
     }
-    if let Some(value) = input.turnstile_site_key.as_deref() {
+    if let Some(value) = input
+        .turnstile_site_key
+        .as_deref()
+        .filter(|value| value.trim() != SECRET_MASK)
+    {
         push_setting!("turnstile_site_key", value.trim());
     }
     if let Some(value) = input
@@ -1153,14 +1206,13 @@ pub async fn update_settings(
         let value = value.clamp(0, 365).to_string();
         push_setting!("expiry_alert_days", &value);
     }
-    macro_rules! push_trimmed {
-        ($field:expr, $key:expr) => {
-            if let Some(value) = $field.as_deref() {
-                push_setting!($key, value.trim());
-            }
-        };
+    if let Some(value) = input
+        .cloudflare_account_id
+        .as_deref()
+        .filter(|value| value.trim() != SECRET_MASK)
+    {
+        push_setting!("cloudflare_account_id", value.trim());
     }
-    push_trimmed!(input.cloudflare_account_id, "cloudflare_account_id");
     if let Some(value) = input
         .cloudflare_api_token
         .as_deref()

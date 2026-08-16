@@ -8,9 +8,28 @@ SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 OPENRC_FILE="/etc/init.d/$SERVICE_NAME"
 
 usage() {
-  echo "Usage: agent.sh -e ENDPOINT -t TOKEN [-i 60]"
-  echo "       agent.sh --uninstall"
-  echo "       agent.sh --status"
+  cat <<'EOF'
+NodeFlare Agent 安装脚本
+
+用法：
+  agent.sh -e <Worker URL> -t <Agent Token> [-i <上报间隔>]
+  agent.sh --status
+  agent.sh --uninstall
+
+参数：
+  -e  NodeFlare Worker 地址（必填）
+  -t  后台生成的 Agent Token（必填，请勿泄露）
+  -i  初始上报间隔，15-3600 秒（默认 60）
+EOF
+}
+
+log() {
+  printf '[NodeFlare] %s\n' "$1"
+}
+
+fail() {
+  printf '[NodeFlare] 错误：%s\n' "$1" >&2
+  exit 1
 }
 
 safe_value() {
@@ -31,7 +50,7 @@ detect_init_system() {
 
 ensure_curl() {
   command -v curl >/dev/null 2>&1 && return
-  echo "curl not found; installing it..."
+  log "未找到 curl，正在通过系统包管理器安装"
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y curl
@@ -42,30 +61,29 @@ ensure_curl() {
   elif command -v apk >/dev/null 2>&1; then
     apk add --no-cache curl
   else
-    echo "curl is required and no supported package manager was found" >&2
-    exit 1
+    fail "缺少 curl，且未找到受支持的包管理器"
   fi
-  command -v curl >/dev/null 2>&1 || { echo "Failed to install curl" >&2; exit 1; }
+  command -v curl >/dev/null 2>&1 || fail "curl 安装失败"
 }
 
 explain_exec_failure() {
   target="$1"
   if [ ! -f "$target" ]; then
-    echo "Downloaded Agent disappeared before validation: $target" >&2
+    echo "下载文件在校验前丢失：$target" >&2
   elif [ ! -x "$target" ]; then
-    echo "Downloaded Agent is not executable: $target" >&2
+    echo "下载文件不可执行：$target" >&2
   elif [ "$(dd if="$target" bs=4 count=1 2>/dev/null)" != "$(printf '\177ELF')" ]; then
-    echo "Downloaded asset is not a Linux ELF executable" >&2
+    echo "下载文件不是有效的 Linux ELF 可执行文件" >&2
   else
-    echo "Downloaded Agent could not run on this system." >&2
-    echo "Use a release built with the current static Linux targets, then retry installation." >&2
+    echo "下载的 Agent 无法在当前系统运行，请确认系统架构与 Release 文件匹配" >&2
   fi
 }
 
 install_agent() {
-  [ "$(id -u)" -eq 0 ] || { echo "Run install as root" >&2; exit 1; }
+  [ "$(id -u)" -eq 0 ] || fail "请使用 root 权限运行安装命令"
+  log "正在检查运行环境"
   ensure_curl
-  command -v sha256sum >/dev/null || { echo "sha256sum is required" >&2; exit 1; }
+  command -v sha256sum >/dev/null || fail "缺少 sha256sum，无法校验下载文件"
   token=""
   endpoint=""
   interval=60
@@ -74,46 +92,46 @@ install_agent() {
     option="$1"
     case "$option" in
       -t|-e|-i)
-        [ "$#" -ge 2 ] || { echo "Missing value for $option" >&2; usage; exit 1; }
+        [ "$#" -ge 2 ] || { echo "参数 $option 缺少值" >&2; usage; exit 1; }
         value="$2"
         shift 2
         ;;
-      *) echo "Unknown argument: $option" >&2; usage; exit 1 ;;
+      *) echo "未知参数：$option" >&2; usage; exit 1 ;;
     esac
     case "$option" in
-      -t) [ -z "$token" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; token="$value" ;;
-      -e) [ -z "$endpoint" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; endpoint="$value" ;;
-      -i) [ "$interval_set" = false ] || { echo "Duplicate argument: $option" >&2; exit 1; }; interval="$value"; interval_set=true ;;
+      -t) [ -z "$token" ] || fail "参数 $option 重复"; token="$value" ;;
+      -e) [ -z "$endpoint" ] || fail "参数 $option 重复"; endpoint="$value" ;;
+      -i) [ "$interval_set" = false ] || fail "参数 $option 重复"; interval="$value"; interval_set=true ;;
     esac
   done
   [ -n "$token" ] && [ -n "$endpoint" ] || { usage; exit 1; }
   endpoint=${endpoint%/}
-  [ ${#token} -le 512 ] && [ ${#endpoint} -le 2048 ] || { echo "Install argument is too long" >&2; exit 1; }
-  safe_value "$token" && safe_value "$endpoint" || { echo "Invalid install argument" >&2; exit 1; }
+  [ ${#token} -le 512 ] && [ ${#endpoint} -le 2048 ] || fail "安装参数长度超出限制"
+  safe_value "$token" && safe_value "$endpoint" || fail "Worker 地址或 Agent Token 格式无效"
   case "$endpoint" in
     https://?*|http://localhost|http://localhost/*|http://localhost:*|http://127.0.0.1|http://127.0.0.1/*|http://127.0.0.1:*) ;;
-    *) echo "Worker URL must use HTTPS; HTTP is only allowed for loopback development" >&2; exit 1 ;;
+    *) fail "Worker 地址必须使用 HTTPS；仅本机调试可使用 HTTP" ;;
   esac
-  case "$endpoint" in *@*) echo "Endpoint must not contain user information" >&2; exit 1 ;; esac
-  case "$interval" in ''|*[!0-9]*) echo "Invalid interval" >&2; exit 1 ;; esac
-  [ "$interval" -ge 15 ] && [ "$interval" -le 3600 ] || { echo "Interval must be between 15 and 3600 seconds" >&2; exit 1; }
-  case "$(uname -m)" in x86_64|amd64) arch="x86_64" ;; aarch64|arm64) arch="aarch64" ;; *) echo "Unsupported architecture" >&2; exit 1 ;; esac
+  case "$endpoint" in *@*) fail "Worker 地址不能包含用户信息" ;; esac
+  case "$interval" in ''|*[!0-9]*) fail "上报间隔必须是整数" ;; esac
+  [ "$interval" -ge 15 ] && [ "$interval" -le 3600 ] || fail "上报间隔必须在 15-3600 秒之间"
+  case "$(uname -m)" in x86_64|amd64) arch="x86_64" ;; aarch64|arm64) arch="aarch64" ;; *) fail "暂不支持当前 CPU 架构：$(uname -m)" ;; esac
   init_system=$(detect_init_system)
-  [ "$init_system" != "unknown" ] || { echo "A running systemd or OpenRC installation is required" >&2; exit 1; }
+  [ "$init_system" != "unknown" ] || fail "未检测到正在运行的 systemd 或 OpenRC"
 
   mkdir -p "$INSTALL_DIR"
   temporary="$INSTALL_DIR/.agent.$$.download"
   trap 'rm -f "$temporary"' EXIT HUP INT TERM
   artifact="agent-linux-$arch"
   release_api="https://api.github.com/repos/imengying/NodeFlare/releases/latest"
+  log "正在获取 GitHub 最新正式版本（$artifact）"
   release_json=$(curl --fail --location --silent --show-error --max-time 30 \
     -H 'Accept: application/vnd.github+json' \
     -H 'User-Agent: nodeflare-installer' \
     "$release_api")
   release_tag=$(printf '%s\n' "$release_json" | tr ',' '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
   printf '%s\n' "$release_tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
-    echo "GitHub latest release has an invalid tag: ${release_tag:-missing}" >&2
-    exit 1
+    fail "GitHub 最新 Release 标签无效：${release_tag:-未找到}"
   }
   expected=$(printf '%s\n' "$release_json" | tr '{' '\n' | awk -v name="$artifact" '
     {
@@ -133,13 +151,15 @@ install_agent() {
       }
     }
   ')
-  [ -n "$expected" ] || { echo "GitHub release does not contain a SHA-256 digest for $artifact" >&2; exit 1; }
+  [ -n "$expected" ] || fail "Release 缺少 $artifact 的 SHA-256 摘要"
   release_base="https://github.com/imengying/NodeFlare/releases/download/$release_tag"
+  log "正在下载 NodeFlare Agent $release_tag"
   curl --fail --location --silent --show-error --max-time 120 \
     "$release_base/$artifact" \
     -o "$temporary"
   actual=$(sha256sum "$temporary" | awk '{ print $1 }')
-  [ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo "Agent checksum verification failed" >&2; exit 1; }
+  [ -n "$expected" ] && [ "$actual" = "$expected" ] || fail "Agent SHA-256 校验失败，已停止安装"
+  log "下载校验通过，正在验证可执行文件"
   chmod 755 "$temporary"
   if ! installed_version=$("$temporary" --version); then
     explain_exec_failure "$temporary"
@@ -147,12 +167,10 @@ install_agent() {
   fi
   installed_version=${installed_version##* }
   printf '%s\n' "$installed_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
-    echo "Downloaded Agent returned an invalid version: $installed_version" >&2
-    exit 1
+    fail "Agent 返回了无效版本号：$installed_version"
   }
   [ "$installed_version" = "${release_tag#v}" ] || {
-    echo "Release $release_tag contains Agent version $installed_version; refusing to install it" >&2
-    exit 1
+    fail "Release $release_tag 与 Agent 版本 $installed_version 不一致"
   }
   case "$init_system" in
     systemd) systemctl stop "$SERVICE_NAME" 2>/dev/null || true ;;
@@ -160,6 +178,7 @@ install_agent() {
   esac
   mv "$temporary" "$AGENT_FILE"
   trap - EXIT HUP INT TERM
+  log "正在配置并启动 $init_system 服务"
   if [ "$init_system" = "systemd" ]; then
     printf '%s\n' \
     '[Unit]' \
@@ -184,8 +203,7 @@ install_agent() {
     systemctl enable --now "$SERVICE_NAME"
     systemctl is-active --quiet "$SERVICE_NAME" || {
       systemctl status "$SERVICE_NAME" --no-pager >&2 || true
-      echo "NodeFlare Agent service failed to start" >&2
-      exit 1
+      fail "NodeFlare 服务启动失败，请查看上方状态信息"
     }
   elif [ "$init_system" = "openrc" ]; then
     printf '%s\n' \
@@ -202,11 +220,17 @@ install_agent() {
     rc-service "$SERVICE_NAME" restart
     rc-service "$SERVICE_NAME" status >/dev/null || {
       rc-service "$SERVICE_NAME" status >&2 || true
-      echo "NodeFlare Agent service failed to start" >&2
-      exit 1
+      fail "NodeFlare 服务启动失败，请查看上方状态信息"
     }
   fi
-  echo "NodeFlare Agent $installed_version installed with $init_system."
+  printf '\nNodeFlare Agent 安装完成\n'
+  printf '  版本：%s\n' "$installed_version"
+  printf '  服务：%s（%s）\n' "$SERVICE_NAME" "$init_system"
+  if [ "$init_system" = "systemd" ]; then
+    printf '  查看状态：systemctl status %s\n' "$SERVICE_NAME"
+  else
+    printf '  查看状态：rc-service %s status\n' "$SERVICE_NAME"
+  fi
 }
 
 status_agent() {
@@ -218,12 +242,13 @@ status_agent() {
     rc-service "$SERVICE_NAME" status
     return $?
   fi
-  echo "NodeFlare agent service is not installed." >&2
+  echo "未检测到 NodeFlare Agent 服务" >&2
   return 1
 }
 
 uninstall_agent() {
-  [ "$(id -u)" -eq 0 ] || { echo "Run uninstall as root" >&2; exit 1; }
+  [ "$(id -u)" -eq 0 ] || fail "请使用 root 权限执行卸载"
+  log "正在停止并移除 NodeFlare Agent"
   init_system=$(detect_init_system)
   case "$init_system" in
     systemd) systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true ;;
@@ -236,7 +261,7 @@ uninstall_agent() {
   rm -f "$OPENRC_FILE"
   [ "$init_system" != "systemd" ] || systemctl daemon-reload 2>/dev/null || true
   rm -rf "$INSTALL_DIR"
-  echo "NodeFlare agent removed."
+  echo "NodeFlare Agent 已卸载"
 }
 
 case "${1:-}" in

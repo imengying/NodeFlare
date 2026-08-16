@@ -6,35 +6,58 @@ INSTALL_DIR="/usr/local/libexec/nodeflare"
 AGENT_FILE="$INSTALL_DIR/agent"
 PLIST_FILE="/Library/LaunchDaemons/$LABEL.plist"
 
+log() {
+  printf '[NodeFlare] %s\n' "$1"
+}
+
+fail() {
+  printf '[NodeFlare] 错误：%s\n' "$1" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+NodeFlare Agent macOS 安装脚本
+
+用法：
+  install-macos.sh -e <Worker URL> -t <Agent Token> [-i <上报间隔>]
+  install-macos.sh --status
+  install-macos.sh --uninstall
+
+仅支持 Apple Silicon（arm64）。Agent Token 请勿泄露。
+EOF
+}
+
 safe_value() {
   case "$1" in *[!A-Za-z0-9_./:@-]*|'') return 1 ;; esac
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
-  [ "$#" -eq 1 ] || { echo "--uninstall does not accept additional arguments" >&2; exit 1; }
-  [ "$(id -u)" -eq 0 ] || { echo "Run as root" >&2; exit 1; }
+  [ "$#" -eq 1 ] || fail "--uninstall 不接受其它参数"
+  [ "$(id -u)" -eq 0 ] || fail "请使用 root 权限执行卸载"
+  log "正在停止并移除 NodeFlare Agent"
   launchctl bootout system "$PLIST_FILE" 2>/dev/null || true
   rm -f "$PLIST_FILE" "$AGENT_FILE"
   rmdir "$INSTALL_DIR" 2>/dev/null || true
-  echo "NodeFlare Agent removed."
+  echo "NodeFlare Agent 已卸载"
   exit 0
 fi
 
 if [ "${1:-}" = "--status" ]; then
-  [ "$#" -eq 1 ] || { echo "--status does not accept additional arguments" >&2; exit 1; }
+  [ "$#" -eq 1 ] || fail "--status 不接受其它参数"
   launchctl print "system/$LABEL"
   exit $?
 fi
 
 [ "${1:-}" != "-h" ] && [ "${1:-}" != "--help" ] && [ "$#" -gt 0 ] || {
-  echo "Usage: install-macos.sh -e ENDPOINT -t TOKEN [-i 60]"
-  echo "       install-macos.sh --uninstall|--status"
+  usage
   exit 0
 }
-[ "$(id -u)" -eq 0 ] || { echo "Run as root" >&2; exit 1; }
-[ "$(uname -m)" = "arm64" ] || { echo "Only Apple Silicon (arm64) is supported" >&2; exit 1; }
-command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
-command -v shasum >/dev/null || { echo "shasum is required" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || fail "请使用 root 权限运行安装"
+[ "$(uname -m)" = "arm64" ] || fail "仅支持 Apple Silicon（arm64）"
+command -v curl >/dev/null || fail "缺少 curl"
+command -v shasum >/dev/null || fail "缺少 shasum，无法校验下载文件"
+log "正在检查运行环境"
 token=""
 endpoint=""
 interval=60
@@ -43,41 +66,42 @@ while [ "$#" -gt 0 ]; do
   option="$1"
   case "$option" in
     -t|-e|-i)
-      [ "$#" -ge 2 ] || { echo "Missing value for $option" >&2; exit 1; }
+      [ "$#" -ge 2 ] || fail "参数 $option 缺少值"
       value="$2"
       shift 2
       ;;
-    *) echo "Unknown argument: $option" >&2; exit 1 ;;
+    *) fail "未知参数：$option" ;;
   esac
   case "$option" in
-    -t) [ -z "$token" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; token="$value" ;;
-    -e) [ -z "$endpoint" ] || { echo "Duplicate argument: $option" >&2; exit 1; }; endpoint="$value" ;;
-    -i) [ "$interval_set" = false ] || { echo "Duplicate argument: $option" >&2; exit 1; }; interval="$value"; interval_set=true ;;
+    -t) [ -z "$token" ] || fail "参数 $option 重复"; token="$value" ;;
+    -e) [ -z "$endpoint" ] || fail "参数 $option 重复"; endpoint="$value" ;;
+    -i) [ "$interval_set" = false ] || fail "参数 $option 重复"; interval="$value"; interval_set=true ;;
   esac
 done
-[ -n "$token" ] && [ -n "$endpoint" ] || { echo "Missing required argument" >&2; exit 1; }
+[ -n "$token" ] && [ -n "$endpoint" ] || { usage; exit 1; }
 endpoint=${endpoint%/}
-[ ${#token} -le 512 ] && [ ${#endpoint} -le 2048 ] || { echo "Install argument is too long" >&2; exit 1; }
-safe_value "$token" && safe_value "$endpoint" || { echo "Invalid argument" >&2; exit 1; }
+[ ${#token} -le 512 ] && [ ${#endpoint} -le 2048 ] || fail "安装参数长度超出限制"
+safe_value "$token" && safe_value "$endpoint" || fail "Worker 地址或 Agent Token 格式无效"
 case "$endpoint" in
   https://?*|http://localhost|http://localhost/*|http://localhost:*|http://127.0.0.1|http://127.0.0.1/*|http://127.0.0.1:*) ;;
-  *) echo "Worker URL must use HTTPS; HTTP is only allowed for loopback development" >&2; exit 1 ;;
+  *) fail "Worker 地址必须使用 HTTPS；仅本机调试可使用 HTTP" ;;
 esac
-case "$endpoint" in *@*) echo "Endpoint must not contain user information" >&2; exit 1 ;; esac
-case "$interval" in ''|*[!0-9]*) echo "Invalid interval" >&2; exit 1 ;; esac
-[ "$interval" -ge 15 ] && [ "$interval" -le 3600 ] || { echo "Interval must be between 15 and 3600 seconds" >&2; exit 1; }
+case "$endpoint" in *@*) fail "Worker 地址不能包含用户信息" ;; esac
+case "$interval" in ''|*[!0-9]*) fail "上报间隔必须是整数" ;; esac
+[ "$interval" -ge 15 ] && [ "$interval" -le 3600 ] || fail "上报间隔必须在 15-3600 秒之间"
 
 mkdir -p "$INSTALL_DIR"
 temporary="$INSTALL_DIR/.agent.$$.download"
 trap 'rm -f "$temporary"' EXIT HUP INT TERM
 artifact="agent-macos-aarch64"
 release_api="https://api.github.com/repos/imengying/NodeFlare/releases/latest"
+log "正在获取 GitHub 最新正式版本（$artifact）"
 release_json=$(curl --fail --location --silent --show-error --max-time 30 \
   -H 'Accept: application/vnd.github+json' \
   -H 'User-Agent: nodeflare-installer' \
   "$release_api")
 release_tag=$(printf '%s\n' "$release_json" | tr ',' '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-printf '%s\n' "$release_tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "GitHub latest release has an invalid tag" >&2; exit 1; }
+printf '%s\n' "$release_tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || fail "GitHub 最新 Release 标签无效：${release_tag:-未找到}"
 expected=$(printf '%s\n' "$release_json" | tr '{' '\n' | awk -v name="$artifact" '
   {
     compact = $0
@@ -96,17 +120,20 @@ expected=$(printf '%s\n' "$release_json" | tr '{' '\n' | awk -v name="$artifact"
     }
   }
 ')
-[ -n "$expected" ] || { echo "GitHub release does not contain a SHA-256 digest for $artifact" >&2; exit 1; }
+[ -n "$expected" ] || fail "Release 缺少 $artifact 的 SHA-256 摘要"
 release_base="https://github.com/imengying/NodeFlare/releases/download/$release_tag"
+log "正在下载 NodeFlare Agent $release_tag"
 curl --fail --location --silent --show-error --max-time 120 \
   "$release_base/$artifact" \
   -o "$temporary"
 actual=$(shasum -a 256 "$temporary" | awk '{ print $1 }')
-[ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo "Agent checksum verification failed" >&2; exit 1; }
+[ -n "$expected" ] && [ "$actual" = "$expected" ] || fail "Agent SHA-256 校验失败，已停止安装"
 chmod 755 "$temporary"
-installed_version=$("$temporary" --version) || { echo "Downloaded Agent cannot run on this macOS system" >&2; exit 1; }
+log "下载校验通过，正在验证可执行文件"
+installed_version=$("$temporary" --version) || fail "下载的 Agent 无法在当前 macOS 运行"
 installed_version=${installed_version##* }
-[ "$installed_version" = "${release_tag#v}" ] || { echo "Release $release_tag contains Agent version $installed_version" >&2; exit 1; }
+[ "$installed_version" = "${release_tag#v}" ] || fail "Release $release_tag 与 Agent 版本 $installed_version 不一致"
+log "正在配置并启动 macOS LaunchDaemon 服务"
 launchctl bootout system "$PLIST_FILE" 2>/dev/null || true
 mv "$temporary" "$AGENT_FILE"
 trap - EXIT HUP INT TERM
@@ -131,5 +158,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     break
   fi
 done
-[ "$started" = true ] || { echo "NodeFlare Agent failed to start; inspect /var/log/nodeflare-agent.log" >&2; exit 1; }
-echo "NodeFlare Agent $installed_version installed and started."
+[ "$started" = true ] || fail "NodeFlare 服务启动失败，请查看 /var/log/nodeflare-agent.log"
+printf '\nNodeFlare Agent 安装完成\n'
+printf '  版本：%s\n' "$installed_version"
+printf '  服务：%s（LaunchDaemon）\n' "$LABEL"
+printf '  查看状态：sudo launchctl print system/%s\n' "$LABEL"

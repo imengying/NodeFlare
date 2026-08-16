@@ -12,9 +12,17 @@ $TaskName = "NodeFlare Agent"
 $InstallDir = Join-Path $env:ProgramData "NodeFlare"
 $AgentFile = Join-Path $InstallDir "nodeflare-agent.exe"
 
+function Write-Step([string]$Message) {
+  Write-Host "[NodeFlare] $Message"
+}
+
+function Write-InstallError([string]$Message) {
+  throw "[NodeFlare] 错误：$Message"
+}
+
 function Assert-Safe([string]$Name, [string]$Value) {
   if ([string]::IsNullOrWhiteSpace($Value) -or $Value -notmatch '^[A-Za-z0-9_./:@-]+$') {
-    throw "Invalid $Name"
+    Write-InstallError "$Name 格式无效"
   }
 }
 
@@ -35,22 +43,23 @@ function Assert-Endpoint([string]$Value) {
     -not [string]::IsNullOrEmpty($Parsed.Query) -or
     -not [string]::IsNullOrEmpty($Parsed.Fragment)
   ) {
-    throw "Endpoint must use HTTPS; HTTP is only allowed for loopback development"
+    Write-InstallError "Worker 地址必须使用 HTTPS；仅本机调试可使用 HTTP"
   }
 }
 
 if ($Uninstall) {
+  Write-Step "正在停止并移除 NodeFlare Agent"
   Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
-  Write-Host "NodeFlare Agent removed."
+  Write-Host "NodeFlare Agent 已卸载"
   exit 0
 }
 
 if ($Status) {
   $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   if ($null -eq $Task) {
-    Write-Error "NodeFlare Agent is not installed."
+    Write-Error "未检测到 NodeFlare Agent 服务"
     exit 1
   }
   $Task
@@ -58,17 +67,18 @@ if ($Status) {
 }
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-  throw "Run PowerShell as Administrator"
+  Write-InstallError "请使用管理员身份运行 PowerShell"
 }
 $NativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 if ($NativeArchitecture -ne "AMD64") {
-  throw "Only Windows x86_64 is supported"
+  Write-InstallError "仅支持 Windows x86_64"
 }
+Write-Step "正在检查运行环境"
 Assert-Safe "Token" $Token
 Assert-Endpoint $Endpoint
 $TokenLength = $Token.Length
 if ($TokenLength -gt 512) {
-  throw "Install argument is too long"
+  Write-InstallError "安装参数长度超出限制"
 }
 $Endpoint = $Endpoint.TrimEnd('/')
 
@@ -78,30 +88,33 @@ $Temporary = "$AgentFile.$PID.download.exe"
 $ReleaseApi = "https://api.github.com/repos/imengying/NodeFlare/releases/latest"
 $Artifact = "agent-windows-x86_64.exe"
 try {
+  Write-Step "正在获取 GitHub 最新正式版本（$Artifact）"
   $Release = Invoke-RestMethod -Uri $ReleaseApi -Headers @{ Accept = "application/vnd.github+json"; "User-Agent" = "nodeflare-installer" } -TimeoutSec 30
   $ReleaseAsset = $Release.assets | Where-Object { $_.name -eq $Artifact } | Select-Object -First 1
   if ($Release.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$' -or $null -eq $ReleaseAsset) {
-    throw "GitHub latest release is invalid or does not contain $Artifact"
+    Write-InstallError "GitHub 最新 Release 无效，或缺少 $Artifact"
   }
   $DigestMatch = [regex]::Match([string]$ReleaseAsset.digest, '^sha256:([0-9a-fA-F]{64})$')
   if (-not $DigestMatch.Success) {
-    throw "GitHub release does not contain a SHA-256 digest for $Artifact"
+    Write-InstallError "Release 缺少 $Artifact 的 SHA-256 摘要"
   }
   $ExpectedChecksum = $DigestMatch.Groups[1].Value
   $DownloadUrl = "https://github.com/imengying/NodeFlare/releases/download/$($Release.tag_name)/$Artifact"
+  Write-Step "正在下载 NodeFlare Agent $($Release.tag_name)"
   Invoke-WebRequest -Uri $DownloadUrl -OutFile $Temporary -TimeoutSec 120
   $ActualChecksum = (Get-FileHash -LiteralPath $Temporary -Algorithm SHA256).Hash
   if ($ActualChecksum -ne $ExpectedChecksum) {
-    throw "Agent checksum verification failed"
+    Write-InstallError "Agent SHA-256 校验失败，已停止安装"
   }
+  Write-Step "下载校验通过，正在验证可执行文件"
   $InstalledVersion = (& $Temporary --version | Out-String).Trim()
   if ($LASTEXITCODE -ne 0) {
-    throw "Downloaded Agent failed its version check"
+    Write-InstallError "下载的 Agent 无法在当前 Windows 运行"
   }
   $InstalledVersion = ($InstalledVersion -split '\s+')[-1]
   $ExpectedVersion = $Release.tag_name.Substring(1)
   if ($InstalledVersion -ne $ExpectedVersion) {
-    throw "Release $($Release.tag_name) contains Agent version $InstalledVersion"
+    Write-InstallError "Release $($Release.tag_name) 与 Agent 版本 $InstalledVersion 不一致"
   }
   Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   Move-Item -LiteralPath $Temporary -Destination $AgentFile -Force
@@ -110,6 +123,7 @@ try {
 }
 
 $TaskArguments = "-e $Endpoint -t $Token -i $Interval"
+Write-Step "正在注册并启动 Windows 计划任务"
 $TaskAction = New-ScheduledTaskAction -Execute $AgentFile -Argument $TaskArguments
 $Trigger = New-ScheduledTaskTrigger -AtStartup
 $Settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 3650)
@@ -123,6 +137,10 @@ for ($Attempt = 0; $Attempt -lt 10; $Attempt++) {
   if ($Task.State -eq "Running") { break }
 }
 if ($Task.State -ne "Running") {
-  throw "NodeFlare Agent scheduled task failed to start (state: $($Task.State))"
+  Write-InstallError "NodeFlare 服务启动失败（状态：$($Task.State)）"
 }
-Write-Host "NodeFlare Agent $InstalledVersion installed and started."
+Write-Host ""
+Write-Host "NodeFlare Agent 安装完成"
+Write-Host "  版本：$InstalledVersion"
+Write-Host "  服务：$TaskName（Windows 计划任务）"
+Write-Host "  查看状态：Get-ScheduledTask -TaskName '$TaskName'"

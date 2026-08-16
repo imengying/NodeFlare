@@ -19,7 +19,7 @@ use worker::*;
 use crate::auth::{
     bearer_token, create_admin_jwt, create_theme_preview_proof, create_turnstile_proof,
     hash_password, is_admin, random_salt, sha256_hex, verify_credentials,
-    verify_theme_preview_proof, verify_turnstile_proof,
+    verify_theme_preview_proof, verify_turnstile_proof, ADMIN_SESSION_SECONDS,
 };
 use crate::models::{
     AgentDiskMetric, AgentGpuMetric, AgentReport, AgentReportBatch, AlertRuleInput, ApiError,
@@ -90,7 +90,7 @@ struct PublicServer {
     latency: Vec<latency::LatencySample>,
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     Date::now().as_millis() as i64 / 1000
 }
 
@@ -115,6 +115,20 @@ fn env_secret_text(env: &Env, key: &str) -> String {
         .unwrap_or_default()
 }
 
+fn settings_for_admin_response(mut settings: db::SettingsView, env: &Env) -> db::SettingsView {
+    for (field, variable) in [
+        (&mut settings.turnstile_site_key, "TURNSTILE_SITE_KEY"),
+        (&mut settings.turnstile_secret_key, "TURNSTILE_SECRET_KEY"),
+        (&mut settings.cloudflare_account_id, "CF_USAGE_ACCOUNT_ID"),
+        (&mut settings.cloudflare_api_token, "CF_USAGE_API_TOKEN"),
+    ] {
+        if field.trim().is_empty() && !env_secret_text(env, variable).trim().is_empty() {
+            *field = db::SECRET_MASK.to_string();
+        }
+    }
+    settings
+}
+
 fn json<T: Serialize>(value: &T, status: u16) -> Result<Response> {
     let mut response = Response::from_json(value)?.with_status(status);
     set_api_headers(&mut response)?;
@@ -137,6 +151,25 @@ fn no_content() -> Result<Response> {
     let mut response = Response::empty()?.with_status(204);
     set_api_headers(&mut response)?;
     Ok(response)
+}
+
+fn set_admin_session_cookie(
+    response: &mut Response,
+    req: &Request,
+    token: Option<&str>,
+) -> Result<()> {
+    let secure = req.url().ok().is_some_and(|url| url.scheme() == "https");
+    let (value, max_age) = token
+        .map(|value| (value, ADMIN_SESSION_SECONDS))
+        .unwrap_or(("", 0));
+    response.headers_mut().append(
+        "Set-Cookie",
+        &format!(
+            "nodeflare_admin={value}; Path=/; Max-Age={max_age}; HttpOnly{}; SameSite=Strict",
+            if secure { "; Secure" } else { "" }
+        ),
+    )?;
+    Ok(())
 }
 
 async fn request_json<T: DeserializeOwned>(req: &mut Request, limit: usize) -> Result<T> {
@@ -427,7 +460,8 @@ fn public_probe_ipv4(address: Ipv4Addr) -> bool {
 
 fn valid_cloudflare_account_id(value: &str) -> bool {
     let value = value.trim();
-    value.is_empty()
+    value == db::SECRET_MASK
+        || value.is_empty()
         || (value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit()))
 }
 
@@ -597,7 +631,7 @@ fn validate_server(input: &ServerInput) -> Option<&'static str> {
     None
 }
 
-fn validate_report(report: &AgentReport) -> Option<&'static str> {
+pub(crate) fn validate_report(report: &AgentReport) -> Option<&'static str> {
     let floats = [
         report.cpu,
         report.load1,
@@ -783,7 +817,9 @@ fn client_ip(req: &Request) -> Option<String> {
 fn rate_limit_binding(method: Method, path: &str) -> Option<&'static str> {
     if method == Method::Post && matches!(path, "/api/admin/login" | "/api/turnstile/verify") {
         Some("AUTH_RATE_LIMITER")
-    } else if method == Method::Post && path == "/api/agent/report" {
+    } else if (method == Method::Post && path == "/api/agent/report")
+        || (method == Method::Get && path == "/api/agent/live")
+    {
         Some("AGENT_RATE_LIMITER")
     } else if path.starts_with("/api/") {
         Some("API_RATE_LIMITER")
@@ -991,6 +1027,9 @@ async fn handle_agent_report(
         response
             .headers_mut()
             .set("X-Agent-Config-Sha256", &config_hash)?;
+        response
+            .headers_mut()
+            .set("X-NodeFlare-Server-Time", &received_at.to_string())?;
         response.headers_mut().set("Cache-Control", "no-store")?;
         return Ok(response);
     }
@@ -998,6 +1037,9 @@ async fn handle_agent_report(
     response
         .headers_mut()
         .set("X-Agent-Config-Sha256", &config_hash)?;
+    response
+        .headers_mut()
+        .set("X-NodeFlare-Server-Time", &received_at.to_string())?;
     Ok(response)
 }
 
@@ -1027,6 +1069,19 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
 
     if method == Method::Post && path == "/api/agent/report" {
         return handle_agent_report(req, env, ctx, &database).await;
+    }
+    if method == Method::Get && path == "/api/agent/live" {
+        let token = match bearer_token(&req) {
+            Some(value) => value,
+            None => return error("缺少探针凭据", 401),
+        };
+        let Some(identity) = db::get_agent_identity(&database, &token).await? else {
+            return error("探针凭据无效", 401);
+        };
+        let Some(context) = db::agent_live_context(&database, &identity.id).await? else {
+            return error("节点不存在", 404);
+        };
+        return live::upgrade_agent(req, &env, &identity.id, identity.hidden != 0, context).await;
     }
 
     let default_name = env_text(&env, "SITE_NAME", "NodeFlare");
@@ -1059,7 +1114,7 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     let login_protection_enabled = settings.turnstile_login_enabled && turnstile_configured;
 
     if method == Method::Get && path == "/api/config" {
-        return json(
+        let mut response = json(
             &serde_json::json!({
                 "site_name": settings.site_name,
                 "site_description": settings.site_description,
@@ -1089,7 +1144,11 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "password_client_salt": settings.password_client_salt
             }),
             200,
-        );
+        )?;
+        response
+            .headers_mut()
+            .set("X-NodeFlare-Server-Time", &now().to_string())?;
+        return Ok(response);
     }
 
     if method == Method::Post && path == "/api/admin/login" {
@@ -1145,7 +1204,9 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         let Some(token) = create_admin_jwt(&env, &session_password_hash) else {
             return error("会话密钥未配置", 503);
         };
-        return json(&serde_json::json!({ "token": token }), 200);
+        let mut response = json(&serde_json::json!({ "token": token }), 200)?;
+        set_admin_session_cookie(&mut response, &req, Some(&token))?;
+        return Ok(response);
     }
 
     if method == Method::Post && path == "/api/turnstile/verify" {
@@ -1187,6 +1248,12 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         || request_turnstile_proof(&req).is_some_and(|value| {
             verify_turnstile_proof(&value, &env, &settings.admin_password_hash)
         });
+
+    if method == Method::Post && path == "/api/admin/logout" {
+        let mut response = no_content()?;
+        set_admin_session_cookie(&mut response, &req, None)?;
+        return Ok(response);
+    }
 
     if method == Method::Get && path == "/api/exchange-rates" {
         if !turnstile_verified {
@@ -1497,6 +1564,9 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error("批量删除列表无效", 400);
         }
         db::delete_servers(&database, &input.ids).await?;
+        if let Err(error) = live::disconnect_agents(&env, &input.ids).await {
+            console_error!("failed to disconnect deleted Agents: {error}");
+        }
         return no_content();
     }
 
@@ -1561,11 +1631,13 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return error("节点 ID 无效", 400);
         };
         if method == Method::Delete {
-            return if db::delete_server(&database, &id).await? {
-                no_content()
-            } else {
-                error("节点不存在", 404)
-            };
+            if !db::delete_server(&database, &id).await? {
+                return error("节点不存在", 404);
+            }
+            if let Err(error) = live::disconnect_agents(&env, std::slice::from_ref(&id)).await {
+                console_error!("failed to disconnect deleted Agent: {error}");
+            }
+            return no_content();
         }
         let input: ServerInput = match request_json(&mut req, API_JSON_MAX_BYTES).await {
             Ok(value) => value,
@@ -1574,15 +1646,17 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         if let Some(message) = validate_server(&input) {
             return error(message, 400);
         }
-        return if db::update_server(&database, &id, &input).await? {
-            no_content()
-        } else {
-            error("节点不存在", 404)
-        };
+        if !db::update_server(&database, &id, &input).await? {
+            return error("节点不存在", 404);
+        }
+        if let Err(error) = live::disconnect_agents(&env, std::slice::from_ref(&id)).await {
+            console_error!("failed to reconnect updated Agent: {error}");
+        }
+        return no_content();
     }
 
     if method == Method::Get && path == "/api/admin/settings" {
-        return json(&settings, 200);
+        return json(&settings_for_admin_response(settings.clone(), &env), 200);
     }
 
     if method == Method::Get && path == "/api/admin/themes" {
@@ -1759,7 +1833,8 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             Ok(usage) => json(&usage, 200),
             Err(err) => {
                 console_error!("cloudflare usage query failed: {err}");
-                error("Cloudflare 用量查询失败，请检查 Token 权限和账户 ID", 502)
+                let detail = err.to_string().chars().take(240).collect::<String>();
+                error(&format!("Cloudflare 用量查询失败：{detail}"), 502)
             }
         };
     }
@@ -1874,11 +1949,10 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         {
             return error("新密码派生值无效", 400);
         }
-        let configured_site_key = input
-            .turnstile_site_key
-            .as_deref()
-            .unwrap_or(&settings.turnstile_site_key)
-            .trim();
+        let configured_site_key = submitted_secret(
+            input.turnstile_site_key.as_deref(),
+            &settings.turnstile_site_key,
+        );
         let configured_secret_key = submitted_secret(
             input.turnstile_secret_key.as_deref(),
             &settings.turnstile_secret_key,
@@ -1970,10 +2044,15 @@ async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         } else {
             None
         };
-        return json(
-            &serde_json::json!({ "settings": updated, "token": token }),
+        let response_settings = settings_for_admin_response(updated, &env);
+        let mut response = json(
+            &serde_json::json!({ "settings": response_settings, "token": token }),
             200,
-        );
+        )?;
+        if let Some(token) = token.as_deref() {
+            set_admin_session_cookie(&mut response, &req, Some(token))?;
+        }
+        return Ok(response);
     }
 
     if path.starts_with("/api/") {
@@ -2122,6 +2201,10 @@ mod tests {
             Some("AGENT_RATE_LIMITER")
         );
         assert_eq!(
+            rate_limit_binding(Method::Get, "/api/agent/live"),
+            Some("AGENT_RATE_LIMITER")
+        );
+        assert_eq!(
             rate_limit_binding(Method::Get, "/api/history/node-a"),
             Some("API_RATE_LIMITER")
         );
@@ -2219,6 +2302,7 @@ mod tests {
     #[test]
     fn validates_cloudflare_usage_credentials() {
         assert!(valid_cloudflare_account_id(""));
+        assert!(valid_cloudflare_account_id(SECRET_MASK));
         assert!(valid_cloudflare_account_id(
             "0123456789abcdef0123456789ABCDEF"
         ));

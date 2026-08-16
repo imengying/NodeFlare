@@ -3,7 +3,9 @@ import {
   ArrowLeft,
   ChevronDown,
   ChevronUp,
+  CircleAlert,
   Cloud,
+  CircleCheck,
   Coins,
   Copy,
   Database,
@@ -203,6 +205,12 @@ export function AdminPanel({
     return () => window.clearTimeout(timer);
   }, [notice]);
 
+  useEffect(() => {
+    if (!error) return;
+    const timer = window.setTimeout(() => setError(""), 6000);
+    return () => window.clearTimeout(timer);
+  }, [error]);
+
   async function login(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
@@ -275,6 +283,14 @@ export function AdminPanel({
       setError(reason instanceof Error ? reason.message : "读取 Agent Token 失败");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function copyInstallCommands() {
+    try {
+      await navigator.clipboard.writeText(commands.map((item) => `# ${item.name}\n${item.command}`).join("\n\n"));
+    } catch {
+      setError("复制失败，请手动选择命令复制");
     }
   }
 
@@ -438,8 +454,11 @@ export function AdminPanel({
     finally { setBusy(false); }
   }
 
-  function logout() {
-    setToken(""); setAuthenticated(false); setServers([]); setSettings(null); setSelectedIds([]);
+  async function logout() {
+    try { await api.logout(); }
+    finally {
+      setToken(""); setAuthenticated(false); setServers([]); setSettings(null); setSelectedIds([]);
+    }
   }
 
   const commands = useMemo(() => install.map((server) => {
@@ -459,7 +478,7 @@ export function AdminPanel({
     }
     return {
       ...server,
-      command: `wget -qO- ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}`,
+      command: `curl -fsSL ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}`,
     };
   }), [install, installPlatform]);
 
@@ -479,6 +498,8 @@ export function AdminPanel({
 
   return (
     <div className={`admin-page ${dark ? "admin-dark" : ""}`}>
+      {error ? <div className="admin-toast error" role="alert" aria-live="assertive"><CircleAlert aria-hidden="true" /><span>{error}</span></div>
+        : notice ? <div className="admin-toast" role="status" aria-live="polite"><CircleCheck aria-hidden="true" /><span>{notice}</span></div> : null}
       {!authenticated ? <div className="admin-login-stage">
         <button className="admin-back" type="button" onClick={onClose}><ArrowLeft size={14} />返回仪表盘</button>
         <button className="admin-login-theme" type="button" onClick={onToggleTheme} title={dark ? "切换浅色主题" : "切换深色主题"}>{dark ? <Sun size={16} /> : <Moon size={16} />}</button>
@@ -488,7 +509,6 @@ export function AdminPanel({
           <label><span>用户名</span><input autoFocus type="text" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
           <label><span>密码</span><input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
           {config.turnstile_login_enabled || config.turnstile_enabled ? <div className="login-turnstile"><TurnstileWidget siteKey={config.turnstile_site_key} theme={dark ? "dark" : "light"} resetKey={turnstileReset} onVerify={setTurnstileToken} onError={setError} /></div> : null}
-          {error ? <p className="form-error login-error">{error}</p> : null}
           <button className="primary-btn login-submit" disabled={busy || ((config.turnstile_login_enabled || config.turnstile_enabled) && !turnstileToken)} type="submit"><KeyRound size={16} />{busy ? "验证中" : "登录"}</button>
         </form>
       </div> : <section className="admin-shell" aria-label="管理面板">
@@ -500,7 +520,7 @@ export function AdminPanel({
           <div className="admin-topbar-actions">
             <button type="button" onClick={onToggleTheme} title={dark ? "切换浅色主题" : "切换深色主题"}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
             <button type="button" onClick={onClose}><ArrowLeft size={17} />返回前台</button>
-            <button type="button" onClick={logout}><LogOut size={17} />退出登录</button>
+            <button type="button" onClick={() => void logout()}><LogOut size={17} />退出登录</button>
           </div>
         </header>
 
@@ -520,8 +540,6 @@ export function AdminPanel({
             </aside>
             <div className="admin-content">
               <header className="admin-content-header"><h1>{adminPages[tab].title}</h1><p>{adminPages[tab].description}</p></header>
-              {error ? <p className="form-error admin-error">{error}</p> : null}
-              {notice ? <p className="form-notice">{notice}</p> : null}
               {tab === "servers" ? (
                 <div className="admin-section">
                   <div className="section-head"><div><h3>监控节点</h3><span>{servers.length} 个节点 · 可拖动上下排序</span></div><div className="section-actions"><button className="primary-btn compact" onClick={() => openEditor()}><Plus size={16} />添加</button></div></div>
@@ -532,7 +550,7 @@ export function AdminPanel({
                         <button type="button" className="drag-handle" draggable onDragStart={(event) => startDrag(event, server.id)} onDragEnd={() => setDraggingId("")} title={`拖动排序：${server.name}`}><GripVertical size={15} /></button>
                         <Checkbox checked={selectedIds.includes(server.id)} onChange={() => toggleSelected(server.id)} ariaLabel={`选择 ${server.name}`} />
                         <span className={`status-dot ${settings && isOnline(server, settings.offline_threshold_seconds) ? "online" : ""}`} />
-                        <div className="server-name"><strong>{server.name}</strong><small>{server.group_name} · {server.region || "未设置地区"} · {server.last_ip || "尚未上报 IP"} · {server.report_interval}s</small></div>
+                        <div className="server-name"><strong>{server.name}</strong><small>{server.group_name} · {server.region || "未设置地区"} · {server.last_ip || "尚未上报 IP"} · {server.agent_version ? `Agent v${server.agent_version}` : "Agent 未上报版本"} · {server.report_interval}s</small></div>
                         <span className="server-usage">{server.traffic_limit > 0 ? formatBytes(server.traffic_limit) : "不限流量"}</span>
                         <div className="row-actions"><button className="icon-btn" disabled={index === 0} onClick={() => void move(index, -1)} title="上移"><ChevronUp size={15} /></button><button className="icon-btn" disabled={index === servers.length - 1} onClick={() => void move(index, 1)} title="下移"><ChevronDown size={15} /></button><button className="icon-btn" disabled={busy} onClick={() => void showInstallCommand(server)} title="显示安装命令"><Download size={15} /></button><button className="icon-btn" onClick={() => openEditor(server)} title="编辑节点"><Pencil size={15} /></button><button className="icon-btn danger" onClick={() => void remove(server)} title="删除节点"><Trash2 size={15} /></button></div>
                       </div>
@@ -603,7 +621,7 @@ export function AdminPanel({
                     <div className="form-grid"><label><span>管理员用户名</span><input autoComplete="username" value={settings.admin_username} onChange={(event) => updateSettings("admin_username", event.target.value)} /></label><label><span>新密码（留空不修改）</span><input autoComplete="new-password" type="password" value={settings.new_password || ""} onChange={(event) => updateSettings("new_password", event.target.value)} placeholder="至少 8 个字符" /></label></div>
                     <div className="security-note">当前密码状态：{settings.admin_password_configured ? "已使用 D1 加盐哈希" : "使用 ADMIN_PASSWORD 初始化密钥"}</div>
                     <div className="form-grid"><Toggle label="保护公开仪表盘" checked={settings.turnstile_enabled} onChange={(value) => updateSettings("turnstile_enabled", value)} /><Toggle label="保护管理员登录" checked={settings.turnstile_login_enabled} onChange={(value) => updateSettings("turnstile_login_enabled", value)} /></div>
-                    <div className="form-grid"><label><span>Turnstile Site Key</span><input value={settings.turnstile_site_key} onChange={(event) => updateSettings("turnstile_site_key", event.target.value)} /></label><label><span>Turnstile Secret Key</span><input type="password" value={settings.turnstile_secret_key} onChange={(event) => updateSettings("turnstile_secret_key", event.target.value)} /></label></div>
+                    <div className="form-grid"><label><span>Turnstile Site Key</span><input autoComplete="off" type="password" value={settings.turnstile_site_key} onChange={(event) => updateSettings("turnstile_site_key", event.target.value)} /></label><label><span>Turnstile Secret Key</span><input autoComplete="off" type="password" value={settings.turnstile_secret_key} onChange={(event) => updateSettings("turnstile_secret_key", event.target.value)} /></label></div>
                     <p className="settings-hint">留空时读取 Worker 的 TURNSTILE_SITE_KEY 和 TURNSTILE_SECRET_KEY，后台配置优先。</p>
                   </> : null}
 
@@ -616,9 +634,9 @@ export function AdminPanel({
                     </div>
                     <div className="usage-section">
                       <div className="usage-head"><div><div className="section-title"><Cloud size={15} />Cloudflare 用量</div><p className="settings-hint">统计周期使用 UTC</p></div><button type="button" className="secondary-btn compact" disabled={busy} onClick={() => void loadCloudflareUsage()}><RotateCw size={14} />{cloudflareUsage ? "刷新用量" : "查询用量"}</button></div>
-                      <div className="form-grid"><label><span>Cloudflare Account ID</span><input autoComplete="off" maxLength={32} value={settings.cloudflare_account_id} onChange={(event) => updateSettings("cloudflare_account_id", event.target.value)} placeholder="32 位账户 ID" /></label><label><span>Cloudflare API Token</span><input autoComplete="off" type="password" value={settings.cloudflare_api_token} onChange={(event) => updateSettings("cloudflare_api_token", event.target.value)} placeholder="需要 Account Analytics Read 权限" /></label></div>
-                      <div className="usage-config-actions"><p className="settings-hint">留空时读取 Worker Secret 中的同名变量。</p><button type="submit" className="primary-btn compact" disabled={busy}><Save size={14} />保存用量配置</button></div>
-                      {cloudflareUsage ? <div className="usage-table-wrap"><table className="usage-table"><thead><tr><th>周期</th><th>D1 读取</th><th>D1 写入</th><th>Workers 请求</th></tr></thead><tbody><UsageRow label="今日" usage={cloudflareUsage.today} /><UsageRow label="昨日" usage={cloudflareUsage.yesterday} /></tbody></table></div> : <div className="usage-empty">尚未读取</div>}
+                      <div className="form-grid"><label><span>Cloudflare Account ID</span><input autoComplete="off" type="password" maxLength={32} value={settings.cloudflare_account_id} onChange={(event) => updateSettings("cloudflare_account_id", event.target.value)} placeholder="32 位账户 ID" /></label><label><span>Cloudflare API Token</span><input autoComplete="off" type="password" value={settings.cloudflare_api_token} onChange={(event) => updateSettings("cloudflare_api_token", event.target.value)} placeholder="Account Analytics: Read" /></label></div>
+                      <div className="usage-config-actions"><p className="settings-hint">Token 需要账户级 Account Analytics: Read 权限，并授权对应账户；留空读取 Worker Secret。</p><button type="submit" className="primary-btn compact" disabled={busy}><Save size={14} />保存用量配置</button></div>
+                      {cloudflareUsage ? <><div className="usage-table-wrap"><table className="usage-table cloudflare-usage-table"><thead><tr><th>周期</th><th>D1 读取</th><th>D1 写入</th><th>Workers 请求</th><th>DO 请求（估算）</th><th>DO 时长 (GB-s)</th></tr></thead><tbody><UsageRow label="今日" usage={cloudflareUsage.today} /><UsageRow label="昨日" usage={cloudflareUsage.yesterday} /></tbody></table></div><div className="usage-do-breakdown"><UsageDoBreakdown label="今日" usage={cloudflareUsage.today} /><UsageDoBreakdown label="昨日" usage={cloudflareUsage.yesterday} /></div></> : <div className="usage-empty">尚未读取</div>}
                     </div>
                     <div className="data-actions"><button type="button" className="secondary-btn" onClick={() => void loadDatabase()}>刷新统计</button><button type="button" className="danger-btn" onClick={() => void clearHistory()}><Trash2 size={15} />清空历史指标</button></div>
                     <p className="settings-hint">清空历史不会删除节点、密钥或最新状态。</p>
@@ -642,7 +660,7 @@ export function AdminPanel({
         <div className="form-actions"><button type="button" className="secondary-btn" onClick={() => setEditing(null)}>取消</button><button className="primary-btn" disabled={busy}><Save size={16} />保存节点</button></div>
       </form></div> : null}
 
-      {commands.length ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setInstall([])}><section className="install-modal glass-panel" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">Agent 部署</span><h3>安装命令</h3></div><div className="segmented install-platform" aria-label="Agent 平台"><button type="button" className={installPlatform === "linux" ? "active" : ""} onClick={() => setInstallPlatform("linux")}>Linux</button><button type="button" className={installPlatform === "windows" ? "active" : ""} onClick={() => setInstallPlatform("windows")}>Windows</button><button type="button" className={installPlatform === "macos" ? "active" : ""} onClick={() => setInstallPlatform("macos")}>macOS ARM</button></div></header><div className="install-list">{commands.map((item) => <div key={item.id}><strong>{item.name}</strong><pre>{item.command}</pre></div>)}</div><div className="form-actions"><button className="secondary-btn" type="button" onClick={() => setInstall([])}>完成</button><button className="primary-btn" type="button" onClick={() => navigator.clipboard.writeText(commands.map((item) => `# ${item.name}\n${item.command}`).join("\n\n"))}><Copy size={16} />复制全部</button></div></section></div> : null}
+      {commands.length ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setInstall([])}><section className="install-modal glass-panel" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">Agent 部署</span><h3>安装命令</h3></div><div className="segmented install-platform" aria-label="Agent 平台"><button type="button" className={installPlatform === "linux" ? "active" : ""} onClick={() => setInstallPlatform("linux")}>Linux</button><button type="button" className={installPlatform === "windows" ? "active" : ""} onClick={() => setInstallPlatform("windows")}>Windows</button><button type="button" className={installPlatform === "macos" ? "active" : ""} onClick={() => setInstallPlatform("macos")}>macOS ARM</button></div></header><div className="install-list">{commands.map((item) => <div key={item.id}><strong>{item.name}</strong><pre>{item.command}</pre></div>)}</div><div className="form-actions"><button className="secondary-btn" type="button" onClick={() => setInstall([])}>关闭</button><button className="primary-btn" type="button" onClick={() => void copyInstallCommands()}><Copy size={16} />复制全部</button></div></section></div> : null}
     </div>
   );
 }
@@ -672,5 +690,9 @@ function DataStat({ label, value }: { label: string; value: number | string }) {
 }
 
 function UsageRow({ label, usage }: { label: string; usage: CloudflareUsage["today"] }) {
-  return <tr><th scope="row">{label}</th><td>{usage.rows_read.toLocaleString()}</td><td>{usage.rows_written.toLocaleString()}</td><td>{usage.workers_requests.toLocaleString()}</td></tr>;
+  return <tr><th scope="row">{label}</th><td>{usage.rows_read.toLocaleString()}</td><td>{usage.rows_written.toLocaleString()}</td><td>{usage.workers_requests.toLocaleString()}</td><td>{usage.durable_objects_requests.toLocaleString()}</td><td>{usage.durable_objects_duration.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td></tr>;
+}
+
+function UsageDoBreakdown({ label, usage }: { label: string; usage: CloudflareUsage["today"] }) {
+  return <div><strong>{label}</strong><span>HTTP {usage.durable_objects_http_requests.toLocaleString()}</span><span>休眠唤醒 {usage.durable_objects_hibernation_wakeups.toLocaleString()}</span><span>WS 入站 {usage.durable_objects_inbound_websocket_messages.toLocaleString()}</span><span>WS 出站 {usage.durable_objects_outbound_websocket_messages.toLocaleString()}</span><small>每 {usage.durable_objects_request_billing_ratio} 条入站消息折算 1 次请求</small></div>;
 }
