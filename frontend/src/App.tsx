@@ -25,19 +25,37 @@ interface LiveSample {
   data: Partial<Server> & { latency_results?: LiveLatencyResult[] };
 }
 
+function mergeLiveResults(previous: LiveLatencyResult[] | undefined, incoming: LiveLatencyResult[]): LiveLatencyResult[] {
+  const results = new Map<string, LiveLatencyResult>();
+  for (const result of [...(previous ?? []), ...incoming]) {
+    if (!result.task_id || !Number.isFinite(result.timestamp) || result.timestamp <= 0) continue;
+    results.set(`${result.task_id}:${result.timestamp}`, result);
+  }
+  return Array.from(results.values())
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .slice(-4096);
+}
+
 function mergeLiveLatency(server: Server, results: LiveLatencyResult[]): LatencySample[] {
-  const definitions = new Map(server.latency.map((point) => [point.task_id, point]));
-  return results.flatMap((result) => {
-    const definition = definitions.get(result.task_id);
-    if (!definition || !Number.isFinite(result.timestamp)) return [];
-    return [{
+  const latest = new Map<string, LiveLatencyResult>();
+  for (const result of results) {
+    const current = latest.get(result.task_id);
+    if (!current || result.timestamp >= current.timestamp) latest.set(result.task_id, result);
+  }
+  let changed = false;
+  const merged = server.latency.map((definition) => {
+    const result = latest.get(definition.task_id);
+    if (!result || result.timestamp <= definition.timestamp) return definition;
+    changed = true;
+    return {
       ...definition,
       server_id: server.id,
       timestamp: result.timestamp,
       latency_ms: result.latency_ms,
       packet_loss: result.packet_loss,
-    }];
+    };
   });
+  return changed ? merged : server.latency;
 }
 
 function routeServerId() {
@@ -77,8 +95,11 @@ export default function App() {
   const blur = themeToggle(config, "enableBlur");
   const liveServers = useMemo(() => servers.map((server) => {
     const live = liveMetrics[server.id];
-    if (!live || live.timestamp <= (server.timestamp ?? 0)) return server;
+    if (!live) return server;
     const latency = live.latencyResults?.length ? mergeLiveLatency(server, live.latencyResults) : server.latency;
+    if (live.timestamp <= (server.timestamp ?? 0)) {
+      return latency === server.latency ? server : { ...server, latency };
+    }
     return { ...server, ...live.metrics, latency, timestamp: live.timestamp };
   }), [liveMetrics, servers]);
 
@@ -260,33 +281,23 @@ export default function App() {
                 if (!latest) continue;
                 const previous = next[update.serverId];
                 if (previous && previous.timestamp >= latest.ts) continue;
-                const results = latest.data.latency_results;
+                const results = samples.flatMap((sample) => Array.isArray(sample.data.latency_results)
+                  ? sample.data.latency_results
+                  : []);
+                const metrics = { ...latest.data };
+                delete metrics.latency_results;
                 next[update.serverId] = {
                   timestamp: latest.ts,
-                  metrics: latest.data,
-                  latencyResults: Array.isArray(results) ? results : previous?.latencyResults,
+                  metrics,
+                  latencyResults: Array.isArray(results) && results.length
+                    ? mergeLiveResults(previous?.latencyResults, results)
+                    : previous?.latencyResults,
                 };
               }
               return next;
             });
             return;
           }
-          if (message.type !== "metrics" || !message.server_id || !message.metrics) return;
-          if (!Number.isFinite(message.timestamp)) return;
-          setLiveMetrics((current) => {
-            const previous = current[message.server_id];
-            if (previous && previous.timestamp >= message.timestamp) return current;
-            return {
-              ...current,
-              [message.server_id]: {
-                timestamp: message.timestamp,
-                metrics: message.metrics,
-                latencyResults: Array.isArray(message.metrics.latency_results)
-                  ? message.metrics.latency_results
-                  : previous?.latencyResults,
-              },
-            };
-          });
         } catch { /* Ignore non-protocol messages. */ }
       };
     };

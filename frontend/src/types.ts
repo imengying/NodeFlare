@@ -62,6 +62,7 @@ export interface Theme {
   name: string;
   description: string;
   url: string;
+  version: string;
   builtin: boolean;
   active: boolean;
 }

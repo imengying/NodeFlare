@@ -364,11 +364,14 @@ fn compact_results(
 
 pub async fn latest_all(db: &D1Database) -> Result<Vec<LatencySample>> {
     db.prepare(
-        "SELECT l.task_id, l.server_id, t.name, t.task_type, t.target, t.port, \
-         l.timestamp, l.latency_ms, l.packet_loss \
-         FROM latency_latest l INNER JOIN latency_tasks t ON t.id = l.task_id \
-         INNER JOIN latency_task_servers a \
-           ON a.task_id = l.task_id AND a.server_id = l.server_id \
+        "SELECT a.task_id, a.server_id, t.name, t.task_type, t.target, t.port, \
+         COALESCE(l.timestamp, 0) AS timestamp, \
+         COALESCE(l.latency_ms, -1) AS latency_ms, \
+         COALESCE(l.packet_loss, -1) AS packet_loss \
+         FROM latency_task_servers a \
+         INNER JOIN latency_tasks t ON t.id = a.task_id \
+         LEFT JOIN latency_latest l \
+           ON l.task_id = a.task_id AND l.server_id = a.server_id \
          ORDER BY t.sort_order ASC, t.created_at ASC",
     )
     .all()
@@ -378,12 +381,15 @@ pub async fn latest_all(db: &D1Database) -> Result<Vec<LatencySample>> {
 
 pub async fn latest_for_server(db: &D1Database, server_id: &str) -> Result<Vec<LatencySample>> {
     db.prepare(
-        "SELECT l.task_id, l.server_id, t.name, t.task_type, t.target, t.port, \
-         l.timestamp, l.latency_ms, l.packet_loss \
-         FROM latency_latest l INNER JOIN latency_tasks t ON t.id = l.task_id \
-         INNER JOIN latency_task_servers a \
-           ON a.task_id = l.task_id AND a.server_id = l.server_id \
-         WHERE l.server_id = ?1 \
+        "SELECT a.task_id, a.server_id, t.name, t.task_type, t.target, t.port, \
+         COALESCE(l.timestamp, 0) AS timestamp, \
+         COALESCE(l.latency_ms, -1) AS latency_ms, \
+         COALESCE(l.packet_loss, -1) AS packet_loss \
+         FROM latency_task_servers a \
+         INNER JOIN latency_tasks t ON t.id = a.task_id \
+         LEFT JOIN latency_latest l \
+           ON l.task_id = a.task_id AND l.server_id = a.server_id \
+         WHERE a.server_id = ?1 \
          ORDER BY t.sort_order ASC, t.created_at ASC",
     )
     .bind(&[text(server_id)])?

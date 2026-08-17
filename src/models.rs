@@ -103,6 +103,7 @@ pub struct ThemeView {
     pub name: String,
     pub description: String,
     pub url: String,
+    pub version: String,
     pub builtin: bool,
     pub active: bool,
 }

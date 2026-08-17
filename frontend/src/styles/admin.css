@@ -182,7 +182,6 @@
 .editor-modal h3, .install-modal h3, .latency-editor h3 { margin: 0; color: var(--admin-text); font-size: 18px; }
 .editor-toggles { grid-template-columns: 1fr 1fr; }
 .install-list { display: flex; flex-direction: column; gap: 12px; max-height: 55vh; overflow: auto; margin: 15px 0; }
-.install-list strong { display: block; margin-bottom: 5px; color: var(--admin-text); font-size: 13px; }
 .install-modal pre { overflow-x: auto; margin: 0; border: 1px solid var(--admin-border); border-radius: 6px; padding: 12px; color: var(--admin-text); background: var(--admin-bg); font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .latency-section { display: flex; min-height: 100%; flex-direction: column; }
@@ -286,4 +285,29 @@
   .alert-server-picker { grid-template-columns: 1fr; }
   .admin-back { top: 12px; left: 12px; }
   .admin-login-theme { top: 12px; right: 12px; }
+}
+
+.server-name-main { display: flex; min-width: 0; align-items: center; gap: 7px; }
+.server-name-main .region-flag { flex: 0 0 auto; font-size: 16px; line-height: 1; }
+.server-name-main strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.server-name-main small { overflow: hidden; color: var(--admin-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.about-page { display: flex; flex-direction: column; gap: 20px; }
+.about-brand { display: flex; align-items: center; gap: 14px; }
+.about-brand img { flex: 0 0 auto; }
+.about-brand strong { display: block; color: var(--admin-text); font-size: 20px; }
+.about-brand small { display: block; margin-top: 3px; color: var(--admin-muted); font-size: 13px; }
+.about-rows { display: grid; border: 1px solid var(--admin-border); border-radius: 7px; overflow: hidden; }
+.about-row { display: flex; min-height: 48px; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--admin-border); padding: 10px 14px; }
+.about-row:last-child { border-bottom: 0; }
+.about-row span { color: var(--admin-muted); font-size: 13px; }
+.about-row strong { color: var(--admin-text); font-size: 14px; font-weight: 600; }
+.about-row a { display: inline-flex; align-items: center; gap: 5px; color: var(--admin-accent); font-size: 14px; text-decoration: none; }
+.about-row a:hover { text-decoration: underline; }
+.theme-badge.version { color: var(--admin-muted); }
+
+@media (max-width: 639px) {
+  .about-brand { align-items: flex-start; }
+  .about-brand small { line-height: 1.55; }
+  .about-row { align-items: flex-start; flex-direction: column; gap: 5px; }
+  .about-row a { max-width: 100%; overflow-wrap: anywhere; }
 }

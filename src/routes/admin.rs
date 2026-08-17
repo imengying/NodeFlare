@@ -396,6 +396,7 @@ async fn themes_get(ctx: &RouteContext) -> Result<Response> {
         name: theme::BUILTIN_THEME_NAME.to_string(),
         description: "默认主题".to_string(),
         url: String::new(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         builtin: true,
         active: ctx.settings.active_theme_id == theme::BUILTIN_THEME_ID,
     }];
@@ -437,7 +438,18 @@ async fn themes_post(req: &mut Request, ctx: &RouteContext) -> Result<Response> 
         );
         return error("无法读取主题 index.html，请检查 URL 和主题构建产物", 422);
     }
-    db::create_theme(&ctx.database, &id, &input, &resolved.source_url, now()).await?;
+    let version = theme::remote_theme_version(&resolved.resolved_url)
+        .await
+        .unwrap_or_default();
+    db::create_theme(
+        &ctx.database,
+        &id,
+        &input,
+        &resolved.source_url,
+        &version,
+        now(),
+    )
+    .await?;
     json(&serde_json::json!({ "id": id }), 201)
 }
 
@@ -481,6 +493,11 @@ async fn theme_activate_post(ctx: &RouteContext, path: &str) -> Result<Response>
         if let Err(err) = theme::validate_remote(&url).await {
             console_warn!("theme activation failed for {url}: {err}");
             return error("主题当前不可访问，未切换主题", 422);
+        }
+        if let Some(version) = theme::remote_theme_version(&url).await {
+            if let Err(err) = db::update_theme_version(&ctx.database, id, &version).await {
+                console_warn!("theme version refresh failed for {id}: {err}");
+            }
         }
     }
     if !db::set_active_theme(&ctx.database, id).await? {

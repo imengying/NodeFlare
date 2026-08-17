@@ -48,7 +48,7 @@ const LIVE_QUEUE_CAPACITY: usize = 720;
 // the queue preserves the remaining samples for the next frame.
 const LIVE_BATCH_CAPACITY: usize = 32;
 // D1 persistence can take a few hundred milliseconds; allow the ACK to arrive
-// before falling back to the configured interval.
+// before continuing with the configured live interval.
 const LIVE_ACK_READ_TIMEOUT: Duration = Duration::from_millis(1_000);
 const CLOCK_CALIBRATION_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const CLOCK_CALIBRATION_MIN_CHANGE_MS: i64 = 20_000;
@@ -229,19 +229,19 @@ type SharedClock = Arc<Mutex<ClockCalibration>>;
 
 struct LiveSender {
     pending: Arc<(Mutex<Vec<Report>>, Condvar)>,
-    report_interval: Arc<Mutex<Duration>>,
+    send_interval: Arc<Mutex<Duration>>,
 }
 
 impl LiveSender {
     fn start(config: &RuntimeConfig, clock: SharedClock) -> Result<Self> {
         let pending = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
-        let report_interval = Arc::new(Mutex::new(Duration::from_secs(
-            config.report_interval.clamp(15, 3600),
+        let send_interval = Arc::new(Mutex::new(Duration::from_secs(
+            config.collect_interval.clamp(2, 60),
         )));
         let endpoint = live_endpoint(&config.endpoint)?;
         let token = config.token.clone();
         let sender_state = Arc::clone(&pending);
-        let sender_interval = Arc::clone(&report_interval);
+        let sender_interval = Arc::clone(&send_interval);
         thread::Builder::new()
             .name("nodeflare-live".to_string())
             .spawn(move || {
@@ -249,7 +249,7 @@ impl LiveSender {
             })?;
         Ok(Self {
             pending,
-            report_interval,
+            send_interval,
         })
     }
 
@@ -264,9 +264,9 @@ impl LiveSender {
         }
     }
 
-    fn set_report_interval(&self, seconds: u64) {
-        if let Ok(mut interval) = self.report_interval.lock() {
-            *interval = Duration::from_secs(seconds.clamp(15, 3600));
+    fn set_send_interval(&self, seconds: u64) {
+        if let Ok(mut interval) = self.send_interval.lock() {
+            *interval = Duration::from_secs(seconds.clamp(2, 60));
         }
         self.pending.1.notify_one();
     }
@@ -1382,17 +1382,15 @@ struct LiveAck {
     #[serde(rename = "nextD1WriteAfterMs")]
     next_d1_write_after_ms: u64,
     #[serde(rename = "nextWssReportAfterMs")]
-    next_wss_report_after_ms: Option<u64>,
+    next_wss_report_after_ms: u64,
 }
 
-fn ack_interval(ack: &LiveAck, fallback: Duration) -> Duration {
-    ack.next_wss_report_after_ms
-        .map(Duration::from_millis)
-        .map(|interval| interval.clamp(Duration::from_secs(2), Duration::from_secs(3600)))
-        .unwrap_or(fallback)
+fn ack_interval(ack: &LiveAck) -> Duration {
+    Duration::from_millis(ack.next_wss_report_after_ms)
+        .clamp(Duration::from_secs(2), Duration::from_secs(60))
 }
 
-fn read_live_ack(socket: &mut LiveSocket, current_interval: Duration) -> Result<Option<Duration>> {
+fn read_live_ack(socket: &mut LiveSocket) -> Result<Option<Duration>> {
     match socket.read() {
         Ok(Message::Text(text)) => {
             let Ok(ack) = serde_json::from_str::<LiveAck>(text.as_ref()) else {
@@ -1402,7 +1400,7 @@ fn read_live_ack(socket: &mut LiveSocket, current_interval: Duration) -> Result<
                 return Ok(None);
             }
             let _ = (ack.persisted, ack.next_d1_write_after_ms);
-            Ok(Some(ack_interval(&ack, current_interval)))
+            Ok(Some(ack_interval(&ack)))
         }
         Ok(Message::Ping(payload)) => {
             socket.send(Message::Pong(payload))?;
@@ -1453,7 +1451,7 @@ fn live_sender_loop(
     let mut send_interval = configured_interval
         .lock()
         .map(|interval| *interval)
-        .unwrap_or(Duration::from_secs(60));
+        .unwrap_or(Duration::from_secs(5));
     let mut next_send_at = Instant::now();
     loop {
         let (queue, ready) = &*pending;
@@ -1479,7 +1477,7 @@ fn live_sender_loop(
         drop(queue);
 
         if let Ok(interval) = configured_interval.lock() {
-            send_interval = (*interval).min(Duration::from_secs(3600));
+            send_interval = (*interval).clamp(Duration::from_secs(2), Duration::from_secs(60));
         }
         if socket.is_none() {
             match connect_live(endpoint, token) {
@@ -1535,7 +1533,7 @@ fn live_sender_loop(
         next_send_at = Instant::now() + send_interval;
         let mut drop_socket = false;
         if let Some(socket) = socket.as_mut() {
-            match read_live_ack(socket, send_interval) {
+            match read_live_ack(socket) {
                 Ok(Some(Duration::ZERO)) => drop_socket = true,
                 Ok(Some(interval)) => {
                     send_interval = interval;
@@ -1955,7 +1953,7 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
                             next_latency.clear();
                         }
                         if let Some(live) = &live {
-                            live.set_report_interval(config.report_interval);
+                            live.set_send_interval(config.collect_interval);
                         }
                     }
                     if !once && config.auto_update && Instant::now() >= next_update_check {
@@ -2152,18 +2150,12 @@ mod tests {
             r#"{"type":"ack","ts":100,"persisted":false,"nextD1WriteAfterMs":60000,"nextWssReportAfterMs":5000}"#,
         )
         .unwrap();
-        assert_eq!(
-            ack_interval(&ack, Duration::from_secs(60)),
-            Duration::from_secs(5)
-        );
+        assert_eq!(ack_interval(&ack), Duration::from_secs(5));
         let slow: LiveAck = serde_json::from_str(
             r#"{"type":"ack","ts":100,"persisted":true,"nextD1WriteAfterMs":60000,"nextWssReportAfterMs":1}"#,
         )
         .unwrap();
-        assert_eq!(
-            ack_interval(&slow, Duration::from_secs(60)),
-            Duration::from_secs(2)
-        );
+        assert_eq!(ack_interval(&slow), Duration::from_secs(2));
     }
 
     #[test]

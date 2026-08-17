@@ -34,6 +34,7 @@ type ChartType = "load" | "latency";
 const LATENCY_COLORS = ["#2563eb", "#db2777", "#ea7b1b", "#0f766e", "#7c3aed", "#0891b2"];
 const REALTIME_WINDOW_SECONDS = 60 * 60;
 const MAX_REALTIME_POINTS = 720;
+const MAX_LATENCY_HISTORY_ROWS = 4000;
 
 function historyPointFromServer(server: Server): HistoryPoint | null {
   if (!Number.isFinite(server.timestamp) || number(server.timestamp) <= 0) return null;
@@ -96,6 +97,76 @@ function average(values: number[]): number | null {
   return valid.length ? valid.reduce((sum, value) => sum + value, 0) / valid.length : null;
 }
 
+function latencyBucketSeconds(hours: number, taskCount: number): number {
+  const boundedHours = Math.max(1, Math.min(24 * 365, Math.trunc(hours)));
+  const boundedTasks = Math.max(1, Math.min(128, Math.trunc(taskCount)));
+  const base = boundedHours === 1 ? 60
+    : boundedHours <= 4 ? 120
+      : boundedHours <= 24 ? 600
+        : boundedHours <= 168 ? 3600
+          : boundedHours <= 720 ? 14_400
+            : 86_400;
+  const pointsPerTask = Math.max(1, Math.floor(MAX_LATENCY_HISTORY_ROWS / boundedTasks));
+  return Math.max(base, Math.ceil(boundedHours * 3600 / pointsPerTask));
+}
+
+function mergeLatencySamples(current: LatencySample[], incoming: LatencySample[], hours: number, taskCount: number): LatencySample[] {
+  const validIncoming = incoming.filter((point) => Number.isFinite(point.timestamp) && point.timestamp > 0);
+  if (!validIncoming.length) return current.filter((point) => Number.isFinite(point.timestamp) && point.timestamp > 0);
+  const latest = Math.max(...validIncoming.map((point) => point.timestamp));
+  const cutoff = latest - hours * 3600;
+  const bucket = latencyBucketSeconds(hours, taskCount);
+  const key = (point: LatencySample) => `${point.task_id}:${Math.floor(point.timestamp / bucket)}`;
+  const next = new Map(current
+    .filter((point) => Number.isFinite(point.timestamp) && point.timestamp > 0 && point.timestamp >= cutoff)
+    .map((point) => [key(point), point]));
+  for (const point of validIncoming) {
+    if (point.timestamp < cutoff) continue;
+    const currentPoint = next.get(key(point));
+    if (!currentPoint || point.timestamp >= currentPoint.timestamp) next.set(key(point), point);
+  }
+  return Array.from(next.values()).sort((left, right) => left.timestamp - right.timestamp);
+}
+
+interface LatencyChartPoint {
+  timestamp: number;
+  label: string;
+  value: number | null;
+}
+
+function latencyChartGapLimit(hours: number): number {
+  return Math.max(5 * 60_000, (hours * 60 * 60_000) / 36);
+}
+
+function insertLatencyGaps(points: LatencyChartPoint[], hours: number): LatencyChartPoint[] {
+  if (points.length < 2) return points;
+  const intervals = points.slice(1)
+    .map((point, index) => point.timestamp - points[index].timestamp)
+    .filter((interval) => interval > 0 && Number.isFinite(interval))
+    .sort((left, right) => left - right);
+  if (!intervals.length) return points;
+  const typicalInterval = intervals[Math.floor((intervals.length - 1) / 4)];
+  const threshold = Math.min(Math.max(10_000, typicalInterval * 1.5), latencyChartGapLimit(hours));
+  const result: LatencyChartPoint[] = [points[0]];
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const current = points[index];
+    if (current.timestamp - previous.timestamp > threshold) {
+      result.push({ timestamp: previous.timestamp + typicalInterval, label: "", value: null });
+    }
+    result.push(current);
+  }
+  return result;
+}
+
+function latencyChartTime(timestamp: number, hours: number, locale: "zh-CN" | "en"): string {
+  const date = new Date(timestamp);
+  if (hours <= 1) return date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  if (hours <= 4) return date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", hour12: false });
+  if (hours <= 24) return date.toLocaleString(locale, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+  return date.toLocaleDateString(locale, { month: "2-digit", day: "2-digit" });
+}
+
 const tooltipStyle = {
   borderRadius: 8,
   border: "1px solid var(--border)",
@@ -155,6 +226,8 @@ export function NodeDetails({ server, liveLatencyResults, threshold, retentionDa
   useEffect(() => {
     setLatencyLoading(true);
     setLatencyError("");
+    setLatencyTasks([]);
+    setLatencyPoints([]);
     if (demo) {
       const taskIds = new Set(server.latency.map((point) => point.task_id));
       const tasks = demoLatencyTasks.filter((task) => taskIds.has(task.id));
@@ -165,36 +238,36 @@ export function NodeDetails({ server, liveLatencyResults, threshold, retentionDa
     }
     let active = true;
     api.latencyHistory(server.id, latencyHours)
-      .then((latency) => { if (active) { setLatencyTasks(latency.tasks); setLatencyPoints(latency.points); } })
-      .catch((reason) => { if (active) { setLatencyPoints([]); setLatencyError(reason instanceof Error ? reason.message : ui(locale, "延迟数据加载失败", "Unable to load latency")); } })
+      .then((latency) => { if (active) {
+        setLatencyTasks(latency.tasks);
+        setLatencyPoints((current) => mergeLatencySamples(
+          current,
+          latency.points,
+          latencyHours,
+          latency.tasks.length,
+        ));
+      } })
+      .catch((reason) => { if (active) { setLatencyTasks([]); setLatencyPoints([]); setLatencyError(reason instanceof Error ? reason.message : ui(locale, "延迟数据加载失败", "Unable to load latency")); } })
       .finally(() => { if (active) setLatencyLoading(false); });
     return () => { active = false; };
   }, [server.id, latencyHours, demo, locale]);
 
   useEffect(() => {
     if (demo || !server.latency.length) return;
-    const latest = Math.max(...server.latency.map((point) => point.timestamp).filter(Number.isFinite));
-    if (!Number.isFinite(latest)) return;
-    const cutoff = latest - latencyHours * 3600;
-    setLatencyPoints((current) => {
-      const next = new Map(current
-        .filter((point) => point.timestamp >= cutoff)
-        .map((point) => [`${point.task_id}:${point.timestamp}`, point]));
-      for (const point of server.latency) {
-        if (point.timestamp >= cutoff) {
-          next.set(`${point.task_id}:${point.timestamp}`, point);
-        }
-      }
-      return Array.from(next.values()).sort((left, right) => left.timestamp - right.timestamp);
-    });
-  }, [demo, latencyHours, server.latency]);
+    setLatencyPoints((current) => mergeLatencySamples(
+      current,
+      server.latency,
+      latencyHours,
+      Math.max(latencyTasks.length, server.latency.length),
+    ));
+  }, [demo, latencyHours, latencyTasks.length, server.latency]);
 
   useEffect(() => {
     if (demo || !liveLatencyResults.length || !latencyTasks.length) return;
     const definitions = new Map(latencyTasks.map((task) => [task.id, task]));
     const samples = liveLatencyResults.flatMap((result): LatencySample[] => {
       const task = definitions.get(result.task_id);
-      if (!task || !Number.isFinite(result.timestamp)) return [];
+      if (!task || !Number.isFinite(result.timestamp) || result.timestamp <= 0) return [];
       return [{
         task_id: task.id,
         server_id: server.id,
@@ -208,15 +281,7 @@ export function NodeDetails({ server, liveLatencyResults, threshold, retentionDa
       }];
     });
     if (!samples.length) return;
-    const latest = Math.max(...samples.map((point) => point.timestamp));
-    const cutoff = latest - latencyHours * 3600;
-    setLatencyPoints((current) => {
-      const next = new Map(current
-        .filter((point) => point.timestamp >= cutoff)
-        .map((point) => [`${point.task_id}:${point.timestamp}`, point]));
-      for (const point of samples) next.set(`${point.task_id}:${point.timestamp}`, point);
-      return Array.from(next.values()).sort((left, right) => left.timestamp - right.timestamp);
-    });
+    setLatencyPoints((current) => mergeLatencySamples(current, samples, latencyHours, latencyTasks.length));
   }, [demo, latencyHours, latencyTasks, liveLatencyResults, server.id]);
 
   const online = isOnline(server, threshold);
@@ -238,34 +303,44 @@ export function NodeDetails({ server, liveLatencyResults, threshold, retentionDa
       ? { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }
       : { hour: "2-digit", minute: "2-digit", hour12: false }),
   })), [points, hours, locale]);
-  const latencyData = useMemo(() => {
-    const grouped = new Map<number, Record<string, number | string | null>>();
-    for (const point of latencyPoints) {
-      const row = grouped.get(point.timestamp) ?? {
-        timestamp: point.timestamp,
-        time: new Date(point.timestamp * 1000).toLocaleString(locale, hours >= 24
-          ? { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }
-          : { hour: "2-digit", minute: "2-digit", hour12: false }),
-      };
-      row[`latency_${point.task_id}`] = point.latency_ms >= 0 ? point.latency_ms : null;
-      row[`loss_${point.task_id}`] = point.packet_loss;
-      grouped.set(point.timestamp, row);
-    }
-    return Array.from(grouped.values()).sort((left, right) => Number(left.timestamp) - Number(right.timestamp));
-  }, [hours, latencyPoints, locale]);
   const latencySeries = useMemo(() => {
     return latencyTasks.map((task, index) => {
       const samples = latencyPoints.filter((point) => point.task_id === task.id);
+      const rawPoints: LatencyChartPoint[] = samples
+        .filter((sample) => Number.isFinite(sample.timestamp) && sample.timestamp > 0)
+        .sort((left, right) => left.timestamp - right.timestamp)
+        .map((sample) => ({
+          timestamp: sample.timestamp * 1000,
+          label: latencyChartTime(sample.timestamp * 1000, hours, locale),
+          value: sample.latency_ms >= 0 ? sample.latency_ms : null,
+        }));
       return {
         id: task.id,
         name: task.name,
-        dataKey: `latency_${task.id}`,
         color: LATENCY_COLORS[index % LATENCY_COLORS.length],
         latency: average(samples.map((sample) => sample.latency_ms)),
         loss: average(samples.map((sample) => sample.packet_loss)),
+        points: insertLatencyGaps(rawPoints, hours),
       };
     });
-  }, [latencyPoints, latencyTasks]);
+  }, [hours, latencyPoints, latencyTasks, locale]);
+  const latencyData = useMemo(() => {
+    const timestamps = new Set<number>();
+    for (const series of latencySeries) {
+      for (const point of series.points) timestamps.add(point.timestamp);
+    }
+    return Array.from(timestamps)
+      .sort((left, right) => left - right)
+      .map((timestamp) => ({ timestamp, label: latencyChartTime(timestamp, hours, locale) }));
+  }, [hours, latencySeries, locale]);
+  const latencyTimeRange = useMemo(() => {
+    const now = Date.now();
+    const start = now - latencyHours * 60 * 60_000;
+    return {
+      domain: [start, now] as [number, number],
+      ticks: Array.from({ length: 5 }, (_, index) => start + ((now - start) * index) / 4),
+    };
+  }, [latencyHours, latencyPoints]);
   const last = data[data.length - 1];
   const pingEnabled = latencyTasks.length > 0;
 
@@ -334,13 +409,13 @@ export function NodeDetails({ server, liveLatencyResults, threshold, retentionDa
             </div>
             <div className="latency-line-chart">
               {latencyData.length ? <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={latencyData.length ? latencyData : data} margin={{ top: 10, right: 12, left: 4, bottom: 2 }}>
+                <LineChart data={latencyData} margin={{ top: 10, right: 12, left: 4, bottom: 2 }}>
                   <CartesianGrid stroke="var(--chart-grid)" strokeDasharray="3 3" />
-                  <XAxis dataKey="time" tick={{ fontSize: 10 }} minTickGap={40} />
+                  <XAxis dataKey="timestamp" type="number" domain={latencyTimeRange.domain} ticks={latencyTimeRange.ticks} allowDataOverflow tick={{ fontSize: 10 }} minTickGap={40} tickFormatter={(value) => latencyChartTime(Number(value), latencyHours, locale)} />
                   <YAxis tick={{ fontSize: 10 }} width={48} unit="ms" />
-                  <Tooltip contentStyle={tooltipStyle} formatter={(value, name) => [`${Number(value).toFixed(1)} ms`, name]} />
+                  <Tooltip contentStyle={tooltipStyle} labelFormatter={(value) => latencyChartTime(Number(value), latencyHours, locale)} formatter={(value, name) => [value == null ? "--" : `${Number(value).toFixed(1)} ms`, name]} />
                   <Legend iconType="rect" iconSize={9} wrapperStyle={{ fontSize: 11, paddingTop: 10 }} />
-                  {latencySeries.map((series) => <Line key={series.id} type="monotone" dataKey={series.dataKey} name={series.name} stroke={series.color} strokeWidth={2} dot={false} connectNulls={false} isAnimationActive={false} />)}
+                  {latencySeries.map((series) => <Line key={series.id} data={series.points} type="monotone" dataKey="value" name={series.name} stroke={series.color} strokeWidth={2} dot={false} connectNulls={false} isAnimationActive={false} />)}
                 </LineChart>
               </ResponsiveContainer> : <div className="latency-empty">{ui(locale, "暂无延迟数据", "No latency data")}</div>}
             </div>

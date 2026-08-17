@@ -1,0 +1,69 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nodeflare",
+  "main": "build/index.js",
+  "compatibility_date": "2026-08-17",
+  "keep_vars": true,
+  "workers_dev": true,
+  "preview_urls": false,
+  "build": {
+    "command": "sh scripts/build-worker.sh"
+  },
+  "assets": {
+    "directory": "./frontend/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nodeflare",
+      "migrations_dir": "migrations",
+      "migrations_pattern": "migrations/initial_*.sql"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "API_RATE_LIMITER",
+      "namespace_id": "73120401",
+      "simple": { "limit": 300, "period": 60 }
+    },
+    {
+      "name": "AUTH_RATE_LIMITER",
+      "namespace_id": "73120402",
+      "simple": { "limit": 20, "period": 60 }
+    },
+    {
+      "name": "AGENT_RATE_LIMITER",
+      "namespace_id": "73120403",
+      "simple": { "limit": 120, "period": 60 }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "LIVE_HUB", "class_name": "LiveHub" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["LiveHub"] }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.05
+    }
+  },
+  "dev": {
+    "port": 8787
+  }
+}

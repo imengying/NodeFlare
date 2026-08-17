@@ -203,7 +203,7 @@ install_agent() {
   if [ "$init_system" = "systemd" ]; then
     printf '%s\n' \
     '[Unit]' \
-    'Description=NodeFlare Rust Agent' \
+    'Description=nodeflare' \
     'After=network-online.target' \
     'Wants=network-online.target' \
     '' \

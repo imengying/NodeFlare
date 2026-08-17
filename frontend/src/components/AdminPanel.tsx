@@ -1,5 +1,6 @@
 import {
   AlertTriangle,
+  Info,
   ArrowLeft,
   ChevronDown,
   ChevronUp,
@@ -38,13 +39,15 @@ import { Checkbox } from "./Checkbox";
 import { TurnstileWidget } from "./TurnstileWidget";
 import { LatencyManager } from "./LatencyManager";
 import { AlertRuleManager } from "./AlertRuleManager";
+import { Flag } from "./Flag";
+import pkg from "../../package.json";
 
-type AdminTab = "servers" | "latency" | "appearance" | "themes" | "themeSettings" | "alerts" | "security" | "data";
+const { version: VERSION } = pkg;
+
+type AdminTab = "servers" | "latency" | "appearance" | "themes" | "themeSettings" | "alerts" | "security" | "data" | "about";
 type AgentPlatform = "linux" | "windows" | "macos";
 
-interface AgentInstallTarget {
-  id: string;
-  name: string;
+interface AgentInstallInfo {
   agent_token: string;
   agent_mirror: string;
 }
@@ -58,6 +61,7 @@ const adminPages: Record<AdminTab, { title: string; description: string }> = {
   alerts: { title: "通知", description: "配置 Telegram 通知和资源告警阈值" },
   security: { title: "登录与安全", description: "管理管理员账号和 Cloudflare Turnstile 防护" },
   data: { title: "监控数据库", description: "查看 D1 用量、汇率状态并维护历史数据" },
+  about: { title: "关于", description: "版本信息与项目地址" },
 };
 
 
@@ -164,7 +168,11 @@ export function AdminPanel({
   const [themeSettingsSchema, setThemeSettingsSchema] = useState<ThemeSettingsSchema | null>(null);
   const [editing, setEditing] = useState<AdminServer | "new" | null>(null);
   const [form, setForm] = useState<ServerInput>(emptyServer);
-  const [install, setInstall] = useState<AgentInstallTarget[]>([]);
+  const [install, setInstall] = useState<AgentInstallInfo | null>(null);
+  const [rxCurrentGb, setRxCurrentGb] = useState("0");
+  const [txCurrentGb, setTxCurrentGb] = useState("0");
+  const [rxBaseBytes, setRxBaseBytes] = useState(0);
+  const [txBaseBytes, setTxBaseBytes] = useState(0);
   const [installPlatform, setInstallPlatform] = useState<AgentPlatform>("linux");
 
   const load = useCallback(async () => {
@@ -236,6 +244,13 @@ export function AdminPanel({
   function openEditor(server?: AdminServer) {
     setEditing(server ?? "new");
     setForm(server ? toInput(server) : { ...emptyServer });
+    // 修正值输入展示“当前累计用量”（已上报 + 已修正），保存时换算回差值。
+    const rxBase = server ? (server.net_rx_total ?? 0) - server.rx_correction : 0;
+    const txBase = server ? (server.net_tx_total ?? 0) - server.tx_correction : 0;
+    setRxCurrentGb(((server ? (server.net_rx_total ?? 0) : 0) / 1024 ** 3).toFixed(2));
+    setTxCurrentGb(((server ? (server.net_tx_total ?? 0) : 0) / 1024 ** 3).toFixed(2));
+    setRxBaseBytes(rxBase);
+    setTxBaseBytes(txBase);
     setError("");
   }
 
@@ -243,12 +258,17 @@ export function AdminPanel({
     event.preventDefault();
     setBusy(true);
     setError("");
+    const payload: ServerInput = {
+      ...form,
+      rx_correction: Math.round(((Number(rxCurrentGb) || 0) * 1024 ** 3) - rxBaseBytes),
+      tx_correction: Math.round(((Number(txCurrentGb) || 0) * 1024 ** 3) - txBaseBytes),
+    };
     try {
       if (editing === "new") {
-        const result = await api.createServer(form);
-        setInstall([{ id: result.id, name: form.name, agent_token: result.agent_token, agent_mirror: form.agent_mirror }]);
+        const result = await api.createServer(payload);
+        setInstall({ agent_token: result.agent_token, agent_mirror: form.agent_mirror });
       } else if (editing) {
-        await api.updateServer(editing.id, form);
+        await api.updateServer(editing.id, payload);
       }
       setEditing(null);
       await load();
@@ -281,7 +301,7 @@ export function AdminPanel({
     setError("");
     try {
       const { agent_token } = await api.serverToken(server.id);
-      setInstall([{ id: server.id, name: server.name, agent_token, agent_mirror: server.agent_mirror }]);
+      setInstall({ agent_token, agent_mirror: server.agent_mirror });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "读取 Agent Token 失败");
     } finally {
@@ -289,12 +309,9 @@ export function AdminPanel({
     }
   }
 
-  async function copyInstallCommands() {
+  async function copyInstallCommand() {
     try {
-      const text = commands.length === 1
-        ? commands[0].command
-        : commands.map((item) => `# ${item.name.replace(/\s+/g, " ").trim() || item.id}\n${item.command}`).join("\n\n");
-      await navigator.clipboard.writeText(text);
+      if (installCommand) await navigator.clipboard.writeText(installCommand);
     } catch {
       setError("复制失败，请手动选择命令复制");
     }
@@ -467,29 +484,21 @@ export function AdminPanel({
     }
   }
 
-  const commands = useMemo(() => install.map((server) => {
+  const installCommand = useMemo(() => {
+    if (!install) return "";
     const origin = window.location.origin;
     const installer = "https://raw.githubusercontent.com/imengying/NodeFlare/main/agent";
-    const mirror = server.agent_mirror.trim().replace(/\/+$/, "");
+    const mirror = install.agent_mirror.trim().replace(/\/+$/, "");
     const shellMirror = mirror ? ` -m ${shellLiteral(mirror)}` : "";
     const powershellMirror = mirror ? ` -Mirror ${powershellLiteral(mirror)}` : "";
     if (installPlatform === "windows") {
-      return {
-        ...server,
-        command: `Invoke-WebRequest -Uri "${installer}/install.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" -e ${powershellLiteral(origin)} -t ${powershellLiteral(server.agent_token)}${powershellMirror}`,
-      };
+      return `Invoke-WebRequest -Uri "${installer}/install.ps1" -OutFile "$env:TEMP\\nodeflare-install.ps1"\n& "$env:TEMP\\nodeflare-install.ps1" -e ${powershellLiteral(origin)} -t ${powershellLiteral(install.agent_token)}${powershellMirror}`;
     }
     if (installPlatform === "macos") {
-      return {
-        ...server,
-        command: `curl -fsSL ${installer}/install-macos.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}${shellMirror}`,
-      };
+      return `curl -fsSL ${installer}/install-macos.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(install.agent_token)}${shellMirror}`;
     }
-    return {
-      ...server,
-      command: `curl -fsSL ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(server.agent_token)}${shellMirror}`,
-    };
-  }), [install, installPlatform]);
+    return `curl -fsSL ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(install.agent_token)}${shellMirror}`;
+  }, [install, installPlatform]);
 
   const toggleSelected = (id: string) => setSelectedIds((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
   const allSelected = servers.length > 0 && selectedIds.length === servers.length;
@@ -545,6 +554,7 @@ export function AdminPanel({
                 <button className={tab === "alerts" ? "active" : ""} onClick={() => selectTab("alerts")}><AlertTriangle size={19} />通知</button>
                 <button className={tab === "security" ? "active" : ""} onClick={() => selectTab("security")}><ShieldCheck size={19} />登录与安全</button>
                 <button className={tab === "data" ? "active" : ""} onClick={() => { selectTab("data"); if (!database) void loadDatabase(); }}><Database size={19} />监控数据库</button>
+                <button className={tab === "about" ? "active" : ""} onClick={() => selectTab("about")}><Info size={19} />关于</button>
               </nav>
             </aside>
             <div className="admin-content">
@@ -559,7 +569,7 @@ export function AdminPanel({
                         <button type="button" className="drag-handle" draggable onDragStart={(event) => startDrag(event, server.id)} onDragEnd={() => setDraggingId("")} title={`拖动排序：${server.name}`}><GripVertical size={15} /></button>
                         <Checkbox checked={selectedIds.includes(server.id)} onChange={() => toggleSelected(server.id)} ariaLabel={`选择 ${server.name}`} />
                         <span className={`status-dot ${settings && isOnline(server, settings.offline_threshold_seconds) ? "online" : ""}`} />
-                        <div className="server-name"><strong>{server.name}</strong><small>{server.group_name} · {server.region || "未设置地区"} · {server.last_ip || "尚未上报 IP"} · {server.agent_version ? `Agent v${server.agent_version}` : "Agent 未上报版本"} · {server.report_interval}s</small></div>
+                        <div className="server-name"><div className="server-name-main"><Flag region={server.region} size={17} /><strong>{server.name}</strong><small>{server.last_ip || "尚未上报 IP"} · {server.agent_version ? `Agent v${server.agent_version}` : "Agent 未上报版本"}</small></div></div>
                         <div className="row-actions"><button className="icon-btn" disabled={index === 0} onClick={() => void move(index, -1)} title="上移"><ChevronUp size={15} /></button><button className="icon-btn" disabled={index === servers.length - 1} onClick={() => void move(index, 1)} title="下移"><ChevronDown size={15} /></button><button className="icon-btn" disabled={busy} onClick={() => void showInstallCommand(server)} title="显示安装命令"><Download size={15} /></button><button className="icon-btn" onClick={() => openEditor(server)} title="编辑节点"><Pencil size={15} /></button><button className="icon-btn danger" onClick={() => void remove(server)} title="删除节点"><Trash2 size={15} /></button></div>
                       </div>
                     ))}
@@ -575,7 +585,7 @@ export function AdminPanel({
                     <div className="theme-list">
                       {themes.map((theme) => <article className={`theme-row ${theme.active ? "active" : ""}`} key={theme.id}>
                         <div className="theme-row-main">
-                          <div className="theme-row-title"><strong>{theme.name}</strong><span className={`theme-badge ${theme.builtin ? "builtin" : "remote"}`}>{theme.builtin ? "默认主题" : "远程主题"}</span></div>
+                          <div className="theme-row-title"><strong>{theme.name}</strong><span className={`theme-badge ${theme.builtin ? "builtin" : "remote"}`}>{theme.builtin ? "默认主题" : "远程主题"}</span>{theme.version ? <span className="theme-badge version">v{theme.version}</span> : null}</div>
                           {!theme.builtin ? <p title={theme.description || undefined}>{theme.description || "暂无主题说明"}</p> : null}
                           {!theme.builtin ? <a href={theme.url} target="_blank" rel="noreferrer"><span>{theme.url}</span><ExternalLink size={13} /></a> : null}
                         </div>
@@ -648,8 +658,17 @@ export function AdminPanel({
                     <p className="settings-hint">清空历史不会删除节点、密钥或最新状态。</p>
                   </> : null}
 
-                  {tab !== "data" ? <div className="form-actions"><button className="primary-btn" disabled={busy}><Save size={16} />保存{tab === "security" ? "账号与安全设置" : "设置"}</button></div> : null}
+                  {tab !== "data" && tab !== "about" ? <div className="form-actions"><button className="primary-btn" disabled={busy}><Save size={16} />保存{tab === "security" ? "账号与安全设置" : "设置"}</button></div> : null}
                 </form>
+              ) : tab === "about" ? (
+                <div className="admin-section about-page">
+                  <div className="about-brand"><img src="/logo.svg" alt="" width="52" height="52" /><div><strong>NodeFlare</strong><small>基于 Rust、WebAssembly 和 Cloudflare Workers 的服务器监控</small></div></div>
+                  <div className="about-rows">
+                    <div className="about-row"><span>版本</span><strong>v{VERSION}</strong></div>
+                    <div className="about-row"><span>项目地址</span><a href="https://github.com/imengying/NodeFlare" target="_blank" rel="noreferrer">github.com/imengying/NodeFlare<ExternalLink size={13} /></a></div>
+                    <div className="about-row"><span>开源协议</span><strong>MIT License</strong></div>
+                  </div>
+                </div>
               ) : null}
             </div>
           </div>
@@ -661,12 +680,12 @@ export function AdminPanel({
         <div className="form-grid three"><label><span>流量限额（GB）</span><input min="0" type="number" value={Math.round(form.traffic_limit / 1024 ** 3)} onChange={(event) => updateForm("traffic_limit", Number(event.target.value) * 1024 ** 3)} /></label><label><span>流量口径</span><select value={form.traffic_limit_type} onChange={(event) => updateForm("traffic_limit_type", event.target.value as ServerInput["traffic_limit_type"])}><option value="sum">上下行合计</option><option value="max">取较大值</option><option value="min">取较小值</option><option value="up">仅上行</option><option value="down">仅下行</option></select></label><label><span>流量重置日</span><input min="1" max="31" type="number" value={form.reset_day} onChange={(event) => updateForm("reset_day", Number(event.target.value))} /></label></div>
         <div className="form-grid three"><label><span>价格（0 隐藏，-1 免费）</span><input min="-1" step="0.01" type="number" value={form.price} onChange={(event) => updateForm("price", Number(event.target.value))} /></label><label><span>币种</span><select value={form.currency} onChange={(event) => updateForm("currency", event.target.value)}>{ASSET_CURRENCIES.map((code) => <option key={code}>{code}</option>)}</select></label><label><span>计费周期（天）</span><input min="1" max="3650" type="number" value={form.billing_cycle} onChange={(event) => updateForm("billing_cycle", Number(event.target.value))} /></label></div>
         <div className="form-grid three"><label><span>到期日期</span><input type="date" value={formatDate(form.expires_at)} onChange={(event) => updateForm("expires_at", event.target.value ? Math.floor(new Date(`${event.target.value}T00:00:00Z`).getTime() / 1000) : null)} /></label><label><span>Agent 上报间隔（秒）</span><input min="15" max="3600" type="number" value={form.report_interval} onChange={(event) => updateForm("report_interval", Number(event.target.value))} /></label><label><span>指标采样间隔（秒）</span><input min="2" max="60" type="number" value={form.collect_interval} onChange={(event) => updateForm("collect_interval", Number(event.target.value))} /></label></div>
-        <div className="form-grid"><label><span>统计网卡（逗号分隔，留空自动）</span><input value={form.network_interface} onChange={(event) => updateForm("network_interface", event.target.value)} placeholder="eth0,ens3" /></label><label><span>下行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.rx_correction / 1024 ** 3} onChange={(event) => updateForm("rx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label><label><span>上行流量修正（GB）</span><input min="0" step="0.1" type="number" value={form.tx_correction / 1024 ** 3} onChange={(event) => updateForm("tx_correction", Math.round(Number(event.target.value) * 1024 ** 3))} /></label><label><span>Agent 下载加速（可选）</span><input value={form.agent_mirror} onChange={(event) => updateForm("agent_mirror", event.target.value.trim())} placeholder="https://ghproxy.net" /></label></div>
+        <div className="form-grid"><label><span>统计网卡（逗号分隔，留空自动）</span><input value={form.network_interface} onChange={(event) => updateForm("network_interface", event.target.value)} placeholder="eth0,ens3" /></label><label><span>下行流量当前值（GB）</span><input min="0" step="0.1" type="number" value={rxCurrentGb} onChange={(event) => setRxCurrentGb(event.target.value)} /></label><label><span>上行流量当前值（GB）</span><input min="0" step="0.1" type="number" value={txCurrentGb} onChange={(event) => setTxCurrentGb(event.target.value)} /></label><label><span>Agent 下载加速（可选）</span><input value={form.agent_mirror} onChange={(event) => updateForm("agent_mirror", event.target.value.trim())} placeholder="https://ghproxy.net" /></label></div>
         <div className="settings-toggles editor-toggles"><Toggle label="自动续费" checked={form.auto_renewal} onChange={(value) => updateForm("auto_renewal", value)} /><Toggle label="Agent 自动更新" checked={form.auto_update} onChange={(value) => updateForm("auto_update", value)} /><Toggle label="隐藏节点" checked={form.hidden} onChange={(value) => updateForm("hidden", value)} /><Toggle label="关闭离线告警" checked={form.offline_notify_disabled} onChange={(value) => updateForm("offline_notify_disabled", value)} /></div>
         <div className="form-actions"><button type="button" className="secondary-btn" onClick={() => setEditing(null)}>取消</button><button className="primary-btn" disabled={busy}><Save size={16} />保存节点</button></div>
       </form></div> : null}
 
-      {commands.length ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setInstall([])}><section className="install-modal glass-panel" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">Agent 部署</span><h3>安装命令</h3></div><div className="segmented install-platform" aria-label="Agent 平台"><button type="button" className={installPlatform === "linux" ? "active" : ""} onClick={() => setInstallPlatform("linux")}>Linux</button><button type="button" className={installPlatform === "windows" ? "active" : ""} onClick={() => setInstallPlatform("windows")}>Windows</button><button type="button" className={installPlatform === "macos" ? "active" : ""} onClick={() => setInstallPlatform("macos")}>macOS ARM</button></div></header><div className="install-list">{commands.map((item) => <div key={item.id}><strong>{item.name}</strong><pre>{item.command}</pre></div>)}</div><div className="form-actions"><button className="secondary-btn" type="button" onClick={() => setInstall([])}>关闭</button><button className="primary-btn" type="button" onClick={() => void copyInstallCommands()}><Copy size={16} />复制全部</button></div></section></div> : null}
+      {installCommand ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setInstall(null)}><section className="install-modal glass-panel" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">Agent 部署</span><h3>安装命令</h3></div><div className="segmented install-platform" aria-label="Agent 平台"><button type="button" className={installPlatform === "linux" ? "active" : ""} onClick={() => setInstallPlatform("linux")}>Linux</button><button type="button" className={installPlatform === "windows" ? "active" : ""} onClick={() => setInstallPlatform("windows")}>Windows</button><button type="button" className={installPlatform === "macos" ? "active" : ""} onClick={() => setInstallPlatform("macos")}>macOS ARM</button></div></header><div className="install-list"><pre>{installCommand}</pre></div><div className="form-actions"><button className="secondary-btn" type="button" onClick={() => setInstall(null)}>关闭</button><button className="primary-btn" type="button" onClick={() => void copyInstallCommand()}><Copy size={16} />复制</button></div></section></div> : null}
     </div>
   );
 }

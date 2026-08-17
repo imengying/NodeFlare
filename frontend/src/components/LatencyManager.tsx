@@ -99,10 +99,6 @@ export function LatencyManager({
       onError(form.task_type === "icmp" ? "ICMP 节点应为公网域名或公网 IPv4，不使用端口" : "TCP 节点应为公网域名或公网 IPv4，并填写 1 至 65535 的端口");
       return;
     }
-    if (!form.default_enabled && !form.server_ids.length) {
-      onError("请至少选择一个服务器，或开启默认分配");
-      return;
-    }
     setBusy(true);
     onError("");
     try {
@@ -154,14 +150,14 @@ export function LatencyManager({
 
     {editing ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setEditing(null)}><form className="latency-editor glass-panel" onSubmit={save} onMouseDown={(event) => event.stopPropagation()}>
       <header><div><span className="eyebrow">延迟检测</span><h3>{editing === "new" ? "添加任务" : `编辑 · ${editing.name}`}</h3></div></header>
-      <div className="form-grid"><label><span>名称</span><input autoFocus required maxLength={80} value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} /></label><label><span>类型</span><div className="segmented task-type-control"><button type="button" className={form.task_type === "icmp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "icmp", port: null }))}>ICMP</button><button type="button" className={form.task_type === "tcp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "tcp", port: current.port ?? 443 }))}>TCP</button></div></label></div>
-      <div className="form-grid"><label><span>节点</span><input required maxLength={50} value={form.target} onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))} placeholder={form.task_type === "tcp" ? "example.com" : "1.1.1.1"} /></label>{form.task_type === "tcp" ? <label><span>端口</span><input type="number" min="1" max="65535" required value={form.port ?? ""} onChange={(event) => setForm((current) => ({ ...current, port: event.target.value ? Number(event.target.value) : null }))} placeholder="443" /></label> : <div />}</div>
+      <div className="form-grid"><label><span>名称</span><input autoFocus required maxLength={80} value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} /></label><label><span>类型</span><div className="segmented task-type-control"><button type="button" className={form.task_type === "icmp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "icmp", port: null }))}>ICMP</button><button type="button" className={form.task_type === "tcp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "tcp", port: current.port ?? 80 }))}>TCP</button></div></label></div>
+      <div className="form-grid"><label><span>节点</span><input required maxLength={50} value={form.target} onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))} placeholder={form.task_type === "tcp" ? "example.com" : "1.1.1.1"} /></label>{form.task_type === "tcp" ? <label><span>端口</span><input type="number" min="1" max="65535" required value={form.port ?? ""} onChange={(event) => setForm((current) => ({ ...current, port: event.target.value ? Number(event.target.value) : null }))} placeholder="80" /></label> : <div />}</div>
       <label><span>检测间隔（秒）</span><input type="number" min="30" max="3600" required value={form.interval_seconds} onChange={(event) => setForm((current) => ({ ...current, interval_seconds: Number(event.target.value) }))} /></label>
       <div className="server-picker">
         <div className="server-picker-head"><strong>服务器</strong><span>已选 {form.server_ids.length} / 共 {servers.length}</span><button type="button" onClick={() => setForm((current) => ({ ...current, server_ids: allSelected ? [] : servers.map((server) => server.id) }))}>{allSelected ? "取消全选" : "全选"}</button></div>
         <div className="server-picker-search"><Search size={16} /><input aria-label="搜索服务器" placeholder="搜索" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
         <div className="server-picker-list">
-          {visibleServers.map((server) => <label className="server-picker-row" key={server.id}><Checkbox checked={form.server_ids.includes(server.id)} onChange={() => toggleServer(server.id)} /><span><strong>{server.name}</strong><small>{server.group_name} · {server.region || "未设置地区"}{server.last_ip ? ` · ${server.last_ip}` : ""}</small></span></label>)}
+          {visibleServers.map((server) => <label className="server-picker-row" key={server.id}><Checkbox checked={form.server_ids.includes(server.id)} onChange={() => toggleServer(server.id)} /><span><strong>{server.name}</strong><small>{server.last_ip || "尚未上报 IP"}</small></span></label>)}
           {!visibleServers.length ? <div className="server-picker-empty">没有匹配的服务器</div> : null}
         </div>
       </div>

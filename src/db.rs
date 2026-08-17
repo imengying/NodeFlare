@@ -19,8 +19,8 @@ SELECT
   s.created_at,
   m.timestamp, m.cpu, m.load1, m.load5, m.load15, m.mem_used, m.mem_total,
   m.swap_used, m.swap_total, m.disk_used, m.disk_total, m.net_in, m.net_out,
-  CASE WHEN m.net_rx_total IS NULL THEN NULL ELSE COALESCE(c.used_rx, m.net_rx_total) + s.rx_correction END AS net_rx_total,
-  CASE WHEN m.net_tx_total IS NULL THEN NULL ELSE COALESCE(c.used_tx, m.net_tx_total) + s.tx_correction END AS net_tx_total,
+  CASE WHEN m.net_rx_total IS NULL THEN NULL ELSE MAX(0, COALESCE(c.used_rx, m.net_rx_total) + s.rx_correction) END AS net_rx_total,
+  CASE WHEN m.net_tx_total IS NULL THEN NULL ELSE MAX(0, COALESCE(c.used_tx, m.net_tx_total) + s.tx_correction) END AS net_tx_total,
   m.uptime, m.processes, m.tcp_connections,
   m.udp_connections, m.cpu_cores, m.cpu_model, m.os, m.kernel, m.arch,
   m.virtualization, m.gpu_usage, m.gpu_model, m.agent_version,
@@ -60,6 +60,7 @@ struct ThemeRow {
     name: String,
     description: String,
     url: String,
+    version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1233,7 +1234,7 @@ pub async fn update_settings(
 
 pub async fn list_themes(db: &D1Database, active_id: &str) -> Result<Vec<ThemeView>> {
     let rows: Vec<ThemeRow> = db
-        .prepare("SELECT id, name, description, url FROM themes ORDER BY created_at DESC")
+        .prepare("SELECT id, name, description, url, version FROM themes ORDER BY created_at DESC")
         .all()
         .await?
         .results()?;
@@ -1246,6 +1247,7 @@ pub async fn list_themes(db: &D1Database, active_id: &str) -> Result<Vec<ThemeVi
                 name: row.name,
                 description: row.description,
                 url: row.url,
+                version: row.version,
                 builtin: false,
                 active,
             }
@@ -1258,17 +1260,19 @@ pub async fn create_theme(
     id: &str,
     input: &ThemeInput,
     source_url: &str,
+    version: &str,
     timestamp: i64,
 ) -> Result<()> {
     db.prepare(
-        "INSERT INTO themes(id, name, description, url, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO themes(id, name, description, url, version, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .bind(&[
         text(id),
         text(input.name.trim()),
         text(input.description.trim()),
         text(source_url),
+        text(version),
         number(timestamp),
     ])?
     .run()
@@ -1278,7 +1282,7 @@ pub async fn create_theme(
 
 pub async fn theme_exists(db: &D1Database, id: &str) -> Result<bool> {
     let row: Option<ThemeRow> = db
-        .prepare("SELECT id, name, description, url FROM themes WHERE id = ?1")
+        .prepare("SELECT id, name, description, url, version FROM themes WHERE id = ?1")
         .bind(&[text(id)])?
         .first(None)
         .await?;
@@ -1287,12 +1291,20 @@ pub async fn theme_exists(db: &D1Database, id: &str) -> Result<bool> {
 
 pub async fn theme_url(db: &D1Database, id: &str) -> Result<Option<String>> {
     let row: Option<ThemeRow> = db
-        .prepare("SELECT id, name, description, url FROM themes WHERE id = ?1")
+        .prepare("SELECT id, name, description, url, version FROM themes WHERE id = ?1")
         .bind(&[text(id)])?
         .first(None)
         .await?;
     row.map(|theme| crate::theme::resolve_url(&theme.url).map(|resolved| resolved.resolved_url))
         .transpose()
+}
+
+pub async fn update_theme_version(db: &D1Database, id: &str, version: &str) -> Result<()> {
+    db.prepare("UPDATE themes SET version = ?2 WHERE id = ?1")
+        .bind(&[text(id), text(version)])?
+        .run()
+        .await?;
+    Ok(())
 }
 
 pub async fn set_active_theme(db: &D1Database, id: &str) -> Result<bool> {

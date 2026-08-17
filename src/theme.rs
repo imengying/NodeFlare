@@ -342,6 +342,30 @@ pub async fn remote_settings_schema(base: &str) -> Result<Value> {
         .ok_or_else(|| Error::RustError("主题 theme.json 设置格式无效".to_string()))
 }
 
+/// 读取远程主题 theme.json 中的 version 字段；无 theme.json 或无版本时返回 None。
+pub async fn remote_theme_version(base: &str) -> Option<String> {
+    let url = settings_url(base)?;
+    let request = Request::new(&url, Method::Get).ok()?;
+    let mut response = Fetch::Request(request).send().await.ok()?;
+    if !(200..300).contains(&response.status_code()) {
+        return None;
+    }
+    let body = read_response_limited(&mut response, SETTINGS_MAX_BYTES)
+        .await
+        .ok()??;
+    let value: Value = serde_json::from_slice(body.as_slice()).ok()?;
+    let version = value.get("version")?.as_str()?.trim();
+    if version.is_empty()
+        || version.len() > 40
+        || !version
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_+ ".contains(character))
+    {
+        return None;
+    }
+    Some(version.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

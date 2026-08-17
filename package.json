@@ -19,6 +19,9 @@
     "test:smoke": "sh scripts/smoke-test.sh"
   },
   "devDependencies": {
-    "wrangler": "^4.122.0"
+    "wrangler": "^4.123.0"
+  },
+  "overrides": {
+    "nanoid": "3.3.18"
   }
 }

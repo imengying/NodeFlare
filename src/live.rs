@@ -38,13 +38,8 @@ struct SocketAttachment {
     traffic: Option<TrafficAttachment>,
 }
 
-fn active_report_interval_ms(report_interval: i64, collect_interval: i64) -> i64 {
-    let report_interval = report_interval.clamp(15, 3600);
-    let collect_interval = collect_interval.clamp(2, 60).min(report_interval);
-    ((report_interval + 14) / 15)
-        .max(collect_interval)
-        .clamp(2, 60)
-        * 1000
+fn live_interval_ms(collect_interval: i64) -> i64 {
+    collect_interval.clamp(2, 60) * 1000
 }
 
 fn apply_live_traffic(report: &mut AgentReport, traffic: &mut TrafficAttachment) {
@@ -71,8 +66,8 @@ fn apply_live_traffic(report: &mut AgentReport, traffic: &mut TrafficAttachment)
         traffic.raw_rx = report.net_rx_total;
         traffic.raw_tx = report.net_tx_total;
     }
-    report.net_rx_total = traffic.used_rx.saturating_add(traffic.rx_correction);
-    report.net_tx_total = traffic.used_tx.saturating_add(traffic.tx_correction);
+    report.net_rx_total = traffic.used_rx.saturating_add(traffic.rx_correction).max(0);
+    report.net_tx_total = traffic.used_tx.saturating_add(traffic.tx_correction).max(0);
 }
 
 fn batch_update_payload(
@@ -336,17 +331,12 @@ impl DurableObject for LiveHub {
                 self.state
                     .get_websockets_with_tag(&format!("server:{server_id}")),
             );
-            let has_dashboard = !sockets.is_empty();
             for dashboard in sockets {
                 if dashboard.send_with_str(&payload).is_err() {
                     let _ = dashboard.close(Some(1011), Some("send failed"));
                 }
             }
-            let next_wss_ms = if has_dashboard {
-                active_report_interval_ms(attachment.report_interval, attachment.collect_interval)
-            } else {
-                report_interval * 1000
-            };
+            let next_wss_ms = live_interval_ms(attachment.collect_interval);
             let next_d1_ms = if persisted {
                 report_interval * 1000
             } else {
@@ -362,6 +352,7 @@ impl DurableObject for LiveHub {
                 "nextWssReportAfterMs": next_wss_ms
             }))?)?;
         } else {
+            let next_wss_ms = live_interval_ms(attachment.collect_interval);
             let next_d1_ms = if persisted {
                 report_interval * 1000
             } else {
@@ -374,7 +365,7 @@ impl DurableObject for LiveHub {
                 "ts": received_at,
                 "persisted": persisted,
                 "nextD1WriteAfterMs": next_d1_ms,
-                "nextWssReportAfterMs": report_interval * 1000
+                "nextWssReportAfterMs": next_wss_ms
             }))?)?;
         }
         Ok(())
@@ -494,7 +485,7 @@ pub async fn upgrade_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::{active_report_interval_ms, batch_update_payload_at, TrafficAttachment};
+    use super::{batch_update_payload_at, live_interval_ms, TrafficAttachment};
     use crate::models::AgentReport;
 
     #[test]
@@ -549,7 +540,8 @@ mod tests {
             tx_correction: 20,
         };
         let payload: serde_json::Value = serde_json::from_str(
-            &batch_update_payload_at("node-a", &[report], &mut traffic, 1_235).unwrap(),
+            &batch_update_payload_at("node-a", std::slice::from_ref(&report), &mut traffic, 1_235)
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(payload["type"], "batchUpdate");
@@ -563,6 +555,23 @@ mod tests {
         assert!(payload["updates"][0]["samples"][0]["data"]
             .get("timestamp")
             .is_none());
-        assert_eq!(active_report_interval_ms(60, 5), 5_000);
+        assert_eq!(live_interval_ms(5), 5_000);
+        assert_eq!(live_interval_ms(1), 2_000);
+        assert_eq!(live_interval_ms(120), 60_000);
+
+        let mut corrected_down = traffic;
+        corrected_down.rx_correction = -800;
+        let mut corrected_report = report.clone();
+        corrected_report.timestamp = 1_235;
+        corrected_report.net_rx_total = 301;
+        let payload: serde_json::Value = serde_json::from_str(
+            &batch_update_payload_at("node-a", &[corrected_report], &mut corrected_down, 1_236)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            payload["updates"][0]["samples"][0]["data"]["net_rx_total"],
+            0
+        );
     }
 }

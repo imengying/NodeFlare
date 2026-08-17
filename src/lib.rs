@@ -524,9 +524,6 @@ pub(crate) fn validate_latency_task(input: &LatencyTaskInput) -> Option<&'static
     {
         return Some("服务器选择列表无效");
     }
-    if !input.default_enabled && input.server_ids.is_empty() {
-        return Some("请至少选择一个服务器，或开启默认分配");
-    }
     None
 }
 
@@ -625,9 +622,6 @@ pub(crate) fn validate_server(input: &ServerInput) -> Option<&'static str> {
     }
     if input.network_interface.chars().count() > 160 {
         return Some("统计网卡配置字段过长");
-    }
-    if input.rx_correction < 0 || input.tx_correction < 0 {
-        return Some("流量修正值不能为负数");
     }
     if !valid_agent_mirror(&input.agent_mirror) {
         return Some("Agent 下载加速地址必须是无凭据、查询参数和片段的 HTTPS URL");
@@ -1309,10 +1303,8 @@ mod tests {
         assert_eq!(validate_latency_task(&task), Some("ICMP 检测不使用端口"));
         task.port = None;
         task.server_ids.clear();
-        assert_eq!(
-            validate_latency_task(&task),
-            Some("请至少选择一个服务器，或开启默认分配")
-        );
+        // 空服务器列表且未开默认分配：任务先保存，之后可再分配。
+        assert_eq!(validate_latency_task(&task), None);
         task.default_enabled = true;
         assert_eq!(validate_latency_task(&task), None);
     }
