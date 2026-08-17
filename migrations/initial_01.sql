@@ -1,8 +1,8 @@
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  value TEXT NOT NULL CHECK(json_valid(value)),
   updated_at INTEGER NOT NULL
 );
 
@@ -25,7 +25,7 @@ CREATE TABLE servers (
   network_interface TEXT NOT NULL DEFAULT '',
   reset_day INTEGER NOT NULL DEFAULT 1,
   report_interval INTEGER NOT NULL DEFAULT 60,
-  collect_interval INTEGER NOT NULL DEFAULT 5,
+  collect_interval INTEGER NOT NULL DEFAULT 1,
   rx_correction INTEGER NOT NULL DEFAULT 0,
   tx_correction INTEGER NOT NULL DEFAULT 0,
   agent_mirror TEXT NOT NULL DEFAULT '',
@@ -34,57 +34,6 @@ CREATE TABLE servers (
   token TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE latest_metrics (
-  server_id TEXT PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
-  timestamp INTEGER NOT NULL,
-  cpu REAL NOT NULL DEFAULT 0,
-  load1 REAL NOT NULL DEFAULT 0,
-  load5 REAL NOT NULL DEFAULT 0,
-  load15 REAL NOT NULL DEFAULT 0,
-  mem_used INTEGER NOT NULL DEFAULT 0,
-  mem_total INTEGER NOT NULL DEFAULT 0,
-  swap_used INTEGER NOT NULL DEFAULT 0,
-  swap_total INTEGER NOT NULL DEFAULT 0,
-  disk_used INTEGER NOT NULL DEFAULT 0,
-  disk_total INTEGER NOT NULL DEFAULT 0,
-  net_in REAL NOT NULL DEFAULT 0,
-  net_out REAL NOT NULL DEFAULT 0,
-  net_rx_total INTEGER NOT NULL DEFAULT 0,
-  net_tx_total INTEGER NOT NULL DEFAULT 0,
-  uptime INTEGER NOT NULL DEFAULT 0,
-  processes INTEGER NOT NULL DEFAULT 0,
-  tcp_connections INTEGER NOT NULL DEFAULT 0,
-  udp_connections INTEGER NOT NULL DEFAULT 0,
-  cpu_cores INTEGER NOT NULL DEFAULT 0,
-  cpu_model TEXT NOT NULL DEFAULT '',
-  os TEXT NOT NULL DEFAULT '',
-  kernel TEXT NOT NULL DEFAULT '',
-  arch TEXT NOT NULL DEFAULT '',
-  virtualization TEXT NOT NULL DEFAULT '',
-  gpu_usage REAL NOT NULL DEFAULT 0,
-  gpu_model TEXT NOT NULL DEFAULT '',
-  agent_version TEXT NOT NULL DEFAULT '',
-  disk_read_bps REAL NOT NULL DEFAULT 0,
-  disk_write_bps REAL NOT NULL DEFAULT 0,
-  disk_read_iops REAL NOT NULL DEFAULT 0,
-  disk_write_iops REAL NOT NULL DEFAULT 0,
-  disk_await_ms REAL NOT NULL DEFAULT 0,
-  disk_utilization REAL NOT NULL DEFAULT 0,
-  disk_info TEXT NOT NULL DEFAULT '[]',
-  gpu_info TEXT NOT NULL DEFAULT '[]'
-);
-
-CREATE TABLE traffic_cycles (
-  server_id TEXT PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
-  cycle_key INTEGER NOT NULL,
-  reset_day INTEGER NOT NULL DEFAULT 1,
-  timestamp INTEGER NOT NULL,
-  raw_rx INTEGER NOT NULL DEFAULT 0,
-  raw_tx INTEGER NOT NULL DEFAULT 0,
-  used_rx INTEGER NOT NULL DEFAULT 0,
-  used_tx INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE metric_history (
@@ -114,8 +63,11 @@ CREATE TABLE metric_history (
   disk_write_iops REAL NOT NULL DEFAULT 0,
   disk_await_ms REAL NOT NULL DEFAULT 0,
   disk_utilization REAL NOT NULL DEFAULT 0,
+  latest_timestamp INTEGER NOT NULL,
+  latest_json TEXT NOT NULL CHECK(json_valid(latest_json)),
+  latency_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(latency_json)),
   PRIMARY KEY(server_id, timestamp)
-);
+) WITHOUT ROWID;
 
 CREATE TABLE metric_history_hourly (
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
@@ -144,51 +96,57 @@ CREATE TABLE metric_history_hourly (
   disk_write_iops REAL NOT NULL DEFAULT 0,
   disk_await_ms REAL NOT NULL DEFAULT 0,
   disk_utilization REAL NOT NULL DEFAULT 0,
+  latest_timestamp INTEGER NOT NULL,
+  latest_json TEXT NOT NULL CHECK(json_valid(latest_json)),
+  latency_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(latency_json)),
   PRIMARY KEY(server_id, timestamp)
-);
+) WITHOUT ROWID;
 
-CREATE INDEX idx_history_server_time
-  ON metric_history(server_id, timestamp DESC);
-CREATE INDEX idx_history_hourly_server_time
-  ON metric_history_hourly(server_id, timestamp DESC);
 CREATE INDEX idx_servers_sort
   ON servers(sort_order, created_at);
 
-INSERT INTO settings(key, value, updated_at) VALUES
-  ('site_description', '轻量、实时的服务器运行状态', unixepoch()),
-  ('site_announcement', '', unixepoch()),
-  ('favicon_url', '', unixepoch()),
-  ('locale', 'zh-CN', unixepoch()),
-  ('public_dashboard', 'true', unixepoch()),
-  ('history_cache_version', '0', unixepoch()),
-  ('default_theme', 'system', unixepoch()),
-  ('active_theme_id', 'builtin-nodeflare-glass', unixepoch()),
-  ('background_url', '', unixepoch()),
-  ('theme_options', '{}', unixepoch()),
-  ('show_search', 'true', unixepoch()),
-  ('show_groups', 'true', unixepoch()),
-  ('show_stats', 'true', unixepoch()),
-  ('show_assets', 'true', unixepoch()),
-  ('show_traffic', 'true', unixepoch()),
-  ('show_speed', 'true', unixepoch()),
-  ('show_price', 'true', unixepoch()),
-  ('show_expiry', 'true', unixepoch()),
-  ('show_latency', 'true', unixepoch()),
-  ('show_uptime', 'true', unixepoch()),
-  ('admin_username', '', unixepoch()),
-  ('admin_password_hash', '', unixepoch()),
-  ('password_client_salt', lower(hex(randomblob(16))), unixepoch()),
-  ('turnstile_enabled', 'false', unixepoch()),
-  ('turnstile_login_enabled', 'true', unixepoch()),
-  ('turnstile_site_key', '', unixepoch()),
-  ('turnstile_secret_key', '', unixepoch()),
-  ('notification_enabled', 'false', unixepoch()),
-  ('notification_endpoint', '', unixepoch()),
-  ('notification_target', '', unixepoch()),
-  ('offline_alert_minutes', '5', unixepoch()),
-  ('expiry_alert_days', '7', unixepoch()),
-  ('cloudflare_account_id', '', unixepoch()),
-  ('cloudflare_api_token', '', unixepoch());
+INSERT INTO settings(id, value, updated_at) VALUES (
+  1,
+  json_patch(
+    '{
+      "site_description": "轻量、实时的服务器运行状态",
+      "site_announcement": "",
+      "favicon_url": "",
+      "locale": "zh-CN",
+      "public_dashboard": "true",
+      "history_cache_version": "0",
+      "default_theme": "system",
+      "active_theme_id": "builtin-nodeflare-glass",
+      "background_url": "",
+      "theme_options": "{}",
+      "show_search": "true",
+      "show_groups": "true",
+      "show_stats": "true",
+      "show_assets": "true",
+      "show_traffic": "true",
+      "show_speed": "true",
+      "show_price": "true",
+      "show_expiry": "true",
+      "show_latency": "true",
+      "show_uptime": "true",
+      "admin_username": "",
+      "admin_password_hash": "",
+      "turnstile_enabled": "false",
+      "turnstile_login_enabled": "true",
+      "turnstile_site_key": "",
+      "turnstile_secret_key": "",
+      "notification_enabled": "false",
+      "notification_endpoint": "",
+      "notification_target": "",
+      "offline_alert_minutes": "5",
+      "expiry_alert_days": "7",
+      "cloudflare_account_id": "",
+      "cloudflare_api_token": ""
+    }',
+    json_object('password_client_salt', lower(hex(randomblob(16))))
+  ),
+  unixepoch()
+);
 
 CREATE TABLE exchange_rate_snapshots (
   base_currency TEXT PRIMARY KEY,
@@ -236,33 +194,12 @@ CREATE TABLE latency_tasks (
 CREATE TABLE latency_task_servers (
   task_id TEXT NOT NULL REFERENCES latency_tasks(id) ON DELETE CASCADE,
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  assigned_at INTEGER NOT NULL,
   PRIMARY KEY(task_id, server_id)
-);
-
-CREATE TABLE latency_latest (
-  task_id TEXT NOT NULL REFERENCES latency_tasks(id) ON DELETE CASCADE,
-  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
-  timestamp INTEGER NOT NULL,
-  latency_ms REAL NOT NULL,
-  packet_loss REAL NOT NULL,
-  PRIMARY KEY(task_id, server_id)
-);
-
-CREATE TABLE latency_history (
-  task_id TEXT NOT NULL REFERENCES latency_tasks(id) ON DELETE CASCADE,
-  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
-  timestamp INTEGER NOT NULL,
-  latency_ms REAL NOT NULL,
-  packet_loss REAL NOT NULL,
-  PRIMARY KEY(task_id, server_id, timestamp)
-);
+) WITHOUT ROWID;
 
 CREATE INDEX idx_latency_task_servers_server
   ON latency_task_servers(server_id, task_id);
-CREATE INDEX idx_latency_history_server_time
-  ON latency_history(server_id, timestamp DESC);
-CREATE INDEX idx_latency_history_task_time
-  ON latency_history(task_id, timestamp DESC);
 
 CREATE TABLE alert_rules (
   id TEXT PRIMARY KEY,
@@ -280,7 +217,7 @@ CREATE TABLE alert_rule_servers (
   rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
   server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
   PRIMARY KEY(rule_id, server_id)
-);
+) WITHOUT ROWID;
 
 CREATE TABLE alert_states (
   rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
@@ -288,4 +225,6 @@ CREATE TABLE alert_states (
   active INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(rule_id, server_id)
-);
+) WITHOUT ROWID;
+
+PRAGMA optimize;

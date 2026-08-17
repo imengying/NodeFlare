@@ -10,15 +10,18 @@ use crate::models::LoginRequest;
 use crate::routes::{RouteContext, RouteOutcome};
 use crate::turnstile;
 use crate::{
-    cached_history_response, db, error, history_cache_key, json, latency, live, no_content, now,
-    public_server, request_json, requested_hours, server_id, set_admin_session_cookie,
-    store_history_response, API_JSON_MAX_BYTES,
+    cached_history_response, db, error, history_cache_key, history_cache_seconds, json, latency,
+    live, no_content, now, public_server, request_json, requested_hours, server_id,
+    set_admin_session_cookie, store_history_response, API_JSON_MAX_BYTES,
 };
 
 pub(crate) async fn route(mut req: Request, ctx: &RouteContext) -> Result<RouteOutcome> {
     let method = req.method();
     let path = req.path();
 
+    if method == Method::Get && path == "/api/bootstrap" {
+        return Ok(RouteOutcome::Handled(bootstrap(ctx).await?));
+    }
     if method == Method::Get && path == "/api/config" {
         return Ok(RouteOutcome::Handled(config(ctx)?));
     }
@@ -67,43 +70,95 @@ fn public_access_denied(ctx: &RouteContext) -> Option<Result<Response>> {
     None
 }
 
-fn config(ctx: &RouteContext) -> Result<Response> {
+fn config_value(ctx: &RouteContext) -> serde_json::Value {
     let settings = &ctx.settings;
-    let mut response = json(
-        &serde_json::json!({
-            "site_name": settings.site_name,
-            "site_description": settings.site_description,
-            "site_announcement": settings.site_announcement,
-            "favicon_url": settings.favicon_url,
-            "locale": settings.locale,
-            "public_dashboard": settings.public_dashboard,
-            "offline_threshold_seconds": settings.offline_threshold_seconds,
-            "history_retention_days": settings.history_retention_days,
-            "default_theme": settings.default_theme,
-            "active_theme_id": settings.active_theme_id,
-            "background_url": settings.background_url,
-            "theme_options": settings.theme_options,
-            "show_search": settings.show_search,
-            "show_groups": settings.show_groups,
-            "show_stats": settings.show_stats,
-            "show_assets": settings.show_assets,
-            "show_traffic": settings.show_traffic,
-            "show_speed": settings.show_speed,
-            "show_price": settings.show_price,
-            "show_expiry": settings.show_expiry,
-            "show_latency": settings.show_latency,
-            "show_uptime": settings.show_uptime,
-            "turnstile_enabled": ctx.public_turnstile_enabled,
-            "turnstile_login_enabled": ctx.login_protection_enabled || ctx.public_turnstile_enabled,
-            "turnstile_site_key": ctx.turnstile_site_key,
-            "password_client_salt": settings.password_client_salt
-        }),
-        200,
-    )?;
+    serde_json::json!({
+        "site_name": settings.site_name,
+        "site_description": settings.site_description,
+        "site_announcement": settings.site_announcement,
+        "favicon_url": settings.favicon_url,
+        "locale": settings.locale,
+        "public_dashboard": settings.public_dashboard,
+        "offline_threshold_seconds": settings.offline_threshold_seconds,
+        "history_retention_days": settings.history_retention_days,
+        "default_theme": settings.default_theme,
+        "active_theme_id": settings.active_theme_id,
+        "background_url": settings.background_url,
+        "theme_options": settings.theme_options,
+        "show_search": settings.show_search,
+        "show_groups": settings.show_groups,
+        "show_stats": settings.show_stats,
+        "show_assets": settings.show_assets,
+        "show_traffic": settings.show_traffic,
+        "show_speed": settings.show_speed,
+        "show_price": settings.show_price,
+        "show_expiry": settings.show_expiry,
+        "show_latency": settings.show_latency,
+        "show_uptime": settings.show_uptime,
+        "turnstile_enabled": ctx.public_turnstile_enabled,
+        "turnstile_login_enabled": ctx.login_protection_enabled || ctx.public_turnstile_enabled,
+        "turnstile_site_key": ctx.turnstile_site_key,
+        "password_client_salt": settings.password_client_salt
+    })
+}
+
+fn config(ctx: &RouteContext) -> Result<Response> {
+    let mut response = json(&config_value(ctx), 200)?;
     response
         .headers_mut()
         .set("X-NodeFlare-Server-Time", &now().to_string())?;
     Ok(response)
+}
+
+async fn server_values(ctx: &RouteContext) -> Result<Vec<serde_json::Value>> {
+    let raw_servers = db::list_servers(&ctx.database, false).await?;
+    let mut latency_by_server: HashMap<String, Vec<latency::LatencySample>> = HashMap::new();
+    for sample in latency::latest_all(&ctx.database).await? {
+        latency_by_server
+            .entry(sample.server_id.clone())
+            .or_default()
+            .push(sample);
+    }
+    raw_servers
+        .into_iter()
+        .map(|server| {
+            let samples = latency_by_server.remove(&server.id).unwrap_or_default();
+            serde_json::to_value(public_server(server, samples)).map_err(Into::into)
+        })
+        .collect()
+}
+
+async fn bootstrap(ctx: &RouteContext) -> Result<Response> {
+    let access = if !ctx.turnstile_verified {
+        "turnstile"
+    } else if !ctx.settings.public_dashboard && !ctx.admin {
+        "login"
+    } else {
+        "ok"
+    };
+    let config = config_value(ctx);
+    if access != "ok" {
+        return json(
+            &serde_json::json!({
+                "config": config,
+                "access": access,
+                "servers": [],
+                "exchange_rates": null
+            }),
+            200,
+        );
+    }
+    let servers = server_values(ctx).await?;
+    let exchange_rates = crate::exchange::current(&ctx.database, now()).await?;
+    json(
+        &serde_json::json!({
+            "config": config,
+            "access": access,
+            "servers": servers,
+            "exchange_rates": exchange_rates
+        }),
+        200,
+    )
 }
 
 async fn admin_login(req: &mut Request, ctx: &RouteContext) -> Result<Response> {
@@ -217,21 +272,7 @@ async fn servers(ctx: &RouteContext) -> Result<Response> {
     if let Some(denied) = public_access_denied(ctx) {
         return denied;
     }
-    let raw_servers = db::list_servers(&ctx.database, false).await?;
-    let mut latency_by_server: HashMap<String, Vec<latency::LatencySample>> = HashMap::new();
-    for sample in latency::latest_all(&ctx.database).await? {
-        latency_by_server
-            .entry(sample.server_id.clone())
-            .or_default()
-            .push(sample);
-    }
-    let servers: Vec<_> = raw_servers
-        .into_iter()
-        .map(|server| {
-            let samples = latency_by_server.remove(&server.id).unwrap_or_default();
-            public_server(server, samples)
-        })
-        .collect();
+    let servers = server_values(ctx).await?;
     json(&serde_json::json!({ "servers": servers }), 200)
 }
 
@@ -266,7 +307,7 @@ async fn history(req: &Request, ctx: &RouteContext) -> Result<Response> {
     let points = db::history(&ctx.database, &id, hours).await?;
     let mut response = json(&serde_json::json!({ "points": points }), 200)?;
     if let Some(cache_key) = cache_key.as_deref() {
-        store_history_response(cache_key, &mut response).await;
+        store_history_response(cache_key, &mut response, history_cache_seconds(hours)).await;
     }
     Ok(response)
 }
@@ -306,7 +347,7 @@ async fn latency(req: &Request, ctx: &RouteContext) -> Result<Response> {
         200,
     )?;
     if let Some(cache_key) = cache_key.as_deref() {
-        store_history_response(cache_key, &mut response).await;
+        store_history_response(cache_key, &mut response, history_cache_seconds(hours)).await;
     }
     Ok(response)
 }

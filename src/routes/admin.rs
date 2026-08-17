@@ -135,6 +135,7 @@ pub(crate) async fn route(mut req: Request, ctx: &RouteContext) -> Result<RouteO
     }
     if method == Method::Delete && path == "/api/admin/history" {
         db::clear_history(&ctx.database).await?;
+        live::clear_alert_windows(&ctx.env).await?;
         db::increment_setting(&ctx.database, "history_cache_version").await?;
         return handled(no_content());
     }
@@ -303,6 +304,9 @@ async fn servers_batch_delete(req: &mut Request, ctx: &RouteContext) -> Result<R
     if let Err(error) = live::disconnect_agents(&ctx.env, &input.ids).await {
         console_error!("failed to disconnect deleted Agents: {error}");
     }
+    if let Err(error) = live::remove_alert_samples(&ctx.env, &input.ids).await {
+        console_error!("failed to remove deleted Agent alert samples: {error}");
+    }
     no_content()
 }
 
@@ -372,6 +376,9 @@ async fn server_patch_delete(
         if let Err(error) = live::disconnect_agents(&ctx.env, std::slice::from_ref(&id)).await {
             console_error!("failed to disconnect deleted Agent: {error}");
         }
+        if let Err(error) = live::remove_alert_samples(&ctx.env, std::slice::from_ref(&id)).await {
+            console_error!("failed to remove deleted Agent alert samples: {error}");
+        }
         return no_content();
     }
     let input: ServerInput = match request_json(req, API_JSON_MAX_BYTES).await {
@@ -396,7 +403,7 @@ async fn themes_get(ctx: &RouteContext) -> Result<Response> {
         name: theme::BUILTIN_THEME_NAME.to_string(),
         description: "默认主题".to_string(),
         url: String::new(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::VERSION.to_string(),
         builtin: true,
         active: ctx.settings.active_theme_id == theme::BUILTIN_THEME_ID,
     }];

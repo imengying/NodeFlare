@@ -181,7 +181,7 @@ pub struct AgentReportBatch {
     pub samples: Vec<AgentReport>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentReport {
     pub timestamp: i64,
@@ -294,7 +294,7 @@ pub struct ServerView {
     pub gpu_info: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct HistoryPoint {
     pub timestamp: i64,
     pub cpu: f64,
@@ -351,7 +351,7 @@ pub struct AlertRuleInput {
     pub server_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AlertRuleView {
     pub id: String,
     pub name: String,

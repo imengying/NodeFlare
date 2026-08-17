@@ -76,6 +76,13 @@ export interface ExchangeRates {
   stale: boolean;
 }
 
+export interface Bootstrap {
+  config: Config;
+  access: "ok" | "login" | "turnstile";
+  servers: Server[];
+  exchange_rates: ExchangeRates | null;
+}
+
 interface DiskMetric {
   name: string;
   mount_point: string;

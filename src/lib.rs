@@ -28,11 +28,14 @@ use crate::models::{
 pub(crate) const ADMIN_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.html"));
 pub(crate) const ADMIN_SCRIPT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.js"));
 pub(crate) const ADMIN_STYLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/admin.css"));
-const HISTORY_CACHE_SECONDS: i64 = 30;
 pub(crate) const API_JSON_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const AGENT_JSON_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_AGENT_SAMPLES: usize = 720;
 pub(crate) const MAX_AGENT_LATENCY_RESULTS: usize = 4096;
+pub(crate) const VERSION: &str = match option_env!("NODEFLARE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 #[derive(Serialize)]
 struct PublicServer {
@@ -286,6 +289,11 @@ fn remote_theme_failure(message: &str) -> Result<Response> {
     secure_public_response(response)
 }
 
+fn rewrite_remote_theme_index(html: &str, asset_prefix: &str) -> String {
+    html.replace("\"/assets/", &format!("\"{asset_prefix}"))
+        .replace("'/assets/", &format!("'{asset_prefix}"))
+}
+
 async fn remote_theme_response(path: &str, base: &str) -> Result<Option<Response>> {
     let (remote_url, relative) =
         if path == "/" || path == "/index.html" || path.starts_with("/instance/") {
@@ -300,7 +308,8 @@ async fn remote_theme_response(path: &str, base: &str) -> Result<Option<Response
         };
     let is_index = relative == "index.html";
     let cache = Cache::default();
-    if let Ok(Some(response)) = cache.get(remote_url.as_str(), false).await {
+    let cache_key = format!("{remote_url}?nodeflare-theme-cache=2");
+    if let Ok(Some(response)) = cache.get(&cache_key, false).await {
         return Ok(Some(secure_public_response(mutable_response(response)?)?));
     }
     let request = Request::new(&remote_url, Method::Get)?;
@@ -339,6 +348,13 @@ async fn remote_theme_response(path: &str, base: &str) -> Result<Option<Response
             Ok(Some(remote_theme_failure("远程主题资源大小无效")?))
         };
     };
+    let body = if is_index {
+        let html = String::from_utf8(body)
+            .map_err(|_| Error::RustError("主题 index.html 不是 UTF-8 文本".to_string()))?;
+        rewrite_remote_theme_index(&html, "/__theme-active/assets/").into_bytes()
+    } else {
+        body
+    };
     let mut response = Response::from_bytes(body)?;
     let headers = response.headers_mut();
     headers.set("Cache-Control", "public, max-age=300")?;
@@ -347,7 +363,7 @@ async fn remote_theme_response(path: &str, base: &str) -> Result<Option<Response
     }
     let mut response = secure_public_response(response)?;
     if let Ok(cached) = response.cloned() {
-        let _ = cache.put(remote_url.as_str(), cached).await;
+        let _ = cache.put(&cache_key, cached).await;
     }
     Ok(Some(response))
 }
@@ -381,9 +397,7 @@ async fn remote_theme_preview_response(
     let html = String::from_utf8(body)
         .map_err(|_| Error::RustError("主题 index.html 不是 UTF-8 文本".to_string()))?;
     let asset_prefix = format!("{preview_prefix}/assets/");
-    let html = html
-        .replace("\"/assets/", &format!("\"{asset_prefix}"))
-        .replace("'/assets/", &format!("'{asset_prefix}"));
+    let html = rewrite_remote_theme_index(&html, &asset_prefix);
     let mut response = Response::from_html(html)?;
     response.headers_mut().set("Cache-Control", "no-store")?;
     secure_public_response(response)
@@ -616,9 +630,14 @@ pub(crate) fn validate_server(input: &ServerInput) -> Option<&'static str> {
     if !(15..=3600).contains(&input.report_interval) {
         return Some("上报间隔应为 15 至 3600 秒");
     }
-    if !(2..=60).contains(&input.collect_interval) || input.collect_interval > input.report_interval
+    if !(1..=60).contains(&input.collect_interval) || input.collect_interval > input.report_interval
     {
-        return Some("采样间隔应为 2 至 60 秒且不能大于上报间隔");
+        return Some("采样间隔应为 1 至 60 秒且不能大于上报间隔");
+    }
+    if (input.report_interval + input.collect_interval - 1) / input.collect_interval
+        > MAX_AGENT_SAMPLES as i64
+    {
+        return Some("每个上报周期最多采集 720 个样本");
     }
     if input.network_interface.chars().count() > 160 {
         return Some("统计网卡配置字段过长");
@@ -853,7 +872,7 @@ fn rate_limit_binding(method: Method, path: &str) -> Option<&'static str> {
     if method == Method::Post && matches!(path, "/api/admin/login" | "/api/turnstile/verify") {
         Some("AUTH_RATE_LIMITER")
     } else if (method == Method::Post && path == "/api/agent/report")
-        || (method == Method::Get && path == "/api/agent/live")
+        || (method == Method::Get && matches!(path, "/api/agent/live" | "/api/agent/config"))
     {
         Some("AGENT_RATE_LIMITER")
     } else if path.starts_with("/api/") {
@@ -927,6 +946,15 @@ pub(crate) fn history_cache_key(
     url.to_string()
 }
 
+pub(crate) fn history_cache_seconds(hours: i64) -> i64 {
+    match hours {
+        120.. => 10 * 60,
+        60.. => 5 * 60,
+        30.. => 3 * 60,
+        _ => 60,
+    }
+}
+
 async fn cached_history_response(key: &str) -> Option<Response> {
     match Cache::default().get(key, false).await {
         Ok(Some(response)) => {
@@ -946,7 +974,7 @@ async fn cached_history_response(key: &str) -> Option<Response> {
     }
 }
 
-async fn store_history_response(key: &str, response: &mut Response) {
+async fn store_history_response(key: &str, response: &mut Response, ttl: i64) {
     if response.headers_mut().set("X-Cache", "MISS").is_err() {
         return;
     }
@@ -957,7 +985,7 @@ async fn store_history_response(key: &str, response: &mut Response) {
         .headers_mut()
         .set(
             "Cache-Control",
-            &format!("public, max-age={HISTORY_CACHE_SECONDS}"),
+            &format!("public, max-age={}", ttl.clamp(60, 10 * 60)),
         )
         .is_err()
     {
@@ -995,6 +1023,9 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
 
     if method == Method::Post && path == "/api/agent/report" {
         return routes::agent::report(req, env, ctx, &database).await;
+    }
+    if method == Method::Get && path == "/api/agent/config" {
+        return routes::agent::config(&req, &database).await;
     }
     if method == Method::Get && path == "/api/agent/live" {
         return routes::agent::live_websocket(req, &env, &database).await;
@@ -1156,7 +1187,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         console_error!("server renewal failed: {err}");
     }
     if let Ok(settings) = settings {
-        if let Err(err) = notify::check_alerts(&database, &settings).await {
+        if let Err(err) = notify::check_alerts(&database, &env, &settings).await {
             console_error!("alert check failed: {err}");
         }
     }
@@ -1165,12 +1196,13 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_on_rate_limit_failure, history_cache_key, rate_limit_binding, same_origin,
-        submitted_secret, valid_agent_mirror, valid_cloudflare_account_id,
-        valid_cloudflare_api_token, valid_password_derived, valid_ping_target, valid_server_price,
-        validate_latency_task, ADMIN_HTML, ADMIN_SCRIPT, ADMIN_STYLE,
+        allow_on_rate_limit_failure, history_cache_key, history_cache_seconds, rate_limit_binding,
+        rewrite_remote_theme_index, same_origin, submitted_secret, valid_agent_mirror,
+        valid_cloudflare_account_id, valid_cloudflare_api_token, valid_password_derived,
+        valid_ping_target, valid_server_price, validate_latency_task, validate_server, ADMIN_HTML,
+        ADMIN_SCRIPT, ADMIN_STYLE,
     };
-    use crate::{db::SECRET_MASK, models::LatencyTaskInput};
+    use crate::{db::SECRET_MASK, models::LatencyTaskInput, models::ServerInput};
     use worker::{Method, Url};
 
     #[test]
@@ -1185,6 +1217,10 @@ mod tests {
         );
         assert_eq!(
             rate_limit_binding(Method::Get, "/api/agent/live"),
+            Some("AGENT_RATE_LIMITER")
+        );
+        assert_eq!(
+            rate_limit_binding(Method::Get, "/api/agent/config"),
             Some("AGENT_RATE_LIMITER")
         );
         assert_eq!(
@@ -1206,6 +1242,10 @@ mod tests {
         );
         assert!(same_origin("https://status.example", &request_url));
         assert!(!same_origin("https://other.example", &request_url));
+        assert_eq!(history_cache_seconds(1), 60);
+        assert_eq!(history_cache_seconds(30), 180);
+        assert_eq!(history_cache_seconds(60), 300);
+        assert_eq!(history_cache_seconds(120), 600);
     }
 
     #[test]
@@ -1215,6 +1255,39 @@ mod tests {
         assert!(valid_server_price(1_000_000_000.0));
         assert!(!valid_server_price(-1.01));
         assert!(!valid_server_price(f64::NAN));
+    }
+
+    #[test]
+    fn bounds_samples_buffered_between_reports() {
+        let mut server = ServerInput {
+            name: "node-a".to_string(),
+            region: String::new(),
+            group_name: String::new(),
+            tags: String::new(),
+            hidden: false,
+            expires_at: None,
+            traffic_limit: 0,
+            traffic_limit_type: "sum".to_string(),
+            price: 0.0,
+            billing_cycle: 30,
+            currency: "CNY".to_string(),
+            auto_renewal: false,
+            network_interface: String::new(),
+            reset_day: 1,
+            report_interval: 3600,
+            collect_interval: 5,
+            rx_correction: 0,
+            tx_correction: 0,
+            agent_mirror: String::new(),
+            offline_notify_disabled: false,
+            auto_update: true,
+        };
+        assert_eq!(validate_server(&server), None);
+        server.collect_interval = 4;
+        assert_eq!(
+            validate_server(&server),
+            Some("每个上报周期最多采集 720 个样本")
+        );
     }
 
     #[test]
@@ -1344,5 +1417,14 @@ mod tests {
             .any(|value| value == b"/admin-assets/admin.js"));
         assert!(!ADMIN_SCRIPT.is_empty());
         assert!(!ADMIN_STYLE.is_empty());
+    }
+
+    #[test]
+    fn namespaces_remote_theme_assets() {
+        let html = r#"<script src="/assets/app.js"></script><link href='/assets/app.css'>"#;
+        assert_eq!(
+            rewrite_remote_theme_index(html, "/__theme-active/assets/"),
+            r#"<script src="/__theme-active/assets/app.js"></script><link href='/__theme-active/assets/app.css'>"#
+        );
     }
 }

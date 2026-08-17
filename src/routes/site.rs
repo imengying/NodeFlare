@@ -51,6 +51,24 @@ pub(crate) async fn route(req: Request, ctx: &RouteContext) -> Result<RouteOutco
         ));
     }
 
+    if let Some(relative) = path.strip_prefix("/__theme-active/") {
+        if ctx.settings.active_theme_id == theme::BUILTIN_THEME_ID {
+            return Ok(RouteOutcome::Handled(Response::error(
+                "远程主题未启用",
+                404,
+            )?));
+        }
+        let Some(url) = db::theme_url(&ctx.database, &ctx.settings.active_theme_id).await? else {
+            return Ok(RouteOutcome::Handled(Response::error("主题不存在", 404)?));
+        };
+        let remote_path = format!("/{relative}");
+        return Ok(RouteOutcome::Handled(
+            remote_theme_response(&remote_path, &url)
+                .await?
+                .unwrap_or(Response::error("主题资源不存在", 404)?),
+        ));
+    }
+
     if ctx.settings.active_theme_id != theme::BUILTIN_THEME_ID {
         if let Some(url) = db::theme_url(&ctx.database, &ctx.settings.active_theme_id).await? {
             if let Some(response) = remote_theme_response(&path, &url).await? {

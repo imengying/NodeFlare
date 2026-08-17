@@ -368,14 +368,10 @@ mod tests {
     }
 
     #[test]
-    fn classifies_durable_objects_hibernation_invocations() {
+    fn calculates_durable_objects_billable_requests() {
         assert!(is_hibernation_invocation_type("webSocketMessage"));
         assert!(is_hibernation_invocation_type("hibernationWakeup"));
         assert!(!is_hibernation_invocation_type("fetch"));
-    }
-
-    #[test]
-    fn calculates_durable_objects_billable_requests() {
         let summary = summarize_durable_objects(
             vec![
                 DurableObjectsInvocationGroup {

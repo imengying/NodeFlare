@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+NODEFLARE_VERSION=$(sh "$script_dir/resolve-version.sh")
+VITE_NODEFLARE_VERSION=$NODEFLARE_VERSION
+export NODEFLARE_VERSION VITE_NODEFLARE_VERSION
+cd "$root_dir"
+
 bun run --cwd frontend build
 
 if build_key=$(sh scripts/build-key.sh frontend 2>/dev/null); then

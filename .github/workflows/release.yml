@@ -44,6 +44,8 @@ jobs:
     needs: metadata
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      NODEFLARE_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -73,6 +75,42 @@ jobs:
         run: cargo test --locked --manifest-path agent/Cargo.toml
       - name: Build Worker
         run: NODEFLARE_ADMIN_READY=1 sh scripts/build-worker.sh
+      - name: Smoke test Worker and D1
+        shell: bash
+        run: |
+          set -euo pipefail
+          state_dir="$RUNNER_TEMP/nodeflare-state"
+          log_file="$RUNNER_TEMP/nodeflare-dev.log"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/wrangler-config"
+          mkdir -p "$XDG_CONFIG_HOME"
+
+          bunx wrangler d1 migrations apply DB --local --persist-to "$state_dir"
+          NODEFLARE_ADMIN_READY=1 NODEFLARE_WORKER_READY=1 \
+            bunx wrangler dev --local --persist-to "$state_dir" --port 8787 \
+              --var ADMIN_USERNAME:smoke --var ADMIN_PASSWORD:SmokePassword123 \
+              >"$log_file" 2>&1 &
+          dev_pid=$!
+          trap 'kill "$dev_pid" 2>/dev/null || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8787/api/bootstrap >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != 1 ]; then
+            cat "$log_file"
+            exit 1
+          fi
+
+          if ! MONITOR_BASE_URL=http://127.0.0.1:8787 \
+            MONITOR_ADMIN_USERNAME=smoke MONITOR_ADMIN_PASSWORD=SmokePassword123 \
+            sh scripts/smoke-test.sh; then
+            cat "$log_file"
+            exit 1
+          fi
 
   agent:
     name: Agent (${{ matrix.platform }})
@@ -85,7 +123,7 @@ jobs:
       id-token: write
     env:
       CARGO_TARGET_DIR: target/agent
-      NODEFLARE_AGENT_VERSION: ${{ needs.metadata.outputs.version }}
+      NODEFLARE_VERSION: ${{ needs.metadata.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -197,6 +235,9 @@ jobs:
       attestations: write
       contents: read
       id-token: write
+    env:
+      NODEFLARE_VERSION: ${{ needs.metadata.outputs.version }}
+      VITE_NODEFLARE_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

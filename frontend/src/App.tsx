@@ -12,10 +12,12 @@ import { derivePassword } from "./password";
 
 const defaultConfig: Config = { ...demoConfig, site_description: "", site_name: "" };
 const demoMode = import.meta.env.DEV && new URLSearchParams(window.location.search).has("demo");
+const MAX_PLAYBACK_SAMPLES_PER_SERVER = 600;
 const NodeDetails = lazy(() => import("./components/NodeDetails").then((module) => ({ default: module.NodeDetails })));
 
 interface LiveMetrics {
   timestamp: number;
+  displayTimestamp: number;
   metrics: Partial<Server>;
   latencyResults?: LiveLatencyResult[];
 }
@@ -69,6 +71,7 @@ export default function App() {
   const [configReady, setConfigReady] = useState(demoMode);
   const [servers, setServers] = useState<Server[]>([]);
   const [liveMetrics, setLiveMetrics] = useState<Record<string, LiveMetrics>>({});
+  const [clockNow, setClockNow] = useState(() => Date.now());
   const [exchangeRates, setExchangeRates] = useState<ExchangeRates | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -90,18 +93,28 @@ export default function App() {
   const [systemDark, setSystemDark] = useState(() => matchMedia("(prefers-color-scheme: dark)").matches);
   const wsRef = useRef<WebSocket[]>([]);
   const liveConnectedRef = useRef(false);
+  const playbackRef = useRef<Map<string, LiveSample[]>>(new Map());
+  const serversRef = useRef<Server[]>([]);
   const dark = appearance ? appearance === "dark" : config.default_theme === "system" ? systemDark : config.default_theme === "dark";
   const background = resolveBackground(config.background_url, dark);
   const blur = themeToggle(config, "enableBlur");
   const liveServers = useMemo(() => servers.map((server) => {
     const live = liveMetrics[server.id];
-    if (!live) return server;
-    const latency = live.latencyResults?.length ? mergeLiveLatency(server, live.latencyResults) : server.latency;
-    if (live.timestamp <= (server.timestamp ?? 0)) {
-      return latency === server.latency ? server : { ...server, latency };
-    }
-    return { ...server, ...live.metrics, latency, timestamp: live.timestamp };
-  }), [liveMetrics, servers]);
+    const merged = !live ? server : (() => {
+      const latency = live.latencyResults?.length ? mergeLiveLatency(server, live.latencyResults) : server.latency;
+      if (live.timestamp <= (server.timestamp ?? 0)) {
+        return latency === server.latency ? server : { ...server, latency };
+      }
+      return { ...server, ...live.metrics, latency, timestamp: live.timestamp };
+    })();
+    // Keep the card clock moving between Agent samples, while preserving the
+    // actual sample timestamp for freshness/online checks.
+    if (!merged.timestamp || !merged.uptime || !Number.isFinite(merged.uptime)) return merged;
+    const elapsed = Math.max(0, Math.floor(clockNow / 1000 - merged.timestamp));
+    return elapsed > 0 && elapsed <= config.offline_threshold_seconds
+      ? { ...merged, uptime: merged.uptime + elapsed }
+      : merged;
+  }), [clockNow, config.offline_threshold_seconds, liveMetrics, servers]);
 
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -114,29 +127,32 @@ export default function App() {
       setLoading(false);
       return;
     }
-    let dashboardPublic = true;
     try {
-      const nextConfig = await api.config();
-      dashboardPublic = nextConfig.public_dashboard;
-      setConfig(nextConfig);
+      const result = await api.bootstrap();
+      setConfig(result.config);
       setConfigReady(true);
-      const [serverResult, ratesResult] = await Promise.all([api.servers(), api.exchangeRates()]);
-      setServers(serverResult.servers);
-      setExchangeRates(ratesResult);
-      setNeedsVerification(false);
-      setNeedsLogin(false);
+      setServers(result.servers);
+      setExchangeRates(result.exchange_rates);
+      setNeedsVerification(result.access === "turnstile");
+      setNeedsLogin(result.access === "login");
+      if (result.access !== "ok") {
+        playbackRef.current.clear();
+        setLiveMetrics({});
+      }
       setError("");
     } catch (reason) {
-      if (reason instanceof ApiError && (reason.status === 401 || (!dashboardPublic && reason.status === 403))) {
+      if (reason instanceof ApiError && reason.status === 401) {
         setNeedsLogin(true);
         setNeedsVerification(false);
         setServers([]);
+        playbackRef.current.clear();
         setLiveMetrics({});
         setError("");
       } else if (reason instanceof ApiError && reason.status === 403) {
         setNeedsVerification(true);
         setNeedsLogin(false);
         setServers([]);
+        playbackRef.current.clear();
         setLiveMetrics({});
         setError(reason.message);
       } else {
@@ -189,14 +205,65 @@ export default function App() {
   }, [load]);
 
   useEffect(() => {
-    if (needsLogin) return;
+    serversRef.current = servers;
+    for (const server of servers) {
+      const samples = playbackRef.current.get(server.id);
+      if (!samples || !server.timestamp) continue;
+      const fresh = samples.filter((sample) => sample.ts > server.timestamp!);
+      if (fresh.length) playbackRef.current.set(server.id, fresh);
+      else playbackRef.current.delete(server.id);
+    }
+  }, [servers]);
+
+  useEffect(() => {
+    if (needsLogin || needsVerification) return;
     let ticks = 0;
     const timer = window.setInterval(() => {
       ticks += 1;
-      if (!liveConnectedRef.current || ticks % 4 === 0) void load(true);
+      if (!liveConnectedRef.current || ticks % 20 === 0) void load(true);
     }, 15_000);
     return () => clearInterval(timer);
-  }, [load, needsLogin]);
+  }, [load, needsLogin, needsVerification]);
+
+  useEffect(() => {
+    let previous = Date.now();
+    const timer = window.setInterval(() => {
+      const current = Date.now();
+      const elapsed = Math.max(0, Math.min(5_000, current - previous));
+      previous = current;
+      setClockNow(current);
+      if (elapsed === 0) return;
+      setLiveMetrics((currentMetrics) => {
+        if (!playbackRef.current.size) return currentMetrics;
+        const next = { ...currentMetrics };
+        for (const [serverId, samples] of playbackRef.current) {
+          const state = next[serverId];
+          if (!state || !samples.length) continue;
+          const displayTimestamp = state.displayTimestamp + elapsed / 1000;
+          let selected: LiveSample | undefined;
+          while (samples.length && samples[0].ts <= displayTimestamp) selected = samples.shift();
+          if (selected) {
+            const metrics = { ...selected.data };
+            const latencyResults = Array.isArray(metrics.latency_results) ? metrics.latency_results : [];
+            delete metrics.latency_results;
+            next[serverId] = {
+              timestamp: selected.ts,
+              displayTimestamp,
+              metrics,
+              latencyResults: latencyResults.length
+                ? mergeLiveResults(state.latencyResults, latencyResults)
+                : state.latencyResults,
+            };
+          } else {
+            next[serverId] = { ...state, displayTimestamp };
+          }
+          if (!samples.length) playbackRef.current.delete(serverId);
+        }
+        return next;
+      });
+    }, 1_000);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark);
@@ -249,7 +316,6 @@ export default function App() {
       wsRef.current.push(socket);
       socket.onopen = () => {
         liveConnectedRef.current = true;
-        void load(true);
       };
       socket.onclose = () => {
         wsRef.current = wsRef.current.filter((current) => current !== socket);
@@ -270,29 +336,55 @@ export default function App() {
             return;
           }
           if (message.type === "batchUpdate" && Array.isArray(message.updates)) {
+            const replayCached = message.cached === true;
             setLiveMetrics((current) => {
               const next = { ...current };
-              for (const update of message.updates as Array<{ serverId?: string; samples?: LiveSample[] }>) {
+              for (const update of message.updates as Array<{
+                serverId?: string;
+                samples?: LiveSample[];
+                reportAgeMs?: number;
+              }>) {
                 if (!update.serverId || !Array.isArray(update.samples) || !update.samples.length) continue;
                 const samples = update.samples
                   .filter((sample) => Number.isFinite(sample.ts) && sample.data && typeof sample.data === "object")
                   .sort((left, right) => left.ts - right.ts);
-                const latest = samples.at(-1);
-                if (!latest) continue;
                 const previous = next[update.serverId];
-                if (previous && previous.timestamp >= latest.ts) continue;
-                const results = samples.flatMap((sample) => Array.isArray(sample.data.latency_results)
-                  ? sample.data.latency_results
-                  : []);
-                const metrics = { ...latest.data };
-                delete metrics.latency_results;
-                next[update.serverId] = {
-                  timestamp: latest.ts,
-                  metrics,
-                  latencyResults: Array.isArray(results) && results.length
-                    ? mergeLiveResults(previous?.latencyResults, results)
-                    : previous?.latencyResults,
-                };
+                const pending = playbackRef.current.get(update.serverId) ?? [];
+                const persistedTimestamp = serversRef.current.find((server) => server.id === update.serverId)?.timestamp ?? 0;
+                const appliedTimestamp = Math.max(previous?.timestamp ?? 0, persistedTimestamp);
+                const seen = new Set<number>([
+                  ...pending.map((sample) => sample.ts),
+                ]);
+                const incoming = samples.filter((sample) => sample.ts > appliedTimestamp && !seen.has(sample.ts));
+                if (!incoming.length) continue;
+                const reportAgeSeconds = replayCached && Number.isFinite(update.reportAgeMs)
+                  ? Math.max(0, update.reportAgeMs! / 1000)
+                  : 0;
+                const cursor = replayCached
+                  ? Math.max(previous?.displayTimestamp ?? 0, incoming[incoming.length - 1].ts + reportAgeSeconds)
+                  : previous?.displayTimestamp ?? incoming[0].ts;
+                const all = [...pending, ...incoming]
+                  .sort((left, right) => left.ts - right.ts)
+                  .slice(-MAX_PLAYBACK_SAMPLES_PER_SERVER);
+                let selected: LiveSample | undefined;
+                while (all.length && all[0].ts <= cursor) selected = all.shift();
+                if (selected) {
+                  const metrics = { ...selected.data };
+                  const latencyResults = Array.isArray(metrics.latency_results) ? metrics.latency_results : [];
+                  delete metrics.latency_results;
+                  next[update.serverId] = {
+                    timestamp: selected.ts,
+                    displayTimestamp: cursor,
+                    metrics,
+                    latencyResults: latencyResults.length
+                      ? mergeLiveResults(previous?.latencyResults, latencyResults)
+                      : previous?.latencyResults,
+                  };
+                } else if (!previous) {
+                  continue;
+                }
+                if (all.length) playbackRef.current.set(update.serverId, all);
+                else playbackRef.current.delete(update.serverId);
               }
               return next;
             });

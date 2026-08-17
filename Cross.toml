@@ -1,5 +1,5 @@
 [build.env]
-passthrough = ["NODEFLARE_AGENT_VERSION"]
+passthrough = ["NODEFLARE_VERSION"]
 
 [target.aarch64-unknown-linux-musl]
 runner = "qemu-user"

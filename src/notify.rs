@@ -1,9 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use worker::{wasm_bindgen::JsValue, D1Database, Fetch, Method, Request, RequestInit, Result};
+use worker::{
+    console_warn, wasm_bindgen::JsValue, D1Database, Env, Fetch, Method, Request, RequestInit,
+    Result,
+};
 
 use crate::db::{self, SettingsView};
+use crate::live;
 
 #[derive(Default, Deserialize, Serialize, PartialEq, Eq)]
 struct AlertState {
@@ -84,7 +88,7 @@ pub async fn renew_servers(db_conn: &D1Database) -> Result<()> {
     Ok(())
 }
 
-pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Result<()> {
+pub async fn check_alerts(db_conn: &D1Database, env: &Env, settings: &SettingsView) -> Result<()> {
     if !settings.notification_enabled || settings.notification_endpoint.trim().is_empty() {
         return Ok(());
     }
@@ -136,7 +140,22 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
     let mut current_resources = HashSet::new();
     let mut evaluated_resources = HashSet::new();
     let mut eligible_resources = HashSet::new();
-    for rule in db::list_alert_rules(db_conn).await? {
+    let rules = db::list_alert_rules(db_conn).await?;
+    let mut values_by_rule = HashMap::new();
+    if rules.iter().any(|rule| rule.enabled) {
+        match live::evaluate_resource_alerts(env, &rules, &servers, current_time).await {
+            Ok(values) => {
+                for value in values {
+                    values_by_rule
+                        .entry(value.rule_id)
+                        .or_insert_with(Vec::new)
+                        .push(value.row);
+                }
+            }
+            Err(error) => console_warn!("resource alert evaluation failed: {error:?}"),
+        }
+    }
+    for rule in rules {
         if !rule.enabled {
             continue;
         }
@@ -167,7 +186,10 @@ pub async fn check_alerts(db_conn: &D1Database, settings: &SettingsView) -> Resu
         } else {
             "%"
         };
-        for value in db::alert_metric_values(db_conn, &rule, current_time).await? {
+        for value in values_by_rule.remove(&rule.id).unwrap_or_default() {
+            if !db::alert_window_covered(&value, rule.duration_minutes, current_time) {
+                continue;
+            }
             let key = format!("{}:{}", rule.id, value.server_id);
             evaluated_resources.insert(key.clone());
             if value.value >= rule.threshold {
@@ -221,10 +243,6 @@ mod tests {
         assert_eq!(renewed_expiry(80 * day, 30, 100 * day), Some(110 * day));
         assert_eq!(renewed_expiry(101 * day, 30, 100 * day), Some(131 * day));
         assert_eq!(renewed_expiry(102 * day, 30, 100 * day), None);
-    }
-
-    #[test]
-    fn saturates_pathological_expiry_values() {
         assert_eq!(renewed_expiry(i64::MIN, 1, i64::MAX), Some(i64::MAX));
     }
 }

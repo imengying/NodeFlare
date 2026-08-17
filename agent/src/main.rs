@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,14 +20,14 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{connect, Error as WebSocketError, Message};
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 compile_error!("nodeflare-agent supports Linux, Windows, and macOS");
 
-const VERSION: &str = match option_env!("NODEFLARE_AGENT_VERSION") {
+const VERSION: &str = match option_env!("NODEFLARE_VERSION") {
     Some(version) if !version.is_empty() => version,
     _ => env!("CARGO_PKG_VERSION"),
 };
@@ -50,6 +51,9 @@ const LIVE_BATCH_CAPACITY: usize = 32;
 // D1 persistence can take a few hundred milliseconds; allow the ACK to arrive
 // before continuing with the configured live interval.
 const LIVE_ACK_READ_TIMEOUT: Duration = Duration::from_millis(1_000);
+const LIVE_HINT_READ_TIMEOUT: Duration = Duration::from_millis(10);
+const LIVE_REPORT_DIVISOR: u64 = 15;
+const BASIC_INFO_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CLOCK_CALIBRATION_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const CLOCK_CALIBRATION_MIN_CHANGE_MS: i64 = 20_000;
 
@@ -228,28 +232,40 @@ impl ClockCalibration {
 type SharedClock = Arc<Mutex<ClockCalibration>>;
 
 struct LiveSender {
-    pending: Arc<(Mutex<Vec<Report>>, Condvar)>,
+    pending: Arc<(Mutex<VecDeque<Report>>, Condvar)>,
     send_interval: Arc<Mutex<Duration>>,
+    healthy: Arc<AtomicBool>,
 }
 
 impl LiveSender {
     fn start(config: &RuntimeConfig, clock: SharedClock) -> Result<Self> {
-        let pending = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
-        let send_interval = Arc::new(Mutex::new(Duration::from_secs(
-            config.collect_interval.clamp(2, 60),
+        let pending = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let send_interval = Arc::new(Mutex::new(live_batch_interval(
+            config.report_interval,
+            config.collect_interval,
         )));
+        let healthy = Arc::new(AtomicBool::new(false));
         let endpoint = live_endpoint(&config.endpoint)?;
         let token = config.token.clone();
         let sender_state = Arc::clone(&pending);
         let sender_interval = Arc::clone(&send_interval);
+        let sender_healthy = Arc::clone(&healthy);
         thread::Builder::new()
             .name("nodeflare-live".to_string())
             .spawn(move || {
-                live_sender_loop(&endpoint, &token, sender_state, sender_interval, clock)
+                live_sender_loop(
+                    &endpoint,
+                    &token,
+                    sender_state,
+                    sender_interval,
+                    sender_healthy,
+                    clock,
+                )
             })?;
         Ok(Self {
             pending,
             send_interval,
+            healthy,
         })
     }
 
@@ -257,19 +273,32 @@ impl LiveSender {
         let (pending, ready) = &*self.pending;
         if let Ok(mut pending) = pending.lock() {
             if pending.len() >= LIVE_QUEUE_CAPACITY {
-                pending.remove(0);
+                pending.pop_front();
             }
-            pending.push(report.clone());
+            pending.push_back(report.clone());
             ready.notify_one();
         }
     }
 
-    fn set_send_interval(&self, seconds: u64) {
+    fn set_send_interval(&self, report_interval: u64, collect_interval: u64) {
         if let Ok(mut interval) = self.send_interval.lock() {
-            *interval = Duration::from_secs(seconds.clamp(2, 60));
+            *interval = live_batch_interval(report_interval, collect_interval);
         }
         self.pending.1.notify_one();
     }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+}
+
+fn live_batch_interval(report_interval: u64, collect_interval: u64) -> Duration {
+    let seconds = report_interval
+        .clamp(15, 3600)
+        .div_ceil(LIVE_REPORT_DIVISOR)
+        .clamp(1, 60)
+        .max(collect_interval.clamp(1, 60));
+    Duration::from_secs(seconds)
 }
 
 #[derive(Debug, Serialize)]
@@ -338,6 +367,19 @@ struct Report {
     disks: Vec<DiskMetric>,
     gpus: Vec<GpuMetric>,
     latency_results: Vec<LatencyResult>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct BasicMetrics {
+    cpu_cores: i64,
+    cpu_model: String,
+    os: String,
+    kernel: String,
+    arch: String,
+    virtualization: String,
+    gpu_usage: f64,
+    gpu_model: String,
+    gpus: Vec<GpuMetric>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1022,220 +1064,357 @@ fn u64_to_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
+fn per_second(value: u64, elapsed_seconds: f64) -> f64 {
+    value as f64 / elapsed_seconds.max(0.001)
+}
+
+fn valid_sample_schedule(report_interval: u64, collect_interval: u64) -> bool {
+    (15..=3600).contains(&report_interval)
+        && (1..=60).contains(&collect_interval)
+        && collect_interval <= report_interval
+        && report_interval.div_ceil(collect_interval) <= LIVE_QUEUE_CAPACITY as u64
+}
+
+fn advance_deadline(mut deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    while deadline <= now {
+        deadline += interval;
+    }
+    deadline
+}
+
 #[cfg(target_os = "linux")]
-fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>, timestamp: i64) -> Report {
-    let cpu_before = cpu_sample();
-    let io_before = io_sample(&config.network_interface);
-    thread::sleep(Duration::from_secs(1));
-    let cpu_after = cpu_sample();
-    let io_after = io_sample(&config.network_interface);
-    let total = cpu_after.total.saturating_sub(cpu_before.total);
-    let idle = cpu_after.idle.saturating_sub(cpu_before.idle);
-    let cpu = if total == 0 {
-        0.0
-    } else {
-        (total.saturating_sub(idle)) as f64 * 100.0 / total as f64
-    };
+struct Collector {
+    previous_cpu: CpuSample,
+    previous_io: IoSample,
+    previous_at: Instant,
+    network_interface: String,
+    basic: BasicMetrics,
+    basic_at: Instant,
+}
 
-    let mem = text("/proc/meminfo");
-    let mem_total = mem_value(&mem, "MemTotal:");
-    let mem_used = mem_total.saturating_sub(mem_value(&mem, "MemAvailable:"));
-    let swap_total = mem_value(&mem, "SwapTotal:");
-    let swap_used = swap_total.saturating_sub(mem_value(&mem, "SwapFree:"));
-    let loads = text("/proc/loadavg")
-        .split_whitespace()
-        .take(3)
-        .filter_map(|value| value.parse::<f64>().ok())
-        .collect::<Vec<_>>();
-    let uptime = text("/proc/uptime")
-        .split_whitespace()
-        .next()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.0) as i64;
-    let processes = fs::read_dir("/proc")
-        .map(|items| {
-            items
-                .filter_map(|item| item.ok())
-                .filter(|item| {
-                    item.file_name()
-                        .to_string_lossy()
-                        .chars()
-                        .all(|ch| ch.is_ascii_digit())
-                })
-                .count() as i64
-        })
-        .unwrap_or(0);
-    let disks = disk_usage();
-    let disk_used = disks.iter().map(|disk| disk.used).sum();
-    let disk_total = disks.iter().map(|disk| disk.total).sum();
-    let gpus = gpu_info();
-    let gpu_usage = average_gpu_usage(&gpus);
-    let gpu_model = gpus
-        .iter()
-        .map(|gpu| gpu.model.as_str())
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let read_ops = io_after.read_ops.saturating_sub(io_before.read_ops);
-    let write_ops = io_after.write_ops.saturating_sub(io_before.write_ops);
-    let total_ops = read_ops.saturating_add(write_ops);
-    let io_wait = io_after
-        .read_millis
-        .saturating_sub(io_before.read_millis)
-        .saturating_add(io_after.write_millis.saturating_sub(io_before.write_millis));
+#[cfg(target_os = "linux")]
+impl Collector {
+    fn new(config: &RuntimeConfig) -> Self {
+        let mut collector = Self {
+            previous_cpu: cpu_sample(),
+            previous_io: io_sample(&config.network_interface),
+            previous_at: Instant::now(),
+            network_interface: config.network_interface.clone(),
+            basic: BasicMetrics::default(),
+            basic_at: Instant::now(),
+        };
+        collector.refresh_basic();
+        collector
+    }
 
-    Report {
-        timestamp,
-        cpu,
-        load1: loads.first().copied().unwrap_or(0.0),
-        load5: loads.get(1).copied().unwrap_or(0.0),
-        load15: loads.get(2).copied().unwrap_or(0.0),
-        mem_used,
-        mem_total,
-        swap_used,
-        swap_total,
-        disk_used,
-        disk_total,
-        net_in: io_after.rx.saturating_sub(io_before.rx) as f64,
-        net_out: io_after.tx.saturating_sub(io_before.tx) as f64,
-        net_rx_total: io_after.rx.min(i64::MAX as u64) as i64,
-        net_tx_total: io_after.tx.min(i64::MAX as u64) as i64,
-        uptime,
-        processes,
-        tcp_connections: file_line_count("/proc/net/tcp") + file_line_count("/proc/net/tcp6"),
-        udp_connections: file_line_count("/proc/net/udp") + file_line_count("/proc/net/udp6"),
-        cpu_cores: thread::available_parallelism()
-            .map(|value| value.get() as i64)
-            .unwrap_or(1),
-        cpu_model: cpu_model(),
-        os: os_name(),
-        kernel: command("uname", &["-r"]),
-        arch: env::consts::ARCH.to_string(),
-        virtualization: command("systemd-detect-virt", &[]),
-        gpu_usage,
-        gpu_model,
-        agent_version: VERSION.to_string(),
-        disk_read_bps: io_after
-            .read_sectors
-            .saturating_sub(io_before.read_sectors)
-            .saturating_mul(512) as f64,
-        disk_write_bps: io_after
-            .write_sectors
-            .saturating_sub(io_before.write_sectors)
-            .saturating_mul(512) as f64,
-        disk_read_iops: io_after.read_ops.saturating_sub(io_before.read_ops) as f64,
-        disk_write_iops: io_after.write_ops.saturating_sub(io_before.write_ops) as f64,
-        disk_await_ms: if total_ops == 0 {
+    fn refresh_basic(&mut self) {
+        let gpus = gpu_info();
+        self.basic = BasicMetrics {
+            cpu_cores: thread::available_parallelism()
+                .map(|value| value.get() as i64)
+                .unwrap_or(1),
+            cpu_model: cpu_model(),
+            os: os_name(),
+            kernel: command("uname", &["-r"]),
+            arch: env::consts::ARCH.to_string(),
+            virtualization: command("systemd-detect-virt", &[]),
+            gpu_usage: average_gpu_usage(&gpus),
+            gpu_model: gpus
+                .iter()
+                .map(|gpu| gpu.model.as_str())
+                .collect::<Vec<_>>()
+                .join(" · "),
+            gpus,
+        };
+        self.basic_at = Instant::now();
+    }
+
+    fn collect(
+        &mut self,
+        config: &RuntimeConfig,
+        latency_results: Vec<LatencyResult>,
+        timestamp: i64,
+    ) -> Report {
+        let sampled_at = Instant::now();
+        let elapsed = sampled_at
+            .saturating_duration_since(self.previous_at)
+            .as_secs_f64()
+            .max(0.001);
+        let cpu_now = cpu_sample();
+        let io_now = io_sample(&config.network_interface);
+        let total = cpu_now.total.saturating_sub(self.previous_cpu.total);
+        let idle = cpu_now.idle.saturating_sub(self.previous_cpu.idle);
+        let cpu = if total == 0 {
             0.0
         } else {
-            io_wait as f64 / total_ops as f64
-        },
-        disk_utilization: (io_after.io_millis.saturating_sub(io_before.io_millis) as f64 / 10.0)
-            .clamp(0.0, 100.0),
-        disks,
-        gpus,
-        latency_results,
+            (total.saturating_sub(idle)) as f64 * 100.0 / total as f64
+        };
+        let interface_changed = self.network_interface != config.network_interface;
+        let io_before = if interface_changed {
+            io_now
+        } else {
+            self.previous_io
+        };
+        self.previous_cpu = cpu_now;
+        self.previous_io = io_now;
+        self.previous_at = sampled_at;
+        self.network_interface.clone_from(&config.network_interface);
+
+        if self.basic_at.elapsed() >= BASIC_INFO_REFRESH_INTERVAL {
+            self.refresh_basic();
+        }
+
+        let mem = text("/proc/meminfo");
+        let mem_total = mem_value(&mem, "MemTotal:");
+        let mem_used = mem_total.saturating_sub(mem_value(&mem, "MemAvailable:"));
+        let swap_total = mem_value(&mem, "SwapTotal:");
+        let swap_used = swap_total.saturating_sub(mem_value(&mem, "SwapFree:"));
+        let loads = text("/proc/loadavg")
+            .split_whitespace()
+            .take(3)
+            .filter_map(|value| value.parse::<f64>().ok())
+            .collect::<Vec<_>>();
+        let uptime = text("/proc/uptime")
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.0) as i64;
+        let processes = fs::read_dir("/proc")
+            .map(|items| {
+                items
+                    .filter_map(|item| item.ok())
+                    .filter(|item| {
+                        item.file_name()
+                            .to_string_lossy()
+                            .chars()
+                            .all(|ch| ch.is_ascii_digit())
+                    })
+                    .count() as i64
+            })
+            .unwrap_or(0);
+        let disks = disk_usage();
+        let disk_used = disks.iter().map(|disk| disk.used).sum();
+        let disk_total = disks.iter().map(|disk| disk.total).sum();
+        let tcp_connections = file_line_count("/proc/net/tcp") + file_line_count("/proc/net/tcp6");
+        let udp_connections = file_line_count("/proc/net/udp") + file_line_count("/proc/net/udp6");
+        let read_ops = io_now.read_ops.saturating_sub(io_before.read_ops);
+        let write_ops = io_now.write_ops.saturating_sub(io_before.write_ops);
+        let total_ops = read_ops.saturating_add(write_ops);
+        let io_wait = io_now
+            .read_millis
+            .saturating_sub(io_before.read_millis)
+            .saturating_add(io_now.write_millis.saturating_sub(io_before.write_millis));
+        let elapsed_ms = elapsed * 1000.0;
+
+        Report {
+            timestamp,
+            cpu,
+            load1: loads.first().copied().unwrap_or(0.0),
+            load5: loads.get(1).copied().unwrap_or(0.0),
+            load15: loads.get(2).copied().unwrap_or(0.0),
+            mem_used,
+            mem_total,
+            swap_used,
+            swap_total,
+            disk_used,
+            disk_total,
+            net_in: per_second(io_now.rx.saturating_sub(io_before.rx), elapsed),
+            net_out: per_second(io_now.tx.saturating_sub(io_before.tx), elapsed),
+            net_rx_total: io_now.rx.min(i64::MAX as u64) as i64,
+            net_tx_total: io_now.tx.min(i64::MAX as u64) as i64,
+            uptime,
+            processes,
+            tcp_connections,
+            udp_connections,
+            cpu_cores: self.basic.cpu_cores,
+            cpu_model: self.basic.cpu_model.clone(),
+            os: self.basic.os.clone(),
+            kernel: self.basic.kernel.clone(),
+            arch: self.basic.arch.clone(),
+            virtualization: self.basic.virtualization.clone(),
+            gpu_usage: self.basic.gpu_usage,
+            gpu_model: self.basic.gpu_model.clone(),
+            agent_version: VERSION.to_string(),
+            disk_read_bps: per_second(
+                io_now
+                    .read_sectors
+                    .saturating_sub(io_before.read_sectors)
+                    .saturating_mul(512),
+                elapsed,
+            ),
+            disk_write_bps: per_second(
+                io_now
+                    .write_sectors
+                    .saturating_sub(io_before.write_sectors)
+                    .saturating_mul(512),
+                elapsed,
+            ),
+            disk_read_iops: per_second(read_ops, elapsed),
+            disk_write_iops: per_second(write_ops, elapsed),
+            disk_await_ms: if total_ops == 0 {
+                0.0
+            } else {
+                io_wait as f64 / total_ops as f64
+            },
+            disk_utilization: if elapsed_ms <= 0.0 {
+                0.0
+            } else {
+                (io_now.io_millis.saturating_sub(io_before.io_millis) as f64 * 100.0 / elapsed_ms)
+                    .clamp(0.0, 100.0)
+            },
+            disks,
+            gpus: self.basic.gpus.clone(),
+            latency_results,
+        }
     }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn collect(config: &RuntimeConfig, latency_results: Vec<LatencyResult>, timestamp: i64) -> Report {
-    let mut system = System::new_all();
-    let mut networks = Networks::new_with_refreshed_list();
-    thread::sleep(Duration::from_secs(1));
-    system.refresh_all();
-    networks.refresh(true);
+struct Collector {
+    system: System,
+    networks: Networks,
+    previous_at: Instant,
+    basic: BasicMetrics,
+    basic_at: Instant,
+}
 
-    let mut net_in = 0_u64;
-    let mut net_out = 0_u64;
-    let mut net_rx_total = 0_u64;
-    let mut net_tx_total = 0_u64;
-    for (name, network) in &networks {
-        if !selected_interface(name, &config.network_interface) {
-            continue;
-        }
-        net_in = net_in.saturating_add(network.received());
-        net_out = net_out.saturating_add(network.transmitted());
-        net_rx_total = net_rx_total.saturating_add(network.total_received());
-        net_tx_total = net_tx_total.saturating_add(network.total_transmitted());
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl Collector {
+    fn new(_config: &RuntimeConfig) -> Self {
+        let mut collector = Self {
+            system: System::new_all(),
+            networks: Networks::new_with_refreshed_list(),
+            previous_at: Instant::now(),
+            basic: BasicMetrics::default(),
+            basic_at: Instant::now(),
+        };
+        collector.refresh_basic();
+        collector
     }
 
-    let disks = Disks::new_with_refreshed_list();
-    #[cfg(target_os = "windows")]
-    let root = format!(
-        "{}\\",
-        env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string())
-    );
-    #[cfg(target_os = "macos")]
-    let root = "/".to_string();
-    let mut disk_metrics = disks
-        .iter()
-        .filter(|disk| !disk.is_removable())
-        .map(|disk| {
-            let total = disk.total_space();
-            DiskMetric {
-                name: disk.name().to_string_lossy().to_string(),
-                mount_point: disk.mount_point().to_string_lossy().to_string(),
-                used: u64_to_i64(total.saturating_sub(disk.available_space())),
-                total: u64_to_i64(total),
-                ..DiskMetric::default()
-            }
-        })
-        .collect::<Vec<_>>();
-    disk_metrics.sort_by_key(|disk| (disk.mount_point != root, disk.mount_point.clone()));
-    let disk_used = disk_metrics.iter().map(|disk| disk.used).sum();
-    let disk_total = disk_metrics.iter().map(|disk| disk.total).sum();
-    let load = System::load_average();
-    let gpus = gpu_info();
-    let gpu_usage = average_gpu_usage(&gpus);
-    let gpu_model = gpus
-        .iter()
-        .map(|gpu| gpu.model.as_str())
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let (tcp_connections, udp_connections) = connection_counts();
+    fn refresh_basic(&mut self) {
+        let gpus = gpu_info();
+        self.basic = BasicMetrics {
+            cpu_cores: self.system.cpus().len().max(1) as i64,
+            cpu_model: self
+                .system
+                .cpus()
+                .first()
+                .map(|cpu| cpu.brand().to_string())
+                .unwrap_or_default(),
+            os: System::long_os_version().unwrap_or_else(|| env::consts::OS.to_string()),
+            kernel: System::kernel_version().unwrap_or_default(),
+            arch: env::consts::ARCH.to_string(),
+            virtualization: String::new(),
+            gpu_usage: average_gpu_usage(&gpus),
+            gpu_model: gpus
+                .iter()
+                .map(|gpu| gpu.model.as_str())
+                .collect::<Vec<_>>()
+                .join(" · "),
+            gpus,
+        };
+        self.basic_at = Instant::now();
+    }
 
-    Report {
-        timestamp,
-        cpu: system.global_cpu_usage() as f64,
-        load1: load.one,
-        load5: load.five,
-        load15: load.fifteen,
-        mem_used: u64_to_i64(system.used_memory()),
-        mem_total: u64_to_i64(system.total_memory()),
-        swap_used: u64_to_i64(system.used_swap()),
-        swap_total: u64_to_i64(system.total_swap()),
-        disk_used,
-        disk_total,
-        net_in: net_in as f64,
-        net_out: net_out as f64,
-        net_rx_total: u64_to_i64(net_rx_total),
-        net_tx_total: u64_to_i64(net_tx_total),
-        uptime: u64_to_i64(System::uptime()),
-        processes: system.processes().len() as i64,
-        tcp_connections,
-        udp_connections,
-        cpu_cores: system.cpus().len().max(1) as i64,
-        cpu_model: system
-            .cpus()
-            .first()
-            .map(|cpu| cpu.brand().to_string())
-            .unwrap_or_default(),
-        os: System::long_os_version().unwrap_or_else(|| env::consts::OS.to_string()),
-        kernel: System::kernel_version().unwrap_or_default(),
-        arch: env::consts::ARCH.to_string(),
-        virtualization: String::new(),
-        gpu_usage,
-        gpu_model,
-        agent_version: VERSION.to_string(),
-        disk_read_bps: 0.0,
-        disk_write_bps: 0.0,
-        disk_read_iops: 0.0,
-        disk_write_iops: 0.0,
-        disk_await_ms: 0.0,
-        disk_utilization: 0.0,
-        disks: disk_metrics,
-        gpus,
-        latency_results,
+    fn collect(
+        &mut self,
+        config: &RuntimeConfig,
+        latency_results: Vec<LatencyResult>,
+        timestamp: i64,
+    ) -> Report {
+        let sampled_at = Instant::now();
+        let elapsed = sampled_at
+            .saturating_duration_since(self.previous_at)
+            .as_secs_f64()
+            .max(0.001);
+        self.system.refresh_cpu_usage();
+        self.system.refresh_memory();
+        self.system.refresh_processes(ProcessesToUpdate::All, true);
+        self.networks.refresh(true);
+        self.previous_at = sampled_at;
+        if self.basic_at.elapsed() >= BASIC_INFO_REFRESH_INTERVAL {
+            self.refresh_basic();
+        }
+
+        let disks = Disks::new_with_refreshed_list();
+        #[cfg(target_os = "windows")]
+        let root = format!(
+            "{}\\",
+            env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string())
+        );
+        #[cfg(target_os = "macos")]
+        let root = "/".to_string();
+        let mut disk_metrics = disks
+            .iter()
+            .filter(|disk| !disk.is_removable())
+            .map(|disk| {
+                let total = disk.total_space();
+                DiskMetric {
+                    name: disk.name().to_string_lossy().to_string(),
+                    mount_point: disk.mount_point().to_string_lossy().to_string(),
+                    used: u64_to_i64(total.saturating_sub(disk.available_space())),
+                    total: u64_to_i64(total),
+                    ..DiskMetric::default()
+                }
+            })
+            .collect::<Vec<_>>();
+        disk_metrics.sort_by_key(|disk| (disk.mount_point != root, disk.mount_point.clone()));
+        let (tcp_connections, udp_connections) = connection_counts();
+
+        let mut net_in = 0_u64;
+        let mut net_out = 0_u64;
+        let mut net_rx_total = 0_u64;
+        let mut net_tx_total = 0_u64;
+        for (name, network) in &self.networks {
+            if !selected_interface(name, &config.network_interface) {
+                continue;
+            }
+            net_in = net_in.saturating_add(network.received());
+            net_out = net_out.saturating_add(network.transmitted());
+            net_rx_total = net_rx_total.saturating_add(network.total_received());
+            net_tx_total = net_tx_total.saturating_add(network.total_transmitted());
+        }
+        let load = System::load_average();
+        Report {
+            timestamp,
+            cpu: self.system.global_cpu_usage() as f64,
+            load1: load.one,
+            load5: load.five,
+            load15: load.fifteen,
+            mem_used: u64_to_i64(self.system.used_memory()),
+            mem_total: u64_to_i64(self.system.total_memory()),
+            swap_used: u64_to_i64(self.system.used_swap()),
+            swap_total: u64_to_i64(self.system.total_swap()),
+            disk_used: disk_metrics.iter().map(|disk| disk.used).sum(),
+            disk_total: disk_metrics.iter().map(|disk| disk.total).sum(),
+            net_in: per_second(net_in, elapsed),
+            net_out: per_second(net_out, elapsed),
+            net_rx_total: u64_to_i64(net_rx_total),
+            net_tx_total: u64_to_i64(net_tx_total),
+            uptime: u64_to_i64(System::uptime()),
+            processes: self.system.processes().len() as i64,
+            tcp_connections,
+            udp_connections,
+            cpu_cores: self.basic.cpu_cores,
+            cpu_model: self.basic.cpu_model.clone(),
+            os: self.basic.os.clone(),
+            kernel: self.basic.kernel.clone(),
+            arch: self.basic.arch.clone(),
+            virtualization: self.basic.virtualization.clone(),
+            gpu_usage: self.basic.gpu_usage,
+            gpu_model: self.basic.gpu_model.clone(),
+            agent_version: VERSION.to_string(),
+            disk_read_bps: 0.0,
+            disk_write_bps: 0.0,
+            disk_read_iops: 0.0,
+            disk_write_iops: 0.0,
+            disk_await_ms: 0.0,
+            disk_utilization: 0.0,
+            disks: disk_metrics,
+            gpus: self.basic.gpus.clone(),
+            latency_results,
+        }
     }
 }
 
@@ -1258,7 +1437,7 @@ fn runtime_config(options: &CliOptions) -> Result<RuntimeConfig> {
         token,
         endpoint: endpoint.trim_end_matches('/').to_string(),
         report_interval: interval,
-        collect_interval: 5,
+        collect_interval: 1,
         network_interface: String::new(),
         agent_mirror: String::new(),
         auto_update: true,
@@ -1280,6 +1459,49 @@ fn submit(
         .header("User-Agent", format!("nodeflare-agent/{VERSION}"))
         .header("X-Agent-Config-Sha256", config_hash)
         .send_json(batch)?;
+    let ended_ms = unix_timestamp_millis();
+    let clock_offset_ms = response
+        .headers()
+        .get("x-nodeflare-server-time")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| clock_offset_from_server_seconds(value, started_ms, ended_ms))
+        .or_else(|| {
+            response
+                .headers()
+                .get("date")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| clock_offset_from_http_date(value, started_ms, ended_ms))
+        });
+    let next_hash = response
+        .headers()
+        .get("X-Agent-Config-Sha256")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(config_hash)
+        .to_string();
+    let remote = if response.status().as_u16() == 204 {
+        None
+    } else {
+        Some(response.body_mut().read_json::<RemoteConfig>()?)
+    };
+    Ok(SubmitResult {
+        config: remote,
+        config_hash: next_hash,
+        clock_offset_ms,
+    })
+}
+
+fn fetch_remote_config(
+    agent: &ureq::Agent,
+    config: &RuntimeConfig,
+    config_hash: &str,
+) -> Result<SubmitResult> {
+    let started_ms = unix_timestamp_millis();
+    let mut response = agent
+        .get(&format!("{}/api/agent/config", config.endpoint))
+        .header("Authorization", format!("Bearer {}", config.token))
+        .header("User-Agent", format!("nodeflare-agent/{VERSION}"))
+        .header("X-Agent-Config-Sha256", config_hash)
+        .call()?;
     let ended_ms = unix_timestamp_millis();
     let clock_offset_ms = response
         .headers()
@@ -1383,11 +1605,13 @@ struct LiveAck {
     next_d1_write_after_ms: u64,
     #[serde(rename = "nextWssReportAfterMs")]
     next_wss_report_after_ms: u64,
+    #[serde(rename = "realtimeHint")]
+    realtime_hint: bool,
 }
 
 fn ack_interval(ack: &LiveAck) -> Duration {
     Duration::from_millis(ack.next_wss_report_after_ms)
-        .clamp(Duration::from_secs(2), Duration::from_secs(60))
+        .clamp(Duration::from_secs(1), Duration::from_secs(60))
 }
 
 fn read_live_ack(socket: &mut LiveSocket) -> Result<Option<Duration>> {
@@ -1399,7 +1623,7 @@ fn read_live_ack(socket: &mut LiveSocket) -> Result<Option<Duration>> {
             if ack.message_type != "ack" || ack.ts <= 0 {
                 return Ok(None);
             }
-            let _ = (ack.persisted, ack.next_d1_write_after_ms);
+            let _ = (ack.persisted, ack.next_d1_write_after_ms, ack.realtime_hint);
             Ok(Some(ack_interval(&ack)))
         }
         Ok(Message::Ping(payload)) => {
@@ -1424,18 +1648,18 @@ fn live_update_payload(reports: &[Report]) -> Result<String> {
     }))?)
 }
 
-fn requeue_reports(pending: &Arc<(Mutex<Vec<Report>>, Condvar)>, reports: Vec<Report>) {
+fn requeue_reports(pending: &Arc<(Mutex<VecDeque<Report>>, Condvar)>, reports: Vec<Report>) {
     if reports.is_empty() {
         return;
     }
     let (queue, ready) = &**pending;
     if let Ok(mut queue) = queue.lock() {
-        let mut merged = reports;
-        merged.append(&mut queue);
-        if merged.len() > LIVE_QUEUE_CAPACITY {
-            merged.truncate(LIVE_QUEUE_CAPACITY);
+        for report in reports.into_iter().rev() {
+            queue.push_front(report);
         }
-        *queue = merged;
+        while queue.len() > LIVE_QUEUE_CAPACITY {
+            queue.pop_back();
+        }
         ready.notify_one();
     }
 }
@@ -1443,19 +1667,20 @@ fn requeue_reports(pending: &Arc<(Mutex<Vec<Report>>, Condvar)>, reports: Vec<Re
 fn live_sender_loop(
     endpoint: &str,
     token: &str,
-    pending: Arc<(Mutex<Vec<Report>>, Condvar)>,
+    pending: Arc<(Mutex<VecDeque<Report>>, Condvar)>,
     configured_interval: Arc<Mutex<Duration>>,
+    healthy: Arc<AtomicBool>,
     clock: SharedClock,
 ) {
     let mut socket: Option<LiveSocket> = None;
     let mut send_interval = configured_interval
         .lock()
         .map(|interval| *interval)
-        .unwrap_or(Duration::from_secs(5));
-    let mut next_send_at = Instant::now();
+        .unwrap_or(Duration::from_secs(1));
+    let mut next_send_at = Instant::now() + send_interval;
     loop {
-        let (queue, ready) = &*pending;
-        let mut queue = match queue.lock() {
+        let (queue_lock, ready) = &*pending;
+        let mut queue = match queue_lock.lock() {
             Ok(queue) => queue,
             Err(_) => return,
         };
@@ -1471,13 +1696,44 @@ fn live_sender_loop(
                 Ok((queue, _)) => queue,
                 Err(_) => return,
             };
+            drop(queue);
+
+            let mut drop_socket = false;
+            if let Some(connected) = socket.as_mut() {
+                if set_live_read_timeout(connected, Some(LIVE_HINT_READ_TIMEOUT)).is_err() {
+                    drop_socket = true;
+                } else {
+                    match read_live_ack(connected) {
+                        Ok(Some(Duration::ZERO)) => drop_socket = true,
+                        Ok(Some(interval)) => {
+                            healthy.store(true, Ordering::Release);
+                            send_interval = interval;
+                            next_send_at = Instant::now() + send_interval;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("live hint read failed: {error}");
+                            drop_socket = true;
+                        }
+                    }
+                }
+            }
+            if drop_socket {
+                socket = None;
+                healthy.store(false, Ordering::Release);
+                next_send_at = Instant::now();
+            }
+            queue = match queue_lock.lock() {
+                Ok(queue) => queue,
+                Err(_) => return,
+            };
         }
         let count = queue.len().min(LIVE_BATCH_CAPACITY);
         let batch = queue.drain(..count).collect::<Vec<_>>();
         drop(queue);
 
         if let Ok(interval) = configured_interval.lock() {
-            send_interval = (*interval).clamp(Duration::from_secs(2), Duration::from_secs(60));
+            send_interval = (*interval).clamp(Duration::from_secs(1), Duration::from_secs(60));
         }
         if socket.is_none() {
             match connect_live(endpoint, token) {
@@ -1485,6 +1741,7 @@ fn live_sender_loop(
                     observe_clock(&clock, offset_ms);
                     if set_live_read_timeout(&mut connected, Some(LIVE_ACK_READ_TIMEOUT)).is_err() {
                         socket = None;
+                        healthy.store(false, Ordering::Release);
                         thread::sleep(LIVE_RECONNECT_DELAY);
                         requeue_reports(&pending, batch);
                         continue;
@@ -1492,6 +1749,7 @@ fn live_sender_loop(
                     socket = Some(connected);
                 }
                 Err(error) => {
+                    healthy.store(false, Ordering::Release);
                     eprintln!("live connection failed: {error}");
                     requeue_reports(&pending, batch);
                     thread::sleep(LIVE_RECONNECT_DELAY);
@@ -1513,6 +1771,7 @@ fn live_sender_loop(
             .is_some_and(|socket| socket.send(Message::Text(payload.clone().into())).is_ok());
         if !sent {
             socket = None;
+            healthy.store(false, Ordering::Release);
             thread::sleep(LIVE_RECONNECT_DELAY);
             let mut resent = false;
             if let Ok((mut connected, offset_ms)) = connect_live(endpoint, token) {
@@ -1533,31 +1792,35 @@ fn live_sender_loop(
         next_send_at = Instant::now() + send_interval;
         let mut drop_socket = false;
         if let Some(socket) = socket.as_mut() {
-            match read_live_ack(socket) {
-                Ok(Some(Duration::ZERO)) => drop_socket = true,
-                Ok(Some(interval)) => {
-                    send_interval = interval;
-                    next_send_at = Instant::now() + send_interval;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("live ACK read failed: {error}");
-                    drop_socket = true;
+            if set_live_read_timeout(socket, Some(LIVE_ACK_READ_TIMEOUT)).is_err() {
+                drop_socket = true;
+            } else {
+                match read_live_ack(socket) {
+                    Ok(Some(Duration::ZERO)) => drop_socket = true,
+                    Ok(Some(interval)) => {
+                        healthy.store(true, Ordering::Release);
+                        send_interval = interval;
+                        next_send_at = Instant::now() + send_interval;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("live ACK read failed: {error}");
+                        drop_socket = true;
+                    }
                 }
             }
         }
         if drop_socket {
             socket = None;
+            healthy.store(false, Ordering::Release);
         }
     }
 }
 
 fn apply_remote(config: &mut RuntimeConfig, remote: &RemoteConfig) -> bool {
-    if (15..=3600).contains(&remote.report_interval) {
+    if valid_sample_schedule(remote.report_interval, remote.collect_interval) {
         config.report_interval = remote.report_interval;
-    }
-    if (2..=60).contains(&remote.collect_interval) {
-        config.collect_interval = remote.collect_interval.min(config.report_interval);
+        config.collect_interval = remote.collect_interval;
     }
     config
         .network_interface
@@ -1870,8 +2133,9 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
         .timeout_global(Some(Duration::from_secs(20)))
         .build()
         .into();
+    let mut collector = Collector::new(&config);
     let mut next_report = Instant::now();
-    let mut next_collect = Instant::now();
+    let mut next_collect = Instant::now() + Duration::from_secs(config.collect_interval);
     let mut next_latency: HashMap<String, Instant> = HashMap::new();
     let mut latency_executor = LatencyExecutor::new()?;
     let mut pending_results = Vec::new();
@@ -1879,6 +2143,7 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
     let mut report_failures = 0_u32;
     let mut next_update_check = Instant::now();
     let mut config_hash = String::new();
+    let mut live_was_healthy = false;
     let clock = Arc::new(Mutex::new(ClockCalibration::default()));
     if !print_only {
         match fetch_clock_offset(&agent, &config.endpoint) {
@@ -1890,6 +2155,11 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
         .then(|| LiveSender::start(&config, Arc::clone(&clock)))
         .transpose()?;
     loop {
+        let live_healthy = live.as_ref().is_some_and(LiveSender::is_healthy);
+        if live_was_healthy && !live_healthy {
+            next_report = Instant::now();
+        }
+        live_was_healthy = live_healthy;
         pending_results.extend(latency_executor.drain());
         let current = Instant::now();
         let due = config
@@ -1920,7 +2190,7 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
                 result.timestamp = corrected_timestamp(result.timestamp, offset_ms);
                 latest_results.insert(result.task_id.clone(), result);
             }
-            let mut report = collect(&config, latest_results.into_values().collect(), 0);
+            let mut report = collector.collect(&config, latest_results.into_values().collect(), 0);
             report.timestamp = corrected_timestamp(unix_timestamp(), offset_ms);
             if print_only {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1934,26 +2204,51 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
                 &mut pending_samples,
                 corrected_timestamp(unix_timestamp(), offset_ms),
             );
-            if pending_samples.len() > 720 {
-                let overflow = pending_samples.len() - 720;
+            if pending_samples.len() > LIVE_QUEUE_CAPACITY {
+                let overflow = pending_samples.len() - LIVE_QUEUE_CAPACITY;
                 pending_samples.drain(..overflow);
             }
-            next_collect = Instant::now() + Duration::from_secs(config.collect_interval);
+            next_collect = advance_deadline(
+                next_collect,
+                Duration::from_secs(config.collect_interval),
+                Instant::now(),
+            );
         }
 
         if Instant::now() >= next_report && !pending_samples.is_empty() {
-            match submit(&agent, &config, &pending_samples, &config_hash) {
-                Ok(result) => {
+            let sync_result = if live_healthy {
+                fetch_remote_config(&agent, &config, &config_hash).map(|result| (result, false))
+            } else {
+                submit(&agent, &config, &pending_samples, &config_hash).map(|result| (result, true))
+            };
+            let sync_failed = sync_result.is_err();
+            match sync_result {
+                Ok((result, submitted_metrics)) => {
                     observe_clock(&clock, result.clock_offset_ms);
-                    pending_samples.clear();
+                    if submitted_metrics {
+                        pending_samples.clear();
+                    }
                     report_failures = 0;
                     config_hash = result.config_hash;
                     if let Some(remote) = result.config {
+                        let previous_collect_interval = config.collect_interval;
+                        let previous_report_interval = config.report_interval;
                         if apply_remote(&mut config, &remote) {
                             next_latency.clear();
                         }
-                        if let Some(live) = &live {
-                            live.set_send_interval(config.collect_interval);
+                        if config.collect_interval != previous_collect_interval {
+                            next_collect =
+                                Instant::now() + Duration::from_secs(config.collect_interval);
+                        }
+                        if config.collect_interval != previous_collect_interval
+                            || config.report_interval != previous_report_interval
+                        {
+                            if let Some(live) = &live {
+                                live.set_send_interval(
+                                    config.report_interval,
+                                    config.collect_interval,
+                                );
+                            }
                         }
                     }
                     if !once && config.auto_update && Instant::now() >= next_update_check {
@@ -1970,14 +2265,22 @@ fn run(options: &CliOptions, once: bool, print_only: bool) -> Result<()> {
                     }
                 }
                 Err(error) => {
-                    eprintln!("report failed: {error}");
-                    report_failures = report_failures.saturating_add(1);
+                    if live_healthy {
+                        eprintln!("config sync failed: {error}");
+                    } else {
+                        eprintln!("report failed: {error}");
+                        report_failures = report_failures.saturating_add(1);
+                    }
                     if once {
                         return Err(error);
                     }
                 }
             }
-            let retry_delay = report_retry_delay(report_failures, config.report_interval);
+            let retry_delay = if live_healthy && sync_failed {
+                REPORT_RETRY_MIN
+            } else {
+                report_retry_delay(report_failures, config.report_interval)
+            };
             next_report = Instant::now() + retry_delay;
             if once {
                 return Ok(());
@@ -2017,14 +2320,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ack_interval, agent_artifact_name, clock_offset_from_http_date, corrected_timestamp,
-        executable_format_valid, gpu_name_from_uevent, is_public_probe_ip, live_endpoint,
-        live_update_payload, median, mirrored_download_url, normalized_version,
-        parse_lspci_gpu_names, parse_probe_target, parse_system_profiler_gpu_names, ping_latency,
-        prune_report_samples, release_asset_sha256, report_retry_delay, sanitize_latency_tasks,
-        selected_interface, tcp_latency_probe_address, valid_endpoint, version_triplet, CliOptions,
-        ClockCalibration, GithubReleaseAsset, LatencyResult, LatencyTask, LiveAck, Report,
-        CLOCK_CALIBRATION_MAX_AGE, MAX_LATENCY_TASKS, MAX_PENDING_LATENCY_RESULTS, PROBE_ATTEMPTS,
+        ack_interval, advance_deadline, agent_artifact_name, clock_offset_from_http_date,
+        corrected_timestamp, executable_format_valid, gpu_name_from_uevent, is_public_probe_ip,
+        live_batch_interval, live_endpoint, live_update_payload, median, mirrored_download_url,
+        normalized_version, parse_lspci_gpu_names, parse_probe_target,
+        parse_system_profiler_gpu_names, ping_latency, prune_report_samples, release_asset_sha256,
+        report_retry_delay, sanitize_latency_tasks, selected_interface, tcp_latency_probe_address,
+        valid_endpoint, valid_sample_schedule, version_triplet, CliOptions, ClockCalibration,
+        GithubReleaseAsset, LatencyResult, LatencyTask, LiveAck, Report, CLOCK_CALIBRATION_MAX_AGE,
+        MAX_LATENCY_TASKS, MAX_PENDING_LATENCY_RESULTS, PROBE_ATTEMPTS,
     };
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2147,15 +2451,16 @@ mod tests {
     #[test]
     fn accepts_server_realtime_ack_interval() {
         let ack: LiveAck = serde_json::from_str(
-            r#"{"type":"ack","ts":100,"persisted":false,"nextD1WriteAfterMs":60000,"nextWssReportAfterMs":5000}"#,
+            r#"{"type":"ack","ts":100,"persisted":false,"nextD1WriteAfterMs":60000,"nextWssReportAfterMs":5000,"realtimeHint":false}"#,
         )
         .unwrap();
         assert_eq!(ack_interval(&ack), Duration::from_secs(5));
         let slow: LiveAck = serde_json::from_str(
-            r#"{"type":"ack","ts":100,"persisted":true,"nextD1WriteAfterMs":60000,"nextWssReportAfterMs":1}"#,
+            r#"{"type":"ack","ts":100,"persisted":true,"nextD1WriteAfterMs":60000,"nextWssReportAfterMs":1,"realtimeHint":true}"#,
         )
         .unwrap();
-        assert_eq!(ack_interval(&slow), Duration::from_secs(2));
+        assert_eq!(ack_interval(&slow), Duration::from_secs(1));
+        assert!(slow.realtime_hint);
     }
 
     #[test]
@@ -2278,6 +2583,32 @@ mod tests {
         assert_eq!(report_retry_delay(1, 60), Duration::from_secs(5));
         assert_eq!(report_retry_delay(4, 60), Duration::from_secs(40));
         assert_eq!(report_retry_delay(20, 60), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn validates_sample_schedules() {
+        assert!(valid_sample_schedule(3600, 5));
+        assert!(!valid_sample_schedule(3600, 4));
+        assert!(!valid_sample_schedule(60, 0));
+        assert!(!valid_sample_schedule(10, 1));
+    }
+
+    #[test]
+    fn batches_live_samples_at_one_fifteenth_of_the_history_interval() {
+        assert_eq!(live_batch_interval(60, 1), Duration::from_secs(4));
+        assert_eq!(live_batch_interval(60, 5), Duration::from_secs(5));
+        assert_eq!(live_batch_interval(120, 1), Duration::from_secs(8));
+        assert_eq!(live_batch_interval(3_600, 1), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn advances_collection_deadlines_without_drift() {
+        let start = Instant::now();
+        let interval = Duration::from_secs(1);
+        assert_eq!(
+            advance_deadline(start, interval, start + Duration::from_millis(2500)),
+            start + Duration::from_secs(3)
+        );
     }
 
     #[test]

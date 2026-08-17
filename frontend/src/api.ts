@@ -1,4 +1,4 @@
-import type { AdminServer, AlertRule, AlertRuleInput, CloudflareUsage, Config, DatabaseStats, ExchangeRates, HistoryPoint, LatencySample, LatencyTask, LatencyTaskInput, LatencyTestPoint, Server, ServerInput, Settings, Theme, ThemeSettingsSchema } from "./types";
+import type { AdminServer, AlertRule, AlertRuleInput, Bootstrap, CloudflareUsage, Config, DatabaseStats, ExchangeRates, HistoryPoint, LatencySample, LatencyTask, LatencyTaskInput, LatencyTestPoint, Server, ServerInput, Settings, Theme, ThemeSettingsSchema } from "./types";
 
 const TOKEN_KEY = "nodeflare-admin-token";
 export const ADMIN_UNAUTHORIZED_EVENT = "nodeflare:admin-unauthorized";
@@ -38,6 +38,7 @@ async function request<T>(path: string, init: RequestInit = {}, admin = false): 
 }
 
 export const api = {
+  bootstrap: () => request<Bootstrap>("/api/bootstrap"),
   config: () => request<Config>("/api/config"),
   exchangeRates: () => request<ExchangeRates>("/api/exchange-rates"),
   refreshExchangeRates: () => request<ExchangeRates>("/api/admin/exchange-rates/refresh", { method: "POST" }, true),

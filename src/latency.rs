@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use worker::{wasm_bindgen::JsValue, D1Database, Date, Result};
@@ -6,7 +6,6 @@ use worker::{wasm_bindgen::JsValue, D1Database, Date, Result};
 use crate::models::{AgentLatencyResult, AgentLatencyTask, LatencyTaskInput};
 
 pub const MAX_LATENCY_TASKS: usize = 128;
-const MAX_HISTORY_ROWS_PER_REPORT: usize = 4096;
 const MAX_HISTORY_RESPONSE_ROWS: i64 = 4000;
 
 #[derive(Debug, Deserialize)]
@@ -26,12 +25,96 @@ struct AssignmentRow {
     server_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-struct StoredLatencyResult {
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct StoredLatencyResult {
     task_id: String,
     timestamp: i64,
     latency_ms: f64,
     packet_loss: f64,
+    latest_timestamp: i64,
+    latest_latency_ms: f64,
+    latest_packet_loss: f64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+// Tuple layout keeps Durable Object WebSocket attachments below Cloudflare's
+// 16 KiB serialized-attachment limit even with all 128 latency tasks enabled.
+struct LatencyMetricAggregate(u64, u64, f64, f64, i64, f64, f64);
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct LatencyMetricAggregates {
+    #[serde(rename = "v")]
+    values: BTreeMap<String, LatencyMetricAggregate>,
+}
+
+impl LatencyMetricAggregates {
+    pub fn extend(&mut self, results: &[AgentLatencyResult], received_at: i64) {
+        for result in results {
+            if !self.values.contains_key(&result.task_id) && self.values.len() >= MAX_LATENCY_TASKS
+            {
+                continue;
+            }
+            let timestamp = if (result.timestamp - received_at).abs() <= 86_400 {
+                result.timestamp
+            } else {
+                received_at
+            };
+            let aggregate = self.values.entry(result.task_id.clone()).or_default();
+            aggregate.0 = aggregate.0.saturating_add(1);
+            aggregate.3 += result.packet_loss;
+            if result.latency_ms >= 0.0 {
+                aggregate.1 = aggregate.1.saturating_add(1);
+                aggregate.2 += result.latency_ms;
+            }
+            if timestamp >= aggregate.4 {
+                aggregate.4 = timestamp;
+                aggregate.5 = result.latency_ms;
+                aggregate.6 = result.packet_loss;
+            }
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        for (task_id, other) in other.values {
+            if !self.values.contains_key(&task_id) && self.values.len() >= MAX_LATENCY_TASKS {
+                continue;
+            }
+            let aggregate = self.values.entry(task_id).or_default();
+            aggregate.0 = aggregate.0.saturating_add(other.0);
+            aggregate.1 = aggregate.1.saturating_add(other.1);
+            aggregate.2 += other.2;
+            aggregate.3 += other.3;
+            if other.4 > aggregate.4 {
+                aggregate.4 = other.4;
+                aggregate.5 = other.5;
+                aggregate.6 = other.6;
+            }
+        }
+    }
+
+    fn rows_matching(&self, mut include: impl FnMut(&String) -> bool) -> Vec<StoredLatencyResult> {
+        let mut history = Vec::new();
+        for (task_id, aggregate) in self.values.iter().filter(|(task_id, _)| include(task_id)) {
+            history.push(StoredLatencyResult {
+                task_id: task_id.clone(),
+                timestamp: aggregate.4 / 60 * 60,
+                latency_ms: if aggregate.1 == 0 {
+                    -1.0
+                } else {
+                    aggregate.2 / aggregate.1 as f64
+                },
+                packet_loss: aggregate.3 / aggregate.0.max(1) as f64,
+                latest_timestamp: aggregate.4,
+                latest_latency_ms: aggregate.5,
+                latest_packet_loss: aggregate.6,
+            });
+        }
+        history
+    }
+
+    pub fn stored_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(&self.rows_matching(|_| true))?)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,10 +236,10 @@ pub async fn create_task(
             number(timestamp),
         ])?,
         db.prepare(
-            "INSERT INTO latency_task_servers(task_id, server_id) \
-             SELECT ?1, CAST(value AS TEXT) FROM json_each(?2)",
+            "INSERT INTO latency_task_servers(task_id, server_id, assigned_at) \
+             SELECT ?1, CAST(value AS TEXT), ?3 FROM json_each(?2)",
         )
-        .bind(&[text(id), text(&server_ids)])?,
+        .bind(&[text(id), text(&server_ids), number(timestamp)])?,
     ];
     db.batch(statements).await?;
     Ok(())
@@ -198,43 +281,22 @@ pub async fn update_task(
             JsValue::from_bool(input.default_enabled),
             number(timestamp),
         ])?,
-        db.prepare("DELETE FROM latency_task_servers WHERE task_id = ?1")
-            .bind(&[text(id)])?,
         db.prepare(
-            "INSERT INTO latency_task_servers(task_id, server_id) \
-             SELECT ?1, CAST(value AS TEXT) FROM json_each(?2)",
+            "DELETE FROM latency_task_servers WHERE task_id = ?1 AND server_id NOT IN ( \
+               SELECT CAST(value AS TEXT) FROM json_each(?2) \
+             )",
         )
         .bind(&[text(id), text(&server_ids)])?,
+        db.prepare(
+            "INSERT OR IGNORE INTO latency_task_servers(task_id, server_id, assigned_at) \
+             SELECT ?1, CAST(value AS TEXT), ?3 FROM json_each(?2)",
+        )
+        .bind(&[text(id), text(&server_ids), number(timestamp)])?,
     ];
     if reset_history {
         statements.push(
-            db.prepare("DELETE FROM latency_latest WHERE task_id = ?1")
-                .bind(&[text(id)])?,
-        );
-        statements.push(
-            db.prepare("DELETE FROM latency_history WHERE task_id = ?1")
-                .bind(&[text(id)])?,
-        );
-    } else {
-        statements.push(
-            db.prepare(
-                "DELETE FROM latency_latest WHERE task_id = ?1 AND NOT EXISTS ( \
-                   SELECT 1 FROM latency_task_servers a \
-                   WHERE a.task_id = latency_latest.task_id \
-                     AND a.server_id = latency_latest.server_id \
-                 )",
-            )
-            .bind(&[text(id)])?,
-        );
-        statements.push(
-            db.prepare(
-                "DELETE FROM latency_history WHERE task_id = ?1 AND NOT EXISTS ( \
-                   SELECT 1 FROM latency_task_servers a \
-                   WHERE a.task_id = latency_history.task_id \
-                     AND a.server_id = latency_history.server_id \
-                 )",
-            )
-            .bind(&[text(id)])?,
+            db.prepare("UPDATE latency_task_servers SET assigned_at = ?2 WHERE task_id = ?1")
+                .bind(&[text(id), number(timestamp)])?,
         );
     }
     db.batch(statements).await?;
@@ -252,150 +314,65 @@ pub async fn delete_task(db: &D1Database, id: &str) -> Result<bool> {
 
 pub async fn assign_defaults(db: &D1Database, server_id: &str) -> Result<()> {
     db.prepare(
-        "INSERT OR IGNORE INTO latency_task_servers(task_id, server_id) \
-         SELECT id, ?1 FROM latency_tasks WHERE default_enabled = 1",
+        "INSERT OR IGNORE INTO latency_task_servers(task_id, server_id, assigned_at) \
+         SELECT id, ?1, ?2 FROM latency_tasks WHERE default_enabled = 1",
     )
-    .bind(&[text(server_id)])?
+    .bind(&[text(server_id), number(crate::now())])?
     .run()
     .await?;
     Ok(())
 }
 
-pub async fn save_results(
-    db: &D1Database,
-    server_id: &str,
-    results: &[AgentLatencyResult],
-    received_at: i64,
-) -> Result<()> {
-    if results.is_empty() {
-        return Ok(());
-    }
-    let assigned: HashSet<String> = tasks_for_server(db, server_id)
-        .await?
-        .into_iter()
-        .map(|task| task.id)
-        .collect();
-    let (latest, history) = compact_results(results, &assigned, received_at);
-    if latest.is_empty() {
-        return Ok(());
-    }
-    let latest_json = serde_json::to_string(&latest)?;
-    let history_json = serde_json::to_string(&history)?;
-    let latest_statement = db
-        .prepare(
-            "INSERT INTO latency_latest( \
-               task_id, server_id, timestamp, latency_ms, packet_loss \
-             ) SELECT \
-               json_extract(value, '$.task_id'), ?1, \
-               CAST(json_extract(value, '$.timestamp') AS INTEGER), \
-               CAST(json_extract(value, '$.latency_ms') AS REAL), \
-               CAST(json_extract(value, '$.packet_loss') AS REAL) \
-             FROM json_each(?2) WHERE true \
-             ON CONFLICT(task_id, server_id) DO UPDATE SET \
-               timestamp=excluded.timestamp, latency_ms=excluded.latency_ms, \
-               packet_loss=excluded.packet_loss \
-             WHERE excluded.timestamp >= latency_latest.timestamp",
-        )
-        .bind(&[text(server_id), text(&latest_json)])?;
-    let history_statement = db
-        .prepare(
-            "INSERT INTO latency_history( \
-               task_id, server_id, timestamp, latency_ms, packet_loss \
-             ) SELECT \
-               json_extract(value, '$.task_id'), ?1, \
-               CAST(json_extract(value, '$.timestamp') AS INTEGER), \
-               CAST(json_extract(value, '$.latency_ms') AS REAL), \
-               CAST(json_extract(value, '$.packet_loss') AS REAL) \
-             FROM json_each(?2) WHERE true \
-             ON CONFLICT(task_id, server_id, timestamp) DO UPDATE SET \
-               latency_ms=excluded.latency_ms, packet_loss=excluded.packet_loss",
-        )
-        .bind(&[text(server_id), text(&history_json)])?;
-    db.batch(vec![latest_statement, history_statement]).await?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn compact_results(
     results: &[AgentLatencyResult],
-    assigned: &HashSet<String>,
+    assigned: &std::collections::HashSet<String>,
     received_at: i64,
-) -> (Vec<StoredLatencyResult>, Vec<StoredLatencyResult>) {
-    let mut latest: HashMap<String, StoredLatencyResult> = HashMap::new();
-    let mut history = std::collections::BTreeMap::new();
-    for result in results
-        .iter()
-        .filter(|result| assigned.contains(&result.task_id))
-    {
-        let timestamp = if (result.timestamp - received_at).abs() <= 86_400 {
-            result.timestamp
-        } else {
-            received_at
-        };
-        let stored = StoredLatencyResult {
-            task_id: result.task_id.clone(),
-            timestamp,
-            latency_ms: result.latency_ms,
-            packet_loss: result.packet_loss,
-        };
-        if latest
-            .get(&result.task_id)
-            .is_none_or(|current| timestamp >= current.timestamp)
-        {
-            latest.insert(result.task_id.clone(), stored.clone());
-        }
-        let minute = timestamp / 60 * 60;
-        history.insert(
-            (minute, result.task_id.clone()),
-            StoredLatencyResult {
-                timestamp: minute,
-                ..stored
-            },
-        );
-    }
-    let mut latest = latest.into_values().collect::<Vec<_>>();
-    latest.sort_by(|left, right| left.task_id.cmp(&right.task_id));
-    let skip = history.len().saturating_sub(MAX_HISTORY_ROWS_PER_REPORT);
-    let history = history
-        .into_values()
-        .skip(skip)
-        .collect::<Vec<StoredLatencyResult>>();
-    (latest, history)
+) -> Vec<StoredLatencyResult> {
+    let mut aggregates = LatencyMetricAggregates::default();
+    aggregates.extend(results, received_at);
+    aggregates.rows_matching(|task_id| assigned.contains(task_id))
 }
 
 pub async fn latest_all(db: &D1Database) -> Result<Vec<LatencySample>> {
-    db.prepare(
-        "SELECT a.task_id, a.server_id, t.name, t.task_type, t.target, t.port, \
-         COALESCE(l.timestamp, 0) AS timestamp, \
-         COALESCE(l.latency_ms, -1) AS latency_ms, \
-         COALESCE(l.packet_loss, -1) AS packet_loss \
-         FROM latency_task_servers a \
-         INNER JOIN latency_tasks t ON t.id = a.task_id \
-         LEFT JOIN latency_latest l \
-           ON l.task_id = a.task_id AND l.server_id = a.server_id \
-         ORDER BY t.sort_order ASC, t.created_at ASC",
-    )
-    .all()
-    .await?
-    .results()
+    db.prepare(latest_query(None)).all().await?.results()
 }
 
 pub async fn latest_for_server(db: &D1Database, server_id: &str) -> Result<Vec<LatencySample>> {
-    db.prepare(
-        "SELECT a.task_id, a.server_id, t.name, t.task_type, t.target, t.port, \
-         COALESCE(l.timestamp, 0) AS timestamp, \
-         COALESCE(l.latency_ms, -1) AS latency_ms, \
-         COALESCE(l.packet_loss, -1) AS packet_loss \
-         FROM latency_task_servers a \
-         INNER JOIN latency_tasks t ON t.id = a.task_id \
-         LEFT JOIN latency_latest l \
-           ON l.task_id = a.task_id AND l.server_id = a.server_id \
-         WHERE a.server_id = ?1 \
-         ORDER BY t.sort_order ASC, t.created_at ASC",
+    db.prepare(latest_query(Some("a.server_id = ?1")))
+        .bind(&[text(server_id)])?
+        .all()
+        .await?
+        .results()
+}
+
+fn latest_query(filter: Option<&str>) -> String {
+    let filter = filter.map_or(String::new(), |value| format!("WHERE {value}"));
+    format!(
+        "WITH assignments AS ( \
+           SELECT a.task_id, a.server_id, a.assigned_at, t.name, t.task_type, \
+             t.target, t.port, t.sort_order, t.created_at \
+           FROM latency_task_servers a \
+           INNER JOIN latency_tasks t ON t.id = a.task_id {filter} \
+         ), latest AS ( \
+           SELECT assignments.*, COALESCE( \
+             (SELECT j.value FROM metric_history h, json_each(h.latency_json) j \
+              WHERE h.server_id = assignments.server_id \
+                AND json_extract(j.value, '$.task_id') = assignments.task_id \
+                AND CAST(json_extract(j.value, '$.latest_timestamp') AS INTEGER) >= assignments.assigned_at \
+              ORDER BY h.timestamp DESC LIMIT 1), \
+             (SELECT j.value FROM metric_history_hourly h, json_each(h.latency_json) j \
+              WHERE h.server_id = assignments.server_id \
+                AND json_extract(j.value, '$.task_id') = assignments.task_id \
+                AND CAST(json_extract(j.value, '$.latest_timestamp') AS INTEGER) >= assignments.assigned_at \
+              ORDER BY h.timestamp DESC LIMIT 1) \
+           ) AS result FROM assignments \
+         ) SELECT task_id, server_id, name, task_type, target, port, \
+           COALESCE(CAST(json_extract(result, '$.latest_timestamp') AS INTEGER), 0) AS timestamp, \
+           COALESCE(CAST(json_extract(result, '$.latest_latency_ms') AS REAL), -1) AS latency_ms, \
+           COALESCE(CAST(json_extract(result, '$.latest_packet_loss') AS REAL), -1) AS packet_loss \
+         FROM latest ORDER BY sort_order ASC, created_at ASC"
     )
-    .bind(&[text(server_id)])?
-    .all()
-    .await?
-    .results()
 }
 
 pub async fn history(db: &D1Database, server_id: &str, hours: i64) -> Result<Vec<LatencySample>> {
@@ -411,16 +388,37 @@ pub async fn history(db: &D1Database, server_id: &str, hours: i64) -> Result<Vec
         return Ok(Vec::new());
     }
     let bucket = history_bucket_seconds(hours, task_count);
+    let source = if hours <= 24 {
+        "SELECT h.server_id, h.timestamp, json_extract(j.value, '$.task_id') AS task_id, \
+           CAST(json_extract(j.value, '$.latency_ms') AS REAL) AS latency_ms, \
+           CAST(json_extract(j.value, '$.packet_loss') AS REAL) AS packet_loss, \
+           CAST(json_extract(j.value, '$.latest_timestamp') AS INTEGER) AS latest_timestamp \
+         FROM metric_history h, json_each(h.latency_json) j"
+            .to_string()
+    } else {
+        "SELECT h.server_id, h.timestamp, json_extract(j.value, '$.task_id') AS task_id, \
+           CAST(json_extract(j.value, '$.latency_ms') AS REAL) AS latency_ms, \
+           CAST(json_extract(j.value, '$.packet_loss') AS REAL) AS packet_loss, \
+           CAST(json_extract(j.value, '$.latest_timestamp') AS INTEGER) AS latest_timestamp \
+         FROM metric_history h, json_each(h.latency_json) j \
+         UNION ALL \
+         SELECT h.server_id, h.timestamp, json_extract(j.value, '$.task_id') AS task_id, \
+           CAST(json_extract(j.value, '$.latency_ms') AS REAL) AS latency_ms, \
+           CAST(json_extract(j.value, '$.packet_loss') AS REAL) AS packet_loss, \
+           CAST(json_extract(j.value, '$.latest_timestamp') AS INTEGER) AS latest_timestamp \
+         FROM metric_history_hourly h, json_each(h.latency_json) j"
+            .to_string()
+    };
     let query = format!(
         "SELECT h.task_id, h.server_id, t.name, t.task_type, t.target, t.port, \
          (h.timestamp / {bucket}) * {bucket} AS timestamp, \
          CASE WHEN SUM(CASE WHEN h.latency_ms >= 0 THEN 1 ELSE 0 END) > 0 \
            THEN AVG(CASE WHEN h.latency_ms >= 0 THEN h.latency_ms END) ELSE -1 END AS latency_ms, \
          AVG(h.packet_loss) AS packet_loss \
-         FROM latency_history h INNER JOIN latency_tasks t ON t.id = h.task_id \
+         FROM ({source}) h INNER JOIN latency_tasks t ON t.id = h.task_id \
          INNER JOIN latency_task_servers a \
            ON a.task_id = h.task_id AND a.server_id = h.server_id \
-         WHERE h.server_id = ?1 AND h.timestamp >= ?2 \
+         WHERE h.server_id = ?1 AND h.timestamp >= ?2 AND h.latest_timestamp >= a.assigned_at \
          GROUP BY h.task_id, h.server_id, t.name, t.task_type, t.target, t.port, h.timestamp / {bucket} \
          ORDER BY timestamp ASC, t.sort_order ASC LIMIT {MAX_HISTORY_RESPONSE_ROWS}"
     );
@@ -447,22 +445,9 @@ fn history_bucket_seconds(hours: i64, task_count: i64) -> i64 {
     base.max(bounded)
 }
 
-pub async fn cleanup_history(db: &D1Database, cutoff: i64) -> Result<()> {
-    db.prepare("DELETE FROM latency_history WHERE timestamp < ?1")
-        .bind(&[number(cutoff)])?
-        .run()
-        .await?;
-    Ok(())
-}
-
-pub async fn clear_history(db: &D1Database) -> Result<()> {
-    db.prepare("DELETE FROM latency_history").run().await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{compact_results, history_bucket_seconds, MAX_HISTORY_ROWS_PER_REPORT};
+    use super::{compact_results, history_bucket_seconds, MAX_LATENCY_TASKS};
     use crate::models::AgentLatencyResult;
     use std::collections::HashSet;
 
@@ -489,16 +474,18 @@ mod tests {
                 packet_loss: 0.0,
             },
         ];
-        let (latest, history) = compact_results(&results, &assigned, 150);
-        assert_eq!(latest.len(), 1);
-        assert_eq!(latest[0].timestamp, 149);
+        let history = compact_results(&results, &assigned, 150);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].timestamp, 120);
-        assert_eq!(history[0].latency_ms, 20.0);
+        assert_eq!(history[0].latency_ms, 15.0);
+        assert_eq!(history[0].packet_loss, 12.5);
+        assert_eq!(history[0].latest_timestamp, 149);
+        assert_eq!(history[0].latest_latency_ms, 20.0);
+        assert_eq!(history[0].latest_packet_loss, 25.0);
     }
 
     #[test]
-    fn bounds_compacted_latency_history() {
+    fn bounds_compacted_latency_history_by_task() {
         let assigned = (0..128)
             .map(|index| format!("task-{index}"))
             .collect::<HashSet<_>>();
@@ -512,8 +499,8 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let (_, history) = compact_results(&results, &assigned, results.last().unwrap().timestamp);
-        assert_eq!(history.len(), MAX_HISTORY_ROWS_PER_REPORT);
+        let history = compact_results(&results, &assigned, results.last().unwrap().timestamp);
+        assert_eq!(history.len(), MAX_LATENCY_TASKS);
         assert_eq!(
             history.last().unwrap().timestamp,
             results.last().unwrap().timestamp / 60 * 60

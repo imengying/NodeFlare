@@ -9,6 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=frontend/admin-dist/admin.html");
     println!("cargo:rerun-if-changed=frontend/admin-dist/admin.js");
     println!("cargo:rerun-if-changed=frontend/admin-dist/admin.css");
+    println!("cargo:rerun-if-env-changed=NODEFLARE_VERSION");
 
     let files = [
         (

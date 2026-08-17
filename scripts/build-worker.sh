@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+NODEFLARE_VERSION=$(sh "$script_dir/resolve-version.sh")
+VITE_NODEFLARE_VERSION=$NODEFLARE_VERSION
+export NODEFLARE_VERSION VITE_NODEFLARE_VERSION
+cd "$root_dir"
+
 current_build_key=$(sh scripts/build-key.sh worker 2>/dev/null || true)
 if [ "${NODEFLARE_WORKER_READY:-0}" = "1" ] && [ -n "$current_build_key" ]; then
   built_build_key=$(sed -n '1p' build/.nodeflare-revision 2>/dev/null || true)
@@ -12,7 +19,6 @@ if [ "${NODEFLARE_WORKER_READY:-0}" = "1" ] && [ -n "$current_build_key" ]; then
   fi
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/ensure-rust.sh"
 
 if [ "${NODEFLARE_ADMIN_READY:-0}" != "1" ]; then

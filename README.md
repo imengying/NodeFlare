@@ -41,10 +41,17 @@
 | `CF_USAGE_ACCOUNT_ID` | 可选 | Cloudflare 用量查询的账户 ID，不设置则不启用用量查询 |
 | `CF_USAGE_API_TOKEN` | 可选 | 用量查询 Token，勾选“加密”；需要 Account Analytics: Read，并授权对应账户 |
 
+## Agent 卸载
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/imengying/NodeFlare/main/agent/agent.sh | sudo sh -s -- --uninstall
+```
+
 ## API
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
+| `GET` | `/api/bootstrap` | 前台配置、节点、汇率和访问状态 |
 | `GET` | `/api/config` | 公开站点配置 |
 | `GET` | `/api/exchange-rates` | D1 中的 CNY 基准汇率快照 |
 | `GET` | `/api/servers` | 公开节点和最新指标 |
@@ -52,6 +59,7 @@
 | `GET` | `/api/latency/:id?hours=24` | 节点延迟任务历史 |
 | `GET` | `/api/ws` | 实时 WebSocket |
 | `GET` | `/api/agent/live` | Agent 实时指标 WebSocket |
+| `GET` | `/api/agent/config` | Agent 配置同步，节点 Bearer Token |
 | `POST` | `/api/agent/report` | Agent 上报，节点 Bearer Token |
 | `POST` | `/api/admin/login` | 管理登录 |
 | `POST` | `/api/admin/logout` | 退出登录（清除会话 Cookie） |

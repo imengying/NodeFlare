@@ -330,12 +330,6 @@ mod tests {
             issued_at + ADMIN_SESSION_SECONDS + 1
         ));
         assert!(!verify_admin_jwt(&token, "different-secret", issued_at));
-    }
-
-    #[test]
-    fn rejects_tampered_admin_jwt() {
-        let issued_at = 1_800_000_000;
-        let token = create_admin_jwt_with_secret("d1-password-hash", issued_at).expect("jwt");
         let tampered = format!("{}x", token);
         assert!(!verify_admin_jwt(&tampered, "d1-password-hash", issued_at));
     }
