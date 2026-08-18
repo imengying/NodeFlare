@@ -85,10 +85,7 @@ pub(crate) async fn report(
     if latency_result_count > MAX_AGENT_LATENCY_RESULTS {
         return error("每批最多包含 4096 条延迟结果", 400);
     }
-    let mut history_aggregate = db::HistoryMetricAggregate::default();
-    history_aggregate.extend(&batch.samples);
-    let alert_point = history_aggregate.point();
-    db::save_reports(database, &server_id, &batch.samples).await?;
+    let alert_point = db::save_reports(database, &server_id, &batch.samples).await?;
     if let Some(point) = alert_point.as_ref() {
         if let Err(error) = live::record_alert_sample(&env, &server_id, point).await {
             worker::console_warn!("resource alert sample write failed: {error:?}");

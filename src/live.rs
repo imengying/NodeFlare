@@ -6,7 +6,7 @@ use worker::*;
 
 use crate::db::{AgentLiveContext, AlertMetricRow, HistoryMetricAggregate};
 use crate::latency::LatencyMetricAggregates;
-use crate::models::{AgentLatencyResult, AgentReport, AlertRuleView, HistoryPoint, ServerView};
+use crate::models::{AgentReport, AlertRuleView, HistoryPoint, ServerView};
 
 const MAX_LIVE_SAMPLES: usize = 720;
 const MAX_LIVE_LATENCY_RESULTS: usize = 4096;
@@ -856,7 +856,7 @@ impl DurableObject for LiveHub {
             return ws.close(Some(1007), Some("invalid live metric batch"));
         }
         let received_at = crate::now();
-        let mut latency_results = Vec::<AgentLatencyResult>::new();
+        let mut latency_result_count = 0usize;
         for report in &batch.samples {
             if report.timestamp <= 0
                 || (report.timestamp - received_at).abs() > 7200
@@ -864,9 +864,10 @@ impl DurableObject for LiveHub {
             {
                 return ws.close(Some(1007), Some("invalid live metric sample"));
             }
-            latency_results.extend(report.latency_results.iter().cloned());
+            latency_result_count =
+                latency_result_count.saturating_add(report.latency_results.len());
         }
-        if latency_results.len() > MAX_LIVE_LATENCY_RESULTS {
+        if latency_result_count > MAX_LIVE_LATENCY_RESULTS {
             return ws.close(Some(1009), Some("too many live latency results"));
         }
         let Some(server_id) = attachment.server_id.clone() else {
@@ -876,8 +877,14 @@ impl DurableObject for LiveHub {
             .traffic
             .take()
             .ok_or_else(|| Error::RustError("missing live traffic state".to_string()))?;
+        let previous_traffic_timestamp = traffic.timestamp;
+        let fresh_reports = crate::db::reports_after(&batch.samples, previous_traffic_timestamp);
+        let latency_results = fresh_reports
+            .iter()
+            .flat_map(|report| report.latency_results.iter().cloned())
+            .collect::<Vec<_>>();
         let (payload, mut cached_samples) =
-            batch_update_parts_at(&server_id, &batch.samples, &mut traffic, received_at)?;
+            batch_update_parts_at(&server_id, &fresh_reports, &mut traffic, received_at)?;
         trim_cached_live_samples(&mut cached_samples);
         let traffic_state = crate::db::TrafficCounterState {
             cycle_key: traffic.cycle_key,
@@ -889,17 +896,22 @@ impl DurableObject for LiveHub {
             used_tx: traffic.used_tx,
         };
         attachment.traffic = Some(traffic);
-        attachment.latest_samples = cached_samples;
-        attachment.latest_received_at = received_at;
-        attachment.history_aggregate.extend(&batch.samples);
-        attachment
-            .latency_aggregates
-            .extend(&latency_results, received_at);
+        if !fresh_reports.is_empty() {
+            attachment.latest_samples = cached_samples;
+            attachment.latest_received_at = received_at;
+            attachment.history_aggregate.extend(&fresh_reports);
+            attachment
+                .latency_aggregates
+                .extend(&latency_results, received_at);
+        }
 
         let report_interval = attachment.report_interval.clamp(15, 3600);
         let due_for_d1 = received_at.saturating_sub(attachment.last_d1_write_at) >= report_interval;
         let flush_active = self.active_d1_flushes.borrow().contains(&server_id);
-        let mut flush = if (due_for_d1 || attachment.d1_flush.is_some()) && !flush_active {
+        let mut flush = if !fresh_reports.is_empty()
+            && (due_for_d1 || attachment.d1_flush.is_some())
+            && !flush_active
+        {
             let database = self.env.d1("DB")?;
             begin_d1_flush(&mut attachment).map(|snapshot| (database, snapshot))
         } else {
@@ -912,7 +924,7 @@ impl DurableObject for LiveHub {
             ws.serialize_attachment(&attachment)?;
         }
 
-        if !attachment.hidden {
+        if !fresh_reports.is_empty() && !attachment.hidden {
             let mut sockets = self.state.get_websockets_with_tag("all");
             sockets.extend(
                 self.state
@@ -935,11 +947,13 @@ impl DurableObject for LiveHub {
                 .history
                 .point()
                 .ok_or_else(|| Error::RustError("missing live history aggregate".to_string()))?;
+            let sample_count = snapshot.history.sample_count();
             let metrics_result = crate::db::save_reports_with_history(
                 &database,
                 &server_id,
-                &batch.samples,
+                &fresh_reports,
                 &history_point,
+                sample_count,
                 &traffic_state,
                 &snapshot.latency,
             )

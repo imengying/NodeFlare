@@ -118,7 +118,7 @@ request -H "Authorization: Bearer $admin_token" \
 agent_version=$(sh scripts/resolve-version.sh)
 
 sample=$(jq -nc --arg agent_version "$agent_version" '{
-  timestamp:(now|floor),cpu:18.5,load1:0.42,load5:0.36,load15:0.31,
+  timestamp:((((now|floor) / 60 | floor) + 1) * 60 + 10),cpu:18.5,load1:0.42,load5:0.36,load15:0.31,
   mem_used:2147483648,mem_total:4294967296,swap_used:0,swap_total:0,disk_used:21474836480,disk_total:53687091200,
   net_in:4096,net_out:2048,net_rx_total:1073741824,net_tx_total:536870912,
   uptime:86400,processes:90,tcp_connections:18,udp_connections:4,cpu_cores:2,
@@ -147,23 +147,40 @@ request -H "Authorization: Bearer $agent_token" \
 request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/admin/servers" | \
   jq -e --arg id "$server_id" '.servers | any(.id == $id and .last_ip == "8.8.8.8")' >/dev/null
 
-latency_report=$(printf '%s' "$report" | jq --arg task_id "$latency_task_id" '.samples[0].timestamp=(now|floor) | .samples[0].latency_results=[{task_id:$task_id,timestamp:(now|floor),latency_ms:28.4,packet_loss:25}]')
+latency_report=$(printf '%s' "$report" | jq --arg task_id "$latency_task_id" \
+  '.samples[0].timestamp += 1 |
+   .samples[0].latency_results=[{
+     task_id:$task_id,
+     timestamp:.samples[0].timestamp,
+     latency_ms:28.4,
+     packet_loss:25
+   }]')
 request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
   --data "$latency_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.collect_interval == 5' >/dev/null
+latency_report_second=$(printf '%s' "$report" | jq --arg task_id "$latency_task_id" \
+  '.samples[0].timestamp += 2 |
+   .samples[0].latency_results=[{
+     task_id:$task_id,
+     timestamp:.samples[0].timestamp,
+     latency_ms:48.4,
+     packet_loss:75
+   }]')
+request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
+  --data "$latency_report_second" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.collect_interval == 5' >/dev/null
 
 # A whole Agent batch must collapse into one traffic-cycle write while preserving
 # counter resets. Replaying the same batch must not count any bytes twice.
 traffic_report=$(printf '%s' "$report" | jq '.samples = [
-  (.samples[0] | .timestamp += 2 | .net_rx_total=2147483648 | .net_tx_total=1073741824),
-  (.samples[0] | .timestamp += 3 | .net_rx_total=268435456 | .net_tx_total=134217728),
-  (.samples[0] | .timestamp += 4 | .net_rx_total=536870912 | .net_tx_total=268435456)
+  (.samples[0] | .timestamp += 3 | .net_rx_total=2147483648 | .net_tx_total=1073741824),
+  (.samples[0] | .timestamp += 4 | .net_rx_total=268435456 | .net_tx_total=134217728),
+  (.samples[0] | .timestamp += 5 | .net_rx_total=536870912 | .net_tx_total=268435456)
 ]')
 request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
   --data "$traffic_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.collect_interval == 5' >/dev/null
 request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
   --data "$traffic_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.collect_interval == 5' >/dev/null
 
-request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/bootstrap" | jq -e --arg id "$server_id" --arg task_id "$latency_task_id" '.servers | any(.id == $id and .cpu == 18.5 and .gpu_usage == 32.5 and .disk_await_ms == 1.4 and (.gpus | length) == 1 and (.disks | length) == 1 and .disk_used == 21474836480 and .traffic_limit == 107374182400 and .net_rx_total == 2684354560 and .net_tx_total == 1342177280 and .price == 9.9 and (has("last_ip") | not) and (.latency | any(.task_id == $task_id and .latency_ms == 28.4 and .packet_loss == 25)))' >/dev/null
+request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/bootstrap" | jq -e --arg id "$server_id" --arg task_id "$latency_task_id" '.servers | any(.id == $id and .cpu == 18.5 and .gpu_usage == 32.5 and .disk_await_ms == 1.4 and (.gpus | length) == 1 and (.disks | length) == 1 and .disk_used == 21474836480 and .traffic_limit == 107374182400 and .net_rx_total == 2684354560 and .net_tx_total == 1342177280 and .price == 9.9 and (has("last_ip") | not) and (.latency | any(.task_id == $task_id and .latency_ms == 48.4 and .packet_loss == 75)))' >/dev/null
 
 # Changing the reset day starts a new traffic cycle. Only growth after the first
 # sample in that cycle counts toward usage.
@@ -171,8 +188,8 @@ request -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/js
   --data "$(printf '%s' "$server_input" | jq '.reset_day=2')" \
   "$MONITOR_BASE_URL/api/admin/servers/$server_id" >/dev/null
 cycle_report=$(printf '%s' "$report" | jq '.samples = [
-  (.samples[0] | .timestamp += 5 | .net_rx_total=805306368 | .net_tx_total=536870912),
-  (.samples[0] | .timestamp += 6 | .net_rx_total=1073741824 | .net_tx_total=805306368)
+  (.samples[0] | .timestamp += 6 | .net_rx_total=805306368 | .net_tx_total=536870912),
+  (.samples[0] | .timestamp += 7 | .net_rx_total=1073741824 | .net_tx_total=805306368)
 ]')
 request -H "Authorization: Bearer $agent_token" -H 'Content-Type: application/json' \
   --data "$cycle_report" "$MONITOR_BASE_URL/api/agent/report" | jq -e '.collect_interval == 5' >/dev/null
@@ -196,7 +213,7 @@ history_cache_header=$(monitor_curl --silent --dump-header - --output /dev/null 
   -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/history/$server_id?hours=1" | \
   tr -d '\r' | awk -F ': ' 'tolower($1) == "x-cache" { print $2 }' | tail -1)
 [ "$history_cache_header" = "HIT" ]
-request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/latency/$server_id?hours=1" | jq -e --arg task_id "$latency_task_id" '(.tasks | any(.id == $task_id)) and (.points | any(.task_id == $task_id and .latency_ms == 28.4))' >/dev/null
+request -H "Authorization: Bearer $admin_token" "$MONITOR_BASE_URL/api/latency/$server_id?hours=1" | jq -e --arg task_id "$latency_task_id" '(.tasks | any(.id == $task_id)) and (.points | any(.task_id == $task_id and .latency_ms > 38.399 and .latency_ms < 38.401 and .packet_loss > 49.999 and .packet_loss < 50.001))' >/dev/null
 
 # An Agent may have already measured a task when the administrator removes its
 # assignment. The stale result must not block delivery of the new task list.

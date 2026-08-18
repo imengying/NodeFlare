@@ -31,6 +31,8 @@ pub(crate) struct StoredLatencyResult {
     timestamp: i64,
     latency_ms: f64,
     packet_loss: f64,
+    sample_count: u64,
+    success_count: u64,
     latest_timestamp: i64,
     latest_latency_ms: f64,
     latest_packet_loss: f64,
@@ -104,6 +106,8 @@ impl LatencyMetricAggregates {
                     aggregate.2 / aggregate.1 as f64
                 },
                 packet_loss: aggregate.3 / aggregate.0.max(1) as f64,
+                sample_count: aggregate.0,
+                success_count: aggregate.1,
                 latest_timestamp: aggregate.4,
                 latest_latency_ms: aggregate.5,
                 latest_packet_loss: aggregate.6,
@@ -392,6 +396,8 @@ pub async fn history(db: &D1Database, server_id: &str, hours: i64) -> Result<Vec
         "SELECT h.server_id, h.timestamp, json_extract(j.value, '$.task_id') AS task_id, \
            CAST(json_extract(j.value, '$.latency_ms') AS REAL) AS latency_ms, \
            CAST(json_extract(j.value, '$.packet_loss') AS REAL) AS packet_loss, \
+           CAST(json_extract(j.value, '$.sample_count') AS INTEGER) AS sample_count, \
+           CAST(json_extract(j.value, '$.success_count') AS INTEGER) AS success_count, \
            CAST(json_extract(j.value, '$.latest_timestamp') AS INTEGER) AS latest_timestamp \
          FROM metric_history h, json_each(h.latency_json) j"
             .to_string()
@@ -399,12 +405,16 @@ pub async fn history(db: &D1Database, server_id: &str, hours: i64) -> Result<Vec
         "SELECT h.server_id, h.timestamp, json_extract(j.value, '$.task_id') AS task_id, \
            CAST(json_extract(j.value, '$.latency_ms') AS REAL) AS latency_ms, \
            CAST(json_extract(j.value, '$.packet_loss') AS REAL) AS packet_loss, \
+           CAST(json_extract(j.value, '$.sample_count') AS INTEGER) AS sample_count, \
+           CAST(json_extract(j.value, '$.success_count') AS INTEGER) AS success_count, \
            CAST(json_extract(j.value, '$.latest_timestamp') AS INTEGER) AS latest_timestamp \
          FROM metric_history h, json_each(h.latency_json) j \
          UNION ALL \
          SELECT h.server_id, h.timestamp, json_extract(j.value, '$.task_id') AS task_id, \
            CAST(json_extract(j.value, '$.latency_ms') AS REAL) AS latency_ms, \
            CAST(json_extract(j.value, '$.packet_loss') AS REAL) AS packet_loss, \
+           CAST(json_extract(j.value, '$.sample_count') AS INTEGER) AS sample_count, \
+           CAST(json_extract(j.value, '$.success_count') AS INTEGER) AS success_count, \
            CAST(json_extract(j.value, '$.latest_timestamp') AS INTEGER) AS latest_timestamp \
          FROM metric_history_hourly h, json_each(h.latency_json) j"
             .to_string()
@@ -412,9 +422,10 @@ pub async fn history(db: &D1Database, server_id: &str, hours: i64) -> Result<Vec
     let query = format!(
         "SELECT h.task_id, h.server_id, t.name, t.task_type, t.target, t.port, \
          (h.timestamp / {bucket}) * {bucket} AS timestamp, \
-         CASE WHEN SUM(CASE WHEN h.latency_ms >= 0 THEN 1 ELSE 0 END) > 0 \
-           THEN AVG(CASE WHEN h.latency_ms >= 0 THEN h.latency_ms END) ELSE -1 END AS latency_ms, \
-         AVG(h.packet_loss) AS packet_loss \
+         CASE WHEN SUM(h.success_count) > 0 \
+           THEN SUM(h.latency_ms * h.success_count) / SUM(h.success_count) \
+           ELSE -1 END AS latency_ms, \
+         SUM(h.packet_loss * h.sample_count) / SUM(h.sample_count) AS packet_loss \
          FROM ({source}) h INNER JOIN latency_tasks t ON t.id = h.task_id \
          INNER JOIN latency_task_servers a \
            ON a.task_id = h.task_id AND a.server_id = h.server_id \
@@ -479,6 +490,8 @@ mod tests {
         assert_eq!(history[0].timestamp, 120);
         assert_eq!(history[0].latency_ms, 15.0);
         assert_eq!(history[0].packet_loss, 12.5);
+        assert_eq!(history[0].sample_count, 2);
+        assert_eq!(history[0].success_count, 2);
         assert_eq!(history[0].latest_timestamp, 149);
         assert_eq!(history[0].latest_latency_ms, 20.0);
         assert_eq!(history[0].latest_packet_loss, 25.0);

@@ -30,12 +30,10 @@ pub fn sha256_hex(value: &str) -> String {
 }
 
 fn secure_eq(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.as_bytes()
-        .iter()
-        .zip(right.as_bytes())
+    let left = Sha256::digest(left.as_bytes());
+    let right = Sha256::digest(right.as_bytes());
+    left.iter()
+        .zip(right.iter())
         .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
         == 0
 }

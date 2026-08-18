@@ -302,6 +302,10 @@ impl HistoryMetricAggregate {
         }
     }
 
+    pub fn sample_count(&self) -> i64 {
+        self.count.min(i64::MAX as u64) as i64
+    }
+
     pub fn point(&self) -> Option<HistoryPoint> {
         if self.count == 0 {
             return None;
@@ -983,13 +987,15 @@ pub async fn history(db: &D1Database, id: &str, hours: i64) -> Result<Vec<Histor
     let query = format!(
         r#"SELECT
           (timestamp / {bucket}) * {bucket} AS timestamp,
-          AVG(cpu) AS cpu, AVG(load1) AS load1, AVG(load5) AS load5,
-          AVG(load15) AS load15,
-          CAST(AVG(mem_used) AS INTEGER) AS mem_used,
+          SUM(cpu * sample_count) / SUM(sample_count) AS cpu,
+          SUM(load1 * sample_count) / SUM(sample_count) AS load1,
+          SUM(load5 * sample_count) / SUM(sample_count) AS load5,
+          SUM(load15 * sample_count) / SUM(sample_count) AS load15,
+          CAST(SUM(mem_used * sample_count) / SUM(sample_count) AS INTEGER) AS mem_used,
           CAST(MAX(mem_total) AS INTEGER) AS mem_total,
-          CAST(AVG(swap_used) AS INTEGER) AS swap_used,
+          CAST(SUM(swap_used * sample_count) / SUM(sample_count) AS INTEGER) AS swap_used,
           CAST(MAX(swap_total) AS INTEGER) AS swap_total,
-          CAST(AVG(disk_used) AS INTEGER) AS disk_used,
+          CAST(SUM(disk_used * sample_count) / SUM(sample_count) AS INTEGER) AS disk_used,
           CAST(MAX(disk_total) AS INTEGER) AS disk_total,
           MAX(net_in) AS net_in, MAX(net_out) AS net_out,
           CAST(MAX(net_rx_total) AS INTEGER) AS net_rx_total,
@@ -997,7 +1003,7 @@ pub async fn history(db: &D1Database, id: &str, hours: i64) -> Result<Vec<Histor
           CAST(MAX(processes) AS INTEGER) AS processes,
           CAST(MAX(tcp_connections) AS INTEGER) AS tcp_connections,
           CAST(MAX(udp_connections) AS INTEGER) AS udp_connections,
-          AVG(gpu_usage) AS gpu_usage,
+          SUM(gpu_usage * sample_count) / SUM(sample_count) AS gpu_usage,
           MAX(disk_read_bps) AS disk_read_bps,
           MAX(disk_write_bps) AS disk_write_bps,
           MAX(disk_read_iops) AS disk_read_iops,
@@ -1017,17 +1023,19 @@ pub async fn history(db: &D1Database, id: &str, hours: i64) -> Result<Vec<Histor
         .results()
 }
 
-pub async fn save_reports(db: &D1Database, server_id: &str, reports: &[AgentReport]) -> Result<()> {
-    let mut aggregate = HistoryMetricAggregate::default();
-    aggregate.extend(reports);
-    let Some(history) = aggregate.point() else {
-        return Ok(());
-    };
-    let mut latency = crate::latency::LatencyMetricAggregates::default();
-    let received_at = now();
-    for report in reports {
-        latency.extend(&report.latency_results, received_at);
-    }
+pub(crate) fn reports_after(reports: &[AgentReport], timestamp: i64) -> Vec<AgentReport> {
+    reports
+        .iter()
+        .filter(|report| report.timestamp > timestamp)
+        .cloned()
+        .collect()
+}
+
+pub async fn save_reports(
+    db: &D1Database,
+    server_id: &str,
+    reports: &[AgentReport],
+) -> Result<Option<HistoryPoint>> {
     let context: TrafficCounterContext = db
         .prepare(
             r#"WITH latest_state AS (
@@ -1056,8 +1064,33 @@ pub async fn save_reports(db: &D1Database, server_id: &str, reports: &[AgentRepo
         .await?
         .ok_or_else(|| worker::Error::RustError("节点不存在".to_string()))?;
     let (mut traffic, configured_reset_day) = context.into_parts();
-    traffic.extend(reports, configured_reset_day);
-    save_reports_with_history(db, server_id, reports, &history, &traffic, &latency).await
+    let fresh_reports = reports_after(reports, traffic.timestamp);
+    if fresh_reports.is_empty() {
+        return Ok(None);
+    }
+
+    let mut aggregate = HistoryMetricAggregate::default();
+    aggregate.extend(&fresh_reports);
+    let Some(history) = aggregate.point() else {
+        return Ok(None);
+    };
+    let mut latency = crate::latency::LatencyMetricAggregates::default();
+    let received_at = now();
+    for report in &fresh_reports {
+        latency.extend(&report.latency_results, received_at);
+    }
+    traffic.extend(&fresh_reports, configured_reset_day);
+    save_reports_with_history(
+        db,
+        server_id,
+        &fresh_reports,
+        &history,
+        aggregate.sample_count(),
+        &traffic,
+        &latency,
+    )
+    .await?;
+    Ok(Some(history))
 }
 
 pub async fn save_reports_with_history(
@@ -1065,6 +1098,7 @@ pub async fn save_reports_with_history(
     server_id: &str,
     reports: &[AgentReport],
     history_point: &HistoryPoint,
+    sample_count: i64,
     traffic: &TrafficCounterState,
     latency: &crate::latency::LatencyMetricAggregates,
 ) -> Result<()> {
@@ -1089,27 +1123,49 @@ pub async fn save_reports_with_history(
           net_in, net_out, net_rx_total, net_tx_total, processes,
           tcp_connections, udp_connections, gpu_usage,
           disk_read_bps, disk_write_bps, disk_read_iops, disk_write_iops,
-          disk_await_ms, disk_utilization, latest_timestamp, latest_json, latency_json
+          disk_await_ms, disk_utilization, sample_count,
+          latest_timestamp, latest_json, latency_json
         ) VALUES (
           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
           ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
-          ?27, ?28, ?29
+          ?27, ?28, ?29, ?30
         ) ON CONFLICT(server_id, timestamp) DO UPDATE SET
-          cpu=excluded.cpu, load1=excluded.load1, load5=excluded.load5,
-          load15=excluded.load15, mem_used=excluded.mem_used,
-          mem_total=excluded.mem_total, swap_used=excluded.swap_used,
+          cpu=(metric_history.cpu * metric_history.sample_count +
+            excluded.cpu * excluded.sample_count) /
+            (metric_history.sample_count + excluded.sample_count),
+          load1=(metric_history.load1 * metric_history.sample_count +
+            excluded.load1 * excluded.sample_count) /
+            (metric_history.sample_count + excluded.sample_count),
+          load5=(metric_history.load5 * metric_history.sample_count +
+            excluded.load5 * excluded.sample_count) /
+            (metric_history.sample_count + excluded.sample_count),
+          load15=(metric_history.load15 * metric_history.sample_count +
+            excluded.load15 * excluded.sample_count) /
+            (metric_history.sample_count + excluded.sample_count),
+          mem_used=CAST((metric_history.mem_used * metric_history.sample_count +
+            excluded.mem_used * excluded.sample_count) /
+            (metric_history.sample_count + excluded.sample_count) AS INTEGER),
+          mem_total=excluded.mem_total,
+          swap_used=CAST((metric_history.swap_used * metric_history.sample_count +
+            excluded.swap_used * excluded.sample_count) /
+            (metric_history.sample_count + excluded.sample_count) AS INTEGER),
           swap_total=excluded.swap_total, disk_used=excluded.disk_used,
-          disk_total=excluded.disk_total, net_in=excluded.net_in,
-          net_out=excluded.net_out, net_rx_total=excluded.net_rx_total,
-          net_tx_total=excluded.net_tx_total, processes=excluded.processes,
-          tcp_connections=excluded.tcp_connections,
-          udp_connections=excluded.udp_connections, gpu_usage=excluded.gpu_usage,
-          disk_read_bps=excluded.disk_read_bps,
-          disk_write_bps=excluded.disk_write_bps,
-          disk_read_iops=excluded.disk_read_iops,
-          disk_write_iops=excluded.disk_write_iops,
-          disk_await_ms=excluded.disk_await_ms,
-          disk_utilization=excluded.disk_utilization,
+          disk_total=excluded.disk_total,
+          net_in=MAX(metric_history.net_in, excluded.net_in),
+          net_out=MAX(metric_history.net_out, excluded.net_out),
+          net_rx_total=excluded.net_rx_total,
+          net_tx_total=excluded.net_tx_total,
+          processes=MAX(metric_history.processes, excluded.processes),
+          tcp_connections=MAX(metric_history.tcp_connections, excluded.tcp_connections),
+          udp_connections=MAX(metric_history.udp_connections, excluded.udp_connections),
+          gpu_usage=excluded.gpu_usage,
+          disk_read_bps=MAX(metric_history.disk_read_bps, excluded.disk_read_bps),
+          disk_write_bps=MAX(metric_history.disk_write_bps, excluded.disk_write_bps),
+          disk_read_iops=MAX(metric_history.disk_read_iops, excluded.disk_read_iops),
+          disk_write_iops=MAX(metric_history.disk_write_iops, excluded.disk_write_iops),
+          disk_await_ms=MAX(metric_history.disk_await_ms, excluded.disk_await_ms),
+          disk_utilization=MAX(metric_history.disk_utilization, excluded.disk_utilization),
+          sample_count=metric_history.sample_count + excluded.sample_count,
           latest_timestamp=MAX(metric_history.latest_timestamp, excluded.latest_timestamp),
           latest_json=CASE
             WHEN excluded.latest_timestamp >= metric_history.latest_timestamp THEN excluded.latest_json
@@ -1117,17 +1173,57 @@ pub async fn save_reports_with_history(
           latency_json=CASE
             WHEN json_array_length(excluded.latency_json) = 0 THEN metric_history.latency_json
             ELSE (
-              SELECT json_group_array(json(item)) FROM (
-                SELECT value AS item FROM json_each(excluded.latency_json)
+              WITH latency_rows AS (
+                SELECT
+                  json_extract(value, '$.task_id') AS task_id,
+                  CAST(json_extract(value, '$.timestamp') AS INTEGER) AS timestamp,
+                  CAST(json_extract(value, '$.latency_ms') AS REAL) AS latency_ms,
+                  CAST(json_extract(value, '$.packet_loss') AS REAL) AS packet_loss,
+                  CAST(json_extract(value, '$.sample_count') AS INTEGER) AS sample_count,
+                  CAST(json_extract(value, '$.success_count') AS INTEGER) AS success_count,
+                  CAST(json_extract(value, '$.latest_timestamp') AS INTEGER) AS latest_timestamp,
+                  CAST(json_extract(value, '$.latest_latency_ms') AS REAL) AS latest_latency_ms,
+                  CAST(json_extract(value, '$.latest_packet_loss') AS REAL) AS latest_packet_loss
+                FROM json_each(metric_history.latency_json)
                 UNION ALL
-                SELECT previous.value AS item FROM json_each(metric_history.latency_json) previous
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM json_each(excluded.latency_json) current
-                  WHERE json_extract(current.value, '$.task_id') =
-                    json_extract(previous.value, '$.task_id')
-                )
-              )
-            ) END"#,
+                SELECT
+                  json_extract(value, '$.task_id'),
+                  CAST(json_extract(value, '$.timestamp') AS INTEGER),
+                  CAST(json_extract(value, '$.latency_ms') AS REAL),
+                  CAST(json_extract(value, '$.packet_loss') AS REAL),
+                  CAST(json_extract(value, '$.sample_count') AS INTEGER),
+                  CAST(json_extract(value, '$.success_count') AS INTEGER),
+                  CAST(json_extract(value, '$.latest_timestamp') AS INTEGER),
+                  CAST(json_extract(value, '$.latest_latency_ms') AS REAL),
+                  CAST(json_extract(value, '$.latest_packet_loss') AS REAL)
+                FROM json_each(excluded.latency_json)
+              ), latency_ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                  PARTITION BY task_id ORDER BY latest_timestamp DESC
+                ) AS latest_position
+                FROM latency_rows
+              ), latency_tasks AS (
+                SELECT task_id, MAX(timestamp) AS timestamp,
+                  CASE WHEN SUM(success_count) > 0
+                    THEN SUM(latency_ms * success_count) / SUM(success_count)
+                    ELSE -1 END AS latency_ms,
+                  SUM(packet_loss * sample_count) / SUM(sample_count) AS packet_loss,
+                  SUM(sample_count) AS sample_count,
+                  SUM(success_count) AS success_count,
+                  MAX(CASE WHEN latest_position = 1 THEN latest_timestamp END) AS latest_timestamp,
+                  MAX(CASE WHEN latest_position = 1 THEN latest_latency_ms END) AS latest_latency_ms,
+                  MAX(CASE WHEN latest_position = 1 THEN latest_packet_loss END) AS latest_packet_loss
+                FROM latency_ranked GROUP BY task_id
+              ) SELECT json_group_array(json_object(
+                'task_id', task_id, 'timestamp', timestamp,
+                'latency_ms', latency_ms, 'packet_loss', packet_loss,
+                'sample_count', sample_count, 'success_count', success_count,
+                'latest_timestamp', latest_timestamp,
+                'latest_latency_ms', latest_latency_ms,
+                'latest_packet_loss', latest_packet_loss
+              )) FROM (SELECT * FROM latency_tasks ORDER BY task_id)
+            ) END
+          WHERE excluded.latest_timestamp > metric_history.latest_timestamp"#,
     )
     .bind(&[
         text(server_id),
@@ -1144,8 +1240,8 @@ pub async fn save_reports_with_history(
         number(history_point.disk_total),
         number(history_point.net_in),
         number(history_point.net_out),
-        number(history_point.net_rx_total),
-        number(history_point.net_tx_total),
+        number(traffic.used_rx),
+        number(traffic.used_tx),
         number(history_point.processes),
         number(history_point.tcp_connections),
         number(history_point.udp_connections),
@@ -1156,6 +1252,7 @@ pub async fn save_reports_with_history(
         number(history_point.disk_write_iops),
         number(history_point.disk_await_ms),
         number(history_point.disk_utilization),
+        number(sample_count.max(1)),
         number(latest_timestamp),
         text(&latest_json),
         text(&latency_json),
@@ -1563,21 +1660,28 @@ pub async fn cleanup_history(db: &D1Database, retention_days: i64) -> Result<()>
         ), metrics AS (
           SELECT
             server_id, bucket,
-            AVG(cpu) AS cpu, AVG(load1) AS load1, AVG(load5) AS load5,
-            AVG(load15) AS load15, CAST(AVG(mem_used) AS INTEGER) AS mem_used,
-            MAX(mem_total) AS mem_total, CAST(AVG(swap_used) AS INTEGER) AS swap_used,
-            MAX(swap_total) AS swap_total, CAST(AVG(disk_used) AS INTEGER) AS disk_used,
+            SUM(cpu * sample_count) / SUM(sample_count) AS cpu,
+            SUM(load1 * sample_count) / SUM(sample_count) AS load1,
+            SUM(load5 * sample_count) / SUM(sample_count) AS load5,
+            SUM(load15 * sample_count) / SUM(sample_count) AS load15,
+            CAST(SUM(mem_used * sample_count) / SUM(sample_count) AS INTEGER) AS mem_used,
+            MAX(mem_total) AS mem_total,
+            CAST(SUM(swap_used * sample_count) / SUM(sample_count) AS INTEGER) AS swap_used,
+            MAX(swap_total) AS swap_total,
+            CAST(SUM(disk_used * sample_count) / SUM(sample_count) AS INTEGER) AS disk_used,
             MAX(disk_total) AS disk_total, MAX(net_in) AS net_in, MAX(net_out) AS net_out,
             MAX(net_rx_total) AS net_rx_total, MAX(net_tx_total) AS net_tx_total,
             CAST(MAX(processes) AS INTEGER) AS processes,
             CAST(MAX(tcp_connections) AS INTEGER) AS tcp_connections,
             CAST(MAX(udp_connections) AS INTEGER) AS udp_connections,
-            AVG(gpu_usage) AS gpu_usage, MAX(disk_read_bps) AS disk_read_bps,
+            SUM(gpu_usage * sample_count) / SUM(sample_count) AS gpu_usage,
+            MAX(disk_read_bps) AS disk_read_bps,
             MAX(disk_write_bps) AS disk_write_bps,
             MAX(disk_read_iops) AS disk_read_iops,
             MAX(disk_write_iops) AS disk_write_iops,
             MAX(disk_await_ms) AS disk_await_ms,
             MAX(disk_utilization) AS disk_utilization,
+            SUM(sample_count) AS sample_count,
             MAX(CASE WHEN latest_position = 1 THEN latest_timestamp END) AS latest_timestamp,
             MAX(CASE WHEN latest_position = 1 THEN latest_json END) AS latest_json
           FROM ranked GROUP BY server_id, bucket
@@ -1586,6 +1690,8 @@ pub async fn cleanup_history(db: &D1Database, retention_days: i64) -> Result<()>
             json_extract(j.value, '$.task_id') AS task_id,
             CAST(json_extract(j.value, '$.latency_ms') AS REAL) AS latency_ms,
             CAST(json_extract(j.value, '$.packet_loss') AS REAL) AS packet_loss,
+            CAST(json_extract(j.value, '$.sample_count') AS INTEGER) AS sample_count,
+            CAST(json_extract(j.value, '$.success_count') AS INTEGER) AS success_count,
             CAST(json_extract(j.value, '$.latest_timestamp') AS INTEGER) AS latest_timestamp,
             CAST(json_extract(j.value, '$.latest_latency_ms') AS REAL) AS latest_latency_ms,
             CAST(json_extract(j.value, '$.latest_packet_loss') AS REAL) AS latest_packet_loss,
@@ -1597,9 +1703,12 @@ pub async fn cleanup_history(db: &D1Database, retention_days: i64) -> Result<()>
           WHERE h.timestamp >= ?1 AND h.timestamp < ?2
         ), latency_tasks AS (
           SELECT server_id, bucket, task_id,
-            CASE WHEN SUM(CASE WHEN latency_ms >= 0 THEN 1 ELSE 0 END) > 0
-              THEN AVG(CASE WHEN latency_ms >= 0 THEN latency_ms END) ELSE -1 END AS latency_ms,
-            AVG(packet_loss) AS packet_loss,
+            CASE WHEN SUM(success_count) > 0
+              THEN SUM(latency_ms * success_count) / SUM(success_count)
+              ELSE -1 END AS latency_ms,
+            SUM(packet_loss * sample_count) / SUM(sample_count) AS packet_loss,
+            SUM(sample_count) AS sample_count,
+            SUM(success_count) AS success_count,
             MAX(CASE WHEN latest_position = 1 THEN latest_timestamp END) AS latest_timestamp,
             MAX(CASE WHEN latest_position = 1 THEN latest_latency_ms END) AS latest_latency_ms,
             MAX(CASE WHEN latest_position = 1 THEN latest_packet_loss END) AS latest_packet_loss
@@ -1608,6 +1717,7 @@ pub async fn cleanup_history(db: &D1Database, retention_days: i64) -> Result<()>
           SELECT server_id, bucket, json_group_array(json_object(
             'task_id', task_id, 'timestamp', bucket,
             'latency_ms', latency_ms, 'packet_loss', packet_loss,
+            'sample_count', sample_count, 'success_count', success_count,
             'latest_timestamp', latest_timestamp,
             'latest_latency_ms', latest_latency_ms,
             'latest_packet_loss', latest_packet_loss
@@ -1618,14 +1728,15 @@ pub async fn cleanup_history(db: &D1Database, retention_days: i64) -> Result<()>
           swap_used, swap_total, disk_used, disk_total, net_in, net_out,
           net_rx_total, net_tx_total, processes, tcp_connections, udp_connections,
           gpu_usage, disk_read_bps, disk_write_bps, disk_read_iops, disk_write_iops,
-          disk_await_ms, disk_utilization, latest_timestamp, latest_json, latency_json
+          disk_await_ms, disk_utilization, sample_count,
+          latest_timestamp, latest_json, latency_json
         ) SELECT
           m.server_id, m.bucket, m.cpu, m.load1, m.load5, m.load15, m.mem_used,
           m.mem_total, m.swap_used, m.swap_total, m.disk_used, m.disk_total,
           m.net_in, m.net_out, m.net_rx_total, m.net_tx_total, m.processes,
           m.tcp_connections, m.udp_connections, m.gpu_usage, m.disk_read_bps,
           m.disk_write_bps, m.disk_read_iops, m.disk_write_iops, m.disk_await_ms,
-          m.disk_utilization, m.latest_timestamp, m.latest_json,
+          m.disk_utilization, m.sample_count, m.latest_timestamp, m.latest_json,
           COALESCE(l.latency_json, '[]')
         FROM metrics m LEFT JOIN latency_packed l
           ON l.server_id = m.server_id AND l.bucket = m.bucket
@@ -1642,6 +1753,7 @@ pub async fn cleanup_history(db: &D1Database, retention_days: i64) -> Result<()>
           disk_read_bps=excluded.disk_read_bps, disk_write_bps=excluded.disk_write_bps,
           disk_read_iops=excluded.disk_read_iops, disk_write_iops=excluded.disk_write_iops,
           disk_await_ms=excluded.disk_await_ms, disk_utilization=excluded.disk_utilization,
+          sample_count=excluded.sample_count,
           latest_timestamp=excluded.latest_timestamp, latest_json=excluded.latest_json,
           latency_json=excluded.latency_json"#,
         )
@@ -2010,6 +2122,7 @@ mod tests {
         aggregate.extend(&reports[1..]);
         let point = aggregate.point().unwrap();
 
+        assert_eq!(aggregate.sample_count(), 2);
         assert_eq!(point.timestamp, 120);
         assert_eq!(point.cpu, 20.0);
         assert_eq!(point.mem_used, 200);
@@ -2027,5 +2140,27 @@ mod tests {
         assert_eq!(point.disk_utilization, 20.0);
         assert_eq!(point.net_rx_total, 2_000);
         assert_eq!(point.net_tx_total, 3_000);
+    }
+
+    #[test]
+    fn excludes_reports_already_persisted() {
+        let reports = [
+            AgentReport {
+                timestamp: 99,
+                ..AgentReport::default()
+            },
+            AgentReport {
+                timestamp: 100,
+                ..AgentReport::default()
+            },
+            AgentReport {
+                timestamp: 101,
+                ..AgentReport::default()
+            },
+        ];
+
+        let fresh = super::reports_after(&reports, 100);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].timestamp, 101);
     }
 }

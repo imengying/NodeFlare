@@ -219,7 +219,8 @@ install_agent() {
     "ReadWritePaths=$INSTALL_DIR" \
     '' \
     '[Install]' \
-      'WantedBy=multi-user.target' > "$SERVICE_FILE"
+    'WantedBy=multi-user.target' > "$SERVICE_FILE"
+    chmod 600 "$SERVICE_FILE"
     systemctl daemon-reload
     systemctl enable --now "$SERVICE_NAME"
     systemctl is-active --quiet "$SERVICE_NAME" || {
@@ -236,7 +237,7 @@ install_agent() {
       "supervisor=\"supervise-daemon\"" \
       "respawn_delay=10" \
       'depend() { need net; }' > "$OPENRC_FILE"
-    chmod 755 "$OPENRC_FILE"
+    chmod 700 "$OPENRC_FILE"
     rc-update add "$SERVICE_NAME" default
     rc-service "$SERVICE_NAME" restart
     rc-service "$SERVICE_NAME" status >/dev/null || {
