@@ -2,6 +2,7 @@ export interface Config {
   site_name: string;
   site_description: string;
   site_announcement: string;
+  logo_url: string;
   favicon_url: string;
   locale: "zh-CN" | "en";
   public_dashboard: boolean;

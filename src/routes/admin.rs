@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use worker::{console_error, console_warn, Method, Request, Response, Result, Url};
+use worker::{console_error, console_warn, Method, Request, Response, Result};
 
 use crate::auth::{
     create_admin_jwt, create_theme_preview_proof, hash_password, random_salt, sha256_hex,
@@ -11,9 +11,10 @@ use crate::models::{
 };
 use crate::routes::{RouteContext, RouteOutcome};
 use crate::{
-    cloudflare, db, error, exchange, json, latency, live, no_content, notify, now, request_json,
-    server_id, settings_for_admin_response, submitted_secret, theme, valid_cloudflare_account_id,
-    valid_cloudflare_api_token, valid_password_derived, validate_alert_rule, validate_latency_task,
+    cloudflare, db, env_secret_text, error, exchange, json, latency, live, no_content, notify, now,
+    request_json, server_id, settings_for_admin_response, submitted_secret, theme,
+    valid_background_urls, valid_cloudflare_account_id, valid_cloudflare_api_token,
+    valid_password_derived, valid_public_asset_url, validate_alert_rule, validate_latency_task,
     validate_server, validate_theme, API_JSON_MAX_BYTES,
 };
 
@@ -555,20 +556,12 @@ async fn exchange_rates_refresh(ctx: &RouteContext) -> Result<Response> {
 
 async fn cloudflare_usage(ctx: &RouteContext) -> Result<Response> {
     let account_id = if ctx.settings.cloudflare_account_id.trim().is_empty() {
-        ctx.env
-            .secret("CF_USAGE_ACCOUNT_ID")
-            .or_else(|_| ctx.env.var("CF_USAGE_ACCOUNT_ID"))
-            .map(|value| value.to_string())
-            .unwrap_or_default()
+        env_secret_text(&ctx.env, "CF_USAGE_ACCOUNT_ID")
     } else {
         ctx.settings.cloudflare_account_id.clone()
     };
     let token = if ctx.settings.cloudflare_api_token.trim().is_empty() {
-        ctx.env
-            .secret("CF_USAGE_API_TOKEN")
-            .or_else(|_| ctx.env.var("CF_USAGE_API_TOKEN"))
-            .map(|value| value.to_string())
-            .unwrap_or_default()
+        env_secret_text(&ctx.env, "CF_USAGE_API_TOKEN")
     } else {
         ctx.settings.cloudflare_api_token.clone()
     };
@@ -625,6 +618,13 @@ async fn settings_patch(req: &mut Request, ctx: &RouteContext) -> Result<Respons
         return error("站点公告不能超过 1000 个字符", 400);
     }
     if input
+        .logo_url
+        .as_deref()
+        .is_some_and(|value| !valid_public_asset_url(value))
+    {
+        return error("站点 Logo 必须使用 HTTPS 地址", 400);
+    }
+    if input
         .default_theme
         .as_deref()
         .is_some_and(|value| !matches!(value, "system" | "light" | "dark"))
@@ -639,10 +639,13 @@ async fn settings_patch(req: &mut Request, ctx: &RouteContext) -> Result<Respons
     }
     if input
         .background_url
-        .as_ref()
-        .is_some_and(|value| value.chars().count() > 1000)
+        .as_deref()
+        .is_some_and(|value| !valid_background_urls(value))
     {
-        return error("背景地址过长", 400);
+        return error(
+            "背景地址无效：请使用 HTTPS 地址，浅色和深色可用 | 分隔",
+            400,
+        );
     }
     if input.theme_options.as_ref().is_some_and(|value| {
         let Some(options) = value.as_object() else {
@@ -751,12 +754,11 @@ async fn settings_patch(req: &mut Request, ctx: &RouteContext) -> Result<Respons
     {
         return error("界面语言仅支持简体中文或 English", 400);
     }
-    if input.favicon_url.as_deref().is_some_and(|value| {
-        !value.trim().is_empty()
-            && Url::parse(value.trim())
-                .ok()
-                .is_none_or(|url| url.scheme() != "https")
-    }) {
+    if input
+        .favicon_url
+        .as_deref()
+        .is_some_and(|value| !valid_public_asset_url(value))
+    {
         return error("站点图标必须使用 HTTPS 地址", 400);
     }
     let password_hash = if input

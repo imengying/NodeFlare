@@ -34,12 +34,14 @@ function loadScript() {
 
 export function TurnstileWidget({
   siteKey,
+  action,
   theme,
   resetKey,
   onVerify,
   onError,
 }: {
   siteKey: string;
+  action: "admin-login" | "public-dashboard";
   theme: "light" | "dark";
   resetKey?: number;
   onVerify: (token: string) => void;
@@ -61,6 +63,7 @@ export function TurnstileWidget({
       target.current.replaceChildren();
       widgetId.current = window.turnstile.render(target.current, {
         sitekey: siteKey,
+        action,
         theme,
         size: "flexible",
         callback: (token: string) => {
@@ -79,7 +82,7 @@ export function TurnstileWidget({
       if (widgetId.current && window.turnstile) window.turnstile.remove(widgetId.current);
       widgetId.current = "";
     };
-  }, [siteKey, theme, resetKey]);
+  }, [action, siteKey, theme, resetKey]);
 
   const testing = siteKey.startsWith("1x00000000000000000000");
   return <div className={`turnstile-widget${verified ? " verified" : ""}${testing ? " testing" : ""}`} ref={target} />;

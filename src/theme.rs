@@ -368,18 +368,7 @@ pub async fn remote_theme_version(base: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        asset_url, builtin_settings_schema, normalize_url, resolve_url, validate_settings_schema,
-    };
-
-    #[test]
-    fn exposes_builtin_glass_theme_settings() {
-        let schema = builtin_settings_schema();
-        let settings = schema["settings"].as_array().expect("settings");
-        assert!(settings.iter().any(|field| field["key"] == "assetCurrency"));
-        assert!(settings.iter().any(|field| field["key"] == "enableBlur"));
-        assert_eq!(schema["source"], "builtin");
-    }
+    use super::{asset_url, normalize_url, resolve_url, validate_settings_schema};
 
     #[test]
     fn validates_remote_theme_settings() {

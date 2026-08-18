@@ -15,6 +15,13 @@ use crate::{
     set_admin_session_cookie, store_history_response, API_JSON_MAX_BYTES,
 };
 
+fn request_hostname(req: &Request) -> Option<String> {
+    req.url()
+        .ok()?
+        .host_str()
+        .map(|hostname| hostname.to_string())
+}
+
 pub(crate) async fn route(mut req: Request, ctx: &RouteContext) -> Result<RouteOutcome> {
     let method = req.method();
     let path = req.path();
@@ -76,6 +83,7 @@ fn config_value(ctx: &RouteContext) -> serde_json::Value {
         "site_name": settings.site_name,
         "site_description": settings.site_description,
         "site_announcement": settings.site_announcement,
+        "logo_url": settings.logo_url,
         "favicon_url": settings.favicon_url,
         "locale": settings.locale,
         "public_dashboard": settings.public_dashboard,
@@ -181,10 +189,15 @@ async fn admin_login(req: &mut Request, ctx: &RouteContext) -> Result<Response> 
     }
     let login_turnstile_enabled = ctx.public_turnstile_enabled || ctx.login_protection_enabled;
     if login_turnstile_enabled {
+        let Some(hostname) = request_hostname(req) else {
+            return error("请求主机名无效", 400);
+        };
         let verified = turnstile::verify(
             &input.turnstile_token,
             &ctx.turnstile_secret_key,
             client_ip(req).as_deref(),
+            &hostname,
+            turnstile::ADMIN_LOGIN_ACTION,
         )
         .await
         .unwrap_or(false);
@@ -229,10 +242,15 @@ async fn turnstile_verify(req: &mut Request, ctx: &RouteContext) -> Result<Respo
             Ok(value) => value,
             Err(_) => return error("验证请求格式无效", 400),
         };
+    let Some(hostname) = request_hostname(req) else {
+        return error("请求主机名无效", 400);
+    };
     let verified = turnstile::verify(
         &input.token,
         &ctx.turnstile_secret_key,
         client_ip(req).as_deref(),
+        &hostname,
+        turnstile::PUBLIC_DASHBOARD_ACTION,
     )
     .await
     .unwrap_or(false);

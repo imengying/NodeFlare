@@ -2,6 +2,7 @@ import { KeyRound, Megaphone, Moon, Search, Sun, UserCircle } from "lucide-react
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, ApiError, setToken } from "./api";
 import { NodeCard } from "./components/NodeCard";
+import { SiteLogo } from "./components/SiteLogo";
 import { StatsBar } from "./components/StatsBar";
 import { TurnstileWidget } from "./components/TurnstileWidget";
 import { demoConfig, demoExchangeRates, demoServers } from "./demo";
@@ -279,8 +280,8 @@ export default function App() {
       link.rel = "icon";
       document.head.append(link);
     }
-    link.href = config.favicon_url || "/logo.svg";
-  }, [config.favicon_url]);
+    link.href = config.favicon_url || config.logo_url || "/logo.svg";
+  }, [config.favicon_url, config.logo_url]);
 
   useEffect(() => {
     const media = matchMedia("(prefers-color-scheme: dark)");
@@ -446,7 +447,7 @@ export default function App() {
       <div className="theme-background" style={background ? { backgroundImage: `url(${JSON.stringify(background)})`, opacity: 1 } : undefined} />
       <header className="site-header">
         <div className="container header-inner">
-          <div className="brand"><img src="/logo.svg" alt="" width="36" height="36" /><strong>{config.site_name}</strong></div>
+          <div className="brand"><SiteLogo src={config.logo_url} alt="" width="36" height="36" /><strong>{config.site_name}</strong></div>
           <div className="header-actions">
             <button className="icon-btn" onClick={toggleTheme} title={dark ? ui(config.locale, "浅色主题", "Light theme") : ui(config.locale, "深色主题", "Dark theme")}>{dark ? <Sun size={18} /> : <Moon size={18} />}</button>
             <button className="icon-btn" onClick={openAdmin} title={ui(config.locale, "进入后台", "Administration")}><UserCircle size={18} /></button>
@@ -458,21 +459,21 @@ export default function App() {
         {config.site_announcement ? <div className="site-announcement"><Megaphone size={16} /><span>{config.site_announcement}</span></div> : null}
         {needsLogin ? (
           <section className="dashboard-login-gate glass-panel">
-            <img src="/logo.svg" alt="" width="46" height="46" />
+            <SiteLogo src={config.logo_url} alt="" width="46" height="46" />
             <div className="dashboard-login-copy"><h1>{ui(config.locale, "登录仪表盘", "Sign in to dashboard")}</h1><p>{ui(config.locale, "此仪表盘仅限登录后访问", "This dashboard requires an administrator sign-in")}</p></div>
             <form className="dashboard-login-form" onSubmit={(event) => void loginDashboard(event)}>
               <label><span>{ui(config.locale, "用户名", "Username")}</span><input autoFocus autoComplete="username" value={loginUsername} onChange={(event) => setLoginUsername(event.target.value)} required /></label>
               <label><span>{ui(config.locale, "密码", "Password")}</span><input type="password" autoComplete="current-password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} required /></label>
-              {config.turnstile_login_enabled ? <div className="dashboard-login-turnstile"><TurnstileWidget siteKey={config.turnstile_site_key} theme={dark ? "dark" : "light"} resetKey={loginTurnstileReset} onVerify={setLoginTurnstileToken} onError={setError} /></div> : null}
+              {config.turnstile_login_enabled ? <div className="dashboard-login-turnstile"><TurnstileWidget siteKey={config.turnstile_site_key} action="admin-login" theme={dark ? "dark" : "light"} resetKey={loginTurnstileReset} onVerify={setLoginTurnstileToken} onError={setError} /></div> : null}
               {error ? <p className="form-error">{error}</p> : null}
               <button className="primary-btn dashboard-login-submit" disabled={loginBusy || (config.turnstile_login_enabled && !loginTurnstileToken)} type="submit"><KeyRound size={16} />{loginBusy ? ui(config.locale, "登录中", "Signing in") : ui(config.locale, "登录", "Sign in")}</button>
             </form>
           </section>
         ) : needsVerification ? (
           <section className="verification-gate">
-            <img src="/logo.svg" alt="" width="52" height="52" />
+            <SiteLogo src={config.logo_url} alt="" width="52" height="52" />
             <div><h1>{ui(config.locale, "访问验证", "Access verification")}</h1><p>{config.site_name}</p></div>
-            {config.turnstile_site_key ? <TurnstileWidget siteKey={config.turnstile_site_key} theme={dark ? "dark" : "light"} onVerify={(token) => void verifyDashboard(token)} onError={setError} /> : <p className="form-error">{ui(config.locale, "Turnstile 尚未正确配置", "Turnstile is not configured")}</p>}
+            {config.turnstile_site_key ? <TurnstileWidget siteKey={config.turnstile_site_key} action="public-dashboard" theme={dark ? "dark" : "light"} onVerify={(token) => void verifyDashboard(token)} onError={setError} /> : <p className="form-error">{ui(config.locale, "Turnstile 尚未正确配置", "Turnstile is not configured")}</p>}
             {verificationBusy ? <span className="verification-status">{ui(config.locale, "正在验证", "Verifying")}</span> : null}
             {error ? <p className="form-error">{error}</p> : null}
           </section>

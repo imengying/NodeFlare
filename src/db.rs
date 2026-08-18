@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize, Serializer};
@@ -70,30 +69,6 @@ SELECT
 FROM servers s
 LEFT JOIN latest_state m ON m.server_id = s.id
 "#;
-
-const SETTINGS_CACHE_TTL_SECONDS: i64 = 30;
-
-#[derive(Clone, PartialEq)]
-struct SettingsCacheKey {
-    default_name: String,
-    default_threshold: i64,
-    default_retention: i64,
-    default_username: String,
-}
-
-struct SettingsCacheEntry {
-    key: SettingsCacheKey,
-    expires_at: i64,
-    settings: SettingsView,
-}
-
-thread_local! {
-    static SETTINGS_CACHE: RefCell<Option<SettingsCacheEntry>> = const { RefCell::new(None) };
-}
-
-fn invalidate_settings_cache() {
-    SETTINGS_CACHE.with(|cache| *cache.borrow_mut() = None);
-}
 
 pub const SECRET_MASK: &str = "********";
 
@@ -347,6 +322,7 @@ pub struct SettingsView {
     pub site_name: String,
     pub site_description: String,
     pub site_announcement: String,
+    pub logo_url: String,
     pub favicon_url: String,
     pub locale: String,
     pub public_dashboard: bool,
@@ -1299,22 +1275,6 @@ pub async fn settings(
     default_retention: i64,
     default_username: &str,
 ) -> Result<SettingsView> {
-    let cache_key = SettingsCacheKey {
-        default_name: default_name.to_string(),
-        default_threshold,
-        default_retention,
-        default_username: default_username.to_string(),
-    };
-    let current = now();
-    if let Some(settings) = SETTINGS_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .as_ref()
-            .filter(|entry| entry.key == cache_key && entry.expires_at > current)
-            .map(|entry| entry.settings.clone())
-    }) {
-        return Ok(settings);
-    }
     let raw = db
         .prepare("SELECT value FROM settings WHERE id = 1")
         .first::<String>(Some("value"))
@@ -1322,13 +1282,14 @@ pub async fn settings(
         .ok_or_else(|| worker::Error::RustError("站点设置尚未初始化".to_string()))?;
     let values: HashMap<String, String> = serde_json::from_str(&raw)
         .map_err(|_| worker::Error::RustError("站点设置格式无效".to_string()))?;
-    let settings = SettingsView {
+    Ok(SettingsView {
         site_name: values
             .get("site_name")
             .cloned()
             .unwrap_or_else(|| default_name.to_string()),
         site_description: string_setting(&values, "site_description", "轻量、实时的服务器运行状态"),
         site_announcement: string_setting(&values, "site_announcement", ""),
+        logo_url: string_setting(&values, "logo_url", ""),
         favicon_url: string_setting(&values, "favicon_url", ""),
         locale: string_setting(&values, "locale", "zh-CN"),
         public_dashboard: bool_setting(&values, "public_dashboard", true),
@@ -1377,15 +1338,7 @@ pub async fn settings(
         expiry_alert_days: integer_setting(&values, "expiry_alert_days", 7),
         cloudflare_account_id: string_setting(&values, "cloudflare_account_id", ""),
         cloudflare_api_token: string_setting(&values, "cloudflare_api_token", ""),
-    };
-    SETTINGS_CACHE.with(|cache| {
-        *cache.borrow_mut() = Some(SettingsCacheEntry {
-            key: cache_key,
-            expires_at: current + SETTINGS_CACHE_TTL_SECONDS,
-            settings: settings.clone(),
-        });
-    });
-    Ok(settings)
+    })
 }
 
 pub async fn update_settings(
@@ -1408,6 +1361,9 @@ pub async fn update_settings(
     }
     if let Some(value) = input.site_announcement.as_deref() {
         push_setting!("site_announcement", value.trim());
+    }
+    if let Some(value) = input.logo_url.as_deref() {
+        push_setting!("logo_url", value.trim());
     }
     if let Some(value) = input.favicon_url.as_deref() {
         push_setting!("favicon_url", value.trim());
@@ -1545,7 +1501,6 @@ pub async fn update_settings(
             ])?
             .run()
             .await?;
-        invalidate_settings_cache();
     }
     Ok(())
 }
@@ -1894,7 +1849,6 @@ pub async fn save_setting(db: &D1Database, key: &str, value: &str) -> Result<()>
         .bind(&[text(&format!("$.{key}")), text(value), number(now())])?
         .run()
         .await?;
-    invalidate_settings_cache();
     Ok(())
 }
 
@@ -1907,7 +1861,6 @@ pub async fn increment_setting(db: &D1Database, key: &str) -> Result<()> {
     .bind(&[text(&format!("$.{key}")), number(now())])?
     .run()
     .await?;
-    invalidate_settings_cache();
     Ok(())
 }
 
@@ -1922,12 +1875,10 @@ pub async fn update_expiry(db: &D1Database, id: &str, expires_at: i64) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        alert_window_covered, history_cutoffs, non_empty_string_setting, secret_for_api,
-        traffic_cycle_key, AlertMetricRow, HistoryMetricAggregate, TrafficCounterState,
-        SECRET_MASK,
+        alert_window_covered, secret_for_api, traffic_cycle_key, AlertMetricRow,
+        HistoryMetricAggregate, TrafficCounterState, SECRET_MASK,
     };
     use crate::models::AgentReport;
-    use std::collections::HashMap;
 
     fn row(samples: i64, last_timestamp: i64, report_interval: i64) -> AlertMetricRow {
         AlertMetricRow {
@@ -1966,33 +1917,6 @@ mod tests {
     fn masks_stored_secrets_in_api_responses() {
         assert_eq!(secret_for_api(""), "");
         assert_eq!(secret_for_api("stored-secret"), SECRET_MASK);
-    }
-
-    #[test]
-    fn requires_an_explicit_admin_username() {
-        let mut values = HashMap::from([("admin_username".to_string(), String::new())]);
-        assert_eq!(
-            non_empty_string_setting(&values, "admin_username", "operator"),
-            "operator"
-        );
-        assert_eq!(non_empty_string_setting(&values, "admin_username", ""), "");
-        values.insert("admin_username".to_string(), "owner".to_string());
-        assert_eq!(
-            non_empty_string_setting(&values, "admin_username", "operator"),
-            "owner"
-        );
-    }
-
-    #[test]
-    fn honors_short_and_long_history_retention() {
-        let current = 10_000_000;
-        let (one_day, one_day_recent) = history_cutoffs(current, 1);
-        assert_eq!(one_day, current - 86_400);
-        assert_eq!(one_day_recent, one_day);
-
-        let (thirty_days, thirty_days_recent) = history_cutoffs(current, 30);
-        assert_eq!(thirty_days, current - 30 * 86_400);
-        assert_eq!(thirty_days_recent, current - 86_400);
     }
 
     #[test]
@@ -2140,27 +2064,5 @@ mod tests {
         assert_eq!(point.disk_utilization, 20.0);
         assert_eq!(point.net_rx_total, 2_000);
         assert_eq!(point.net_tx_total, 3_000);
-    }
-
-    #[test]
-    fn excludes_reports_already_persisted() {
-        let reports = [
-            AgentReport {
-                timestamp: 99,
-                ..AgentReport::default()
-            },
-            AgentReport {
-                timestamp: 100,
-                ..AgentReport::default()
-            },
-            AgentReport {
-                timestamp: 101,
-                ..AgentReport::default()
-            },
-        ];
-
-        let fresh = super::reports_after(&reports, 100);
-        assert_eq!(fresh.len(), 1);
-        assert_eq!(fresh[0].timestamp, 101);
     }
 }

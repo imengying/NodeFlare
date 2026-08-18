@@ -37,6 +37,8 @@ import { derivePassword } from "../password";
 import { ASSET_CURRENCIES, type AdminServer, type CloudflareUsage, type Config, type DatabaseStats, type ExchangeRates, type ServerInput, type Settings, type Theme, type ThemeSettingField, type ThemeSettingsSchema, type ThemeSettingValue } from "../types";
 import { Checkbox } from "./Checkbox";
 import { TurnstileWidget } from "./TurnstileWidget";
+import { useDialog } from "./useDialog";
+import { SiteLogo } from "./SiteLogo";
 import { LatencyManager } from "./LatencyManager";
 import { AlertRuleManager } from "./AlertRuleManager";
 import { Flag } from "./Flag";
@@ -499,6 +501,8 @@ export function AdminPanel({
     }
     return `curl -fsSL ${installer}/agent.sh | sudo sh -s -- -e ${shellLiteral(origin)} -t ${shellLiteral(install.agent_token)}${shellMirror}`;
   }, [install, installPlatform]);
+  const serverDialog = useDialog<HTMLFormElement>(editing !== null, () => setEditing(null));
+  const installDialog = useDialog<HTMLElement>(Boolean(installCommand), () => setInstall(null));
 
   const toggleSelected = (id: string) => setSelectedIds((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
   const allSelected = servers.length > 0 && selectedIds.length === servers.length;
@@ -513,32 +517,33 @@ export function AdminPanel({
     setNotice("");
     setError("");
   };
+  const siteLogoUrl = settings ? settings.logo_url : config.logo_url;
 
   return (
     <div className={`admin-page ${dark ? "admin-dark" : ""}`}>
       {error ? <div className="admin-toast error" role="alert" aria-live="assertive"><CircleAlert aria-hidden="true" /><span>{error}</span></div>
         : notice ? <div className="admin-toast" role="status" aria-live="polite"><CircleCheck aria-hidden="true" /><span>{notice}</span></div> : null}
       {!authenticated ? <div className="admin-login-stage">
-        <button className="admin-back" type="button" onClick={onClose}><ArrowLeft size={14} />返回仪表盘</button>
+        <button className="admin-back" type="button" onClick={onClose}><ArrowLeft size={14} />返回</button>
         <button className="admin-login-theme" type="button" onClick={onToggleTheme} title={dark ? "切换浅色主题" : "切换深色主题"}>{dark ? <Sun size={16} /> : <Moon size={16} />}</button>
         <form className="login-form glass-panel" onSubmit={login}>
-          <img src="/logo.svg" alt="" width="48" height="48" />
+          <SiteLogo src={siteLogoUrl} alt="" width="48" height="48" />
           <div className="login-copy"><h1>管理员登录</h1></div>
           <label><span>用户名</span><input autoFocus type="text" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
           <label><span>密码</span><input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
-          {config.turnstile_login_enabled || config.turnstile_enabled ? <div className="login-turnstile"><TurnstileWidget siteKey={config.turnstile_site_key} theme={dark ? "dark" : "light"} resetKey={turnstileReset} onVerify={setTurnstileToken} onError={setError} /></div> : null}
+          {config.turnstile_login_enabled || config.turnstile_enabled ? <div className="login-turnstile"><TurnstileWidget siteKey={config.turnstile_site_key} action="admin-login" theme={dark ? "dark" : "light"} resetKey={turnstileReset} onVerify={setTurnstileToken} onError={setError} /></div> : null}
           <button className="primary-btn login-submit" disabled={busy || ((config.turnstile_login_enabled || config.turnstile_enabled) && !turnstileToken)} type="submit"><KeyRound size={16} />{busy ? "验证中" : "登录"}</button>
         </form>
       </div> : <section className="admin-shell" aria-label="管理面板">
         <header className="admin-topbar">
           <div className="admin-brand">
-            <img src="/logo.svg" alt="" width="36" height="36" />
+            <SiteLogo src={siteLogoUrl} alt="" width="36" height="36" />
             <strong>{config.site_name}</strong>
           </div>
           <div className="admin-topbar-actions">
             <button type="button" onClick={onToggleTheme} title={dark ? "切换浅色主题" : "切换深色主题"} aria-label={dark ? "切换浅色主题" : "切换深色主题"}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
-            <button type="button" onClick={onClose} title="返回前台" aria-label="返回前台"><ArrowLeft size={17} />返回前台</button>
-            <button type="button" onClick={() => void logout()} title="退出登录" aria-label="退出登录"><LogOut size={17} />退出登录</button>
+            <button type="button" onClick={onClose} title="主页" aria-label="主页"><ArrowLeft size={17} />主页</button>
+            <button type="button" onClick={() => void logout()} title="退出" aria-label="退出"><LogOut size={17} />退出</button>
           </div>
         </header>
 
@@ -605,20 +610,20 @@ export function AdminPanel({
                     <div className="form-actions"><button className="primary-btn" disabled={busy}><Plus size={16} />添加主题</button></div>
                   </form>
                 </div>
-              ) : settings ? (
+              ) : settings && tab !== "about" ? (
                 <form className="settings-form" onSubmit={saveSite}>
                   {tab === "appearance" ? <>
                     <div className="section-title"><Eye size={15} />外观与展示</div>
                     <div className="form-grid"><label><span>站点名称</span><input required value={settings.site_name} onChange={(event) => updateSettings("site_name", event.target.value)} /></label><label><span>站点描述</span><input value={settings.site_description} onChange={(event) => updateSettings("site_description", event.target.value)} /></label></div>
                     <label><span>站点公告</span><textarea rows={3} maxLength={1000} value={settings.site_announcement} onChange={(event) => updateSettings("site_announcement", event.target.value)} /></label>
-                    <div className="form-grid"><label><span>界面语言</span><select value={settings.locale} onChange={(event) => updateSettings("locale", event.target.value as Settings["locale"])}><option value="zh-CN">简体中文</option><option value="en">English</option></select></label><label><span>站点图标地址</span><input type="url" value={settings.favicon_url} onChange={(event) => updateSettings("favicon_url", event.target.value)} placeholder="https://example.com/favicon.png" /></label></div>
+                    <div className="form-grid three"><label><span>界面语言</span><select value={settings.locale} onChange={(event) => updateSettings("locale", event.target.value as Settings["locale"])}><option value="zh-CN">简体中文</option><option value="en">English</option></select></label><label><span>站点 Logo 地址</span><input type="url" maxLength={1000} value={settings.logo_url} onChange={(event) => updateSettings("logo_url", event.target.value)} placeholder="https://example.com/logo.svg" /></label><label><span>浏览器图标地址</span><input type="url" maxLength={1000} value={settings.favicon_url} onChange={(event) => updateSettings("favicon_url", event.target.value)} placeholder="https://example.com/favicon.png" /></label></div>
                     <div className="form-grid"><label><span>离线判定（秒）</span><input type="number" min="30" max="3600" value={settings.offline_threshold_seconds} onChange={(event) => updateSettings("offline_threshold_seconds", Number(event.target.value))} /></label><label><span>历史保留（天）</span><input type="number" min="1" max="365" value={settings.history_retention_days} onChange={(event) => updateSettings("history_retention_days", Number(event.target.value))} /></label></div>
                   </> : null}
 
                   {tab === "themeSettings" ? <>
                     <div className="section-title"><SlidersHorizontal size={15} />通用主题设置</div>
-                    <div className="form-grid"><label><span>默认主题</span><select value={settings.default_theme} onChange={(event) => updateSettings("default_theme", event.target.value as Settings["default_theme"])}><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label><label><span>背景图地址</span><input type="text" value={settings.background_url} onChange={(event) => updateSettings("background_url", event.target.value)} /></label></div>
-                    <p className="settings-hint">背景图可用 | 分隔浅色和深色地址，例如 light.jpg | dark.jpg。</p>
+                    <div className="form-grid"><label><span>默认主题</span><select value={settings.default_theme} onChange={(event) => updateSettings("default_theme", event.target.value as Settings["default_theme"])}><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label><label><span>背景图地址</span><input type="text" maxLength={1000} value={settings.background_url} onChange={(event) => updateSettings("background_url", event.target.value)} placeholder="https://example.com/light.webp | https://example.com/dark.webp" /></label></div>
+                    <p className="settings-hint">仅支持 HTTPS 地址；浅色和深色背景可用 | 分隔。</p>
                     <div className="section-subtitle">当前主题选项</div><div className="theme-option-grid"><Toggle label="公开仪表盘" checked={settings.public_dashboard} onChange={(value) => updateSettings("public_dashboard", value)} />{themeSettingsSchema?.settings.map((field) => <ThemeOption key={field.key} field={field} value={settings.theme_options[field.key] ?? field.default} onChange={(value) => updateThemeOption(field.key, value)} />)}</div>
                     <div className="section-subtitle">公开界面元素</div>
                     <div className="settings-toggles"><Toggle label="显示搜索" checked={settings.show_search} onChange={(value) => updateSettings("show_search", value)} /><Toggle label="显示分组" checked={settings.show_groups} onChange={(value) => updateSettings("show_groups", value)} /><Toggle label="总览统计" checked={settings.show_stats} onChange={(value) => updateSettings("show_stats", value)} /><Toggle label="资产统计" checked={settings.show_assets} onChange={(value) => updateSettings("show_assets", value)} /><Toggle label="累计流量" checked={settings.show_traffic} onChange={(value) => updateSettings("show_traffic", value)} /><Toggle label="实时网速" checked={settings.show_speed} onChange={(value) => updateSettings("show_speed", value)} /><Toggle label="价格信息" checked={settings.show_price} onChange={(value) => updateSettings("show_price", value)} /><Toggle label="到期信息" checked={settings.show_expiry} onChange={(value) => updateSettings("show_expiry", value)} /><Toggle label="延迟与丢包" checked={settings.show_latency} onChange={(value) => updateSettings("show_latency", value)} /><Toggle label="在线时长" checked={settings.show_uptime} onChange={(value) => updateSettings("show_uptime", value)} /></div>
@@ -658,11 +663,11 @@ export function AdminPanel({
                     <p className="settings-hint">清空历史不会删除节点、密钥或最新状态。</p>
                   </> : null}
 
-                  {tab !== "data" && tab !== "about" ? <div className="form-actions"><button className="primary-btn" disabled={busy}><Save size={16} />保存{tab === "security" ? "账号与安全设置" : "设置"}</button></div> : null}
+                  {tab !== "data" ? <div className="form-actions"><button className="primary-btn" disabled={busy}><Save size={16} />保存{tab === "security" ? "账号与安全设置" : "设置"}</button></div> : null}
                 </form>
               ) : tab === "about" ? (
                 <div className="admin-section about-page">
-                  <div className="about-brand"><img src="/logo.svg" alt="" width="52" height="52" /><div><strong>NodeFlare</strong><small>基于 Rust、WebAssembly 和 Cloudflare Workers 的服务器监控</small></div></div>
+                  <div className="about-brand"><SiteLogo alt="" width="52" height="52" /><div><strong>NodeFlare</strong><small>基于 Rust、WebAssembly 和 Cloudflare Workers 的服务器监控</small></div></div>
                   <div className="about-rows">
                     <div className="about-row"><span>版本</span><strong>v{VERSION}</strong></div>
                     <div className="about-row"><span>项目地址</span><a href="https://github.com/imengying/NodeFlare" target="_blank" rel="noreferrer">github.com/imengying/NodeFlare<ExternalLink size={13} /></a></div>
@@ -674,8 +679,8 @@ export function AdminPanel({
           </div>
       </section>}
 
-      {editing ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setEditing(null)}><form className="editor-modal glass-panel" onSubmit={saveServer} onMouseDown={(event) => event.stopPropagation()}>
-        <header><div><span className="eyebrow">节点配置</span><h3>{editing === "new" ? "添加节点" : `编辑 · ${editing.name}`}</h3></div></header>
+      {editing ? <div className="submodal-backdrop" role="presentation" onMouseDown={serverDialog.onBackdropMouseDown}><form ref={serverDialog.dialogRef} className="editor-modal glass-panel" role="dialog" aria-modal="true" aria-labelledby="server-editor-title" tabIndex={-1} onSubmit={saveServer}>
+        <header><div><span className="eyebrow">节点配置</span><h3 id="server-editor-title">{editing === "new" ? "添加节点" : `编辑 · ${editing.name}`}</h3></div></header>
         <div className="form-grid"><label><span>名称</span><input autoFocus required value={form.name} onChange={(event) => updateForm("name", event.target.value)} /></label><label><span>地区代码</span><input maxLength={16} placeholder="CN / JP / DE" value={form.region} onChange={(event) => updateForm("region", event.target.value.toUpperCase())} /></label><label><span>分组</span><input value={form.group_name} onChange={(event) => updateForm("group_name", event.target.value)} /></label><label><span>标签</span><input placeholder="主力, 线路:BGP" value={form.tags} onChange={(event) => updateForm("tags", event.target.value)} /></label></div>
         <div className="form-grid three"><label><span>流量限额（GB）</span><input min="0" type="number" value={Math.round(form.traffic_limit / 1024 ** 3)} onChange={(event) => updateForm("traffic_limit", Number(event.target.value) * 1024 ** 3)} /></label><label><span>流量口径</span><select value={form.traffic_limit_type} onChange={(event) => updateForm("traffic_limit_type", event.target.value as ServerInput["traffic_limit_type"])}><option value="sum">上下行合计</option><option value="max">取较大值</option><option value="min">取较小值</option><option value="up">仅上行</option><option value="down">仅下行</option></select></label><label><span>流量重置日</span><input min="1" max="31" type="number" value={form.reset_day} onChange={(event) => updateForm("reset_day", Number(event.target.value))} /></label></div>
         <div className="form-grid three"><label><span>价格（0 隐藏，-1 免费）</span><input min="-1" step="0.01" type="number" value={form.price} onChange={(event) => updateForm("price", Number(event.target.value))} /></label><label><span>币种</span><select value={form.currency} onChange={(event) => updateForm("currency", event.target.value)}>{ASSET_CURRENCIES.map((code) => <option key={code}>{code}</option>)}</select></label><label><span>计费周期（天）</span><input min="1" max="3650" type="number" value={form.billing_cycle} onChange={(event) => updateForm("billing_cycle", Number(event.target.value))} /></label></div>
@@ -685,7 +690,7 @@ export function AdminPanel({
         <div className="form-actions"><button type="button" className="secondary-btn" onClick={() => setEditing(null)}>取消</button><button className="primary-btn" disabled={busy}><Save size={16} />保存节点</button></div>
       </form></div> : null}
 
-      {installCommand ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setInstall(null)}><section className="install-modal glass-panel" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">Agent 部署</span><h3>安装命令</h3></div><div className="segmented install-platform" aria-label="Agent 平台"><button type="button" className={installPlatform === "linux" ? "active" : ""} onClick={() => setInstallPlatform("linux")}>Linux</button><button type="button" className={installPlatform === "windows" ? "active" : ""} onClick={() => setInstallPlatform("windows")}>Windows</button><button type="button" className={installPlatform === "macos" ? "active" : ""} onClick={() => setInstallPlatform("macos")}>macOS ARM</button></div></header><div className="install-list"><pre>{installCommand}</pre></div><div className="form-actions"><button className="secondary-btn" type="button" onClick={() => setInstall(null)}>关闭</button><button className="primary-btn" type="button" onClick={() => void copyInstallCommand()}><Copy size={16} />复制</button></div></section></div> : null}
+      {installCommand ? <div className="submodal-backdrop" role="presentation" onMouseDown={installDialog.onBackdropMouseDown}><section ref={installDialog.dialogRef} className="install-modal glass-panel" role="dialog" aria-modal="true" aria-labelledby="install-dialog-title" tabIndex={-1}><header><div><span className="eyebrow">Agent 部署</span><h3 id="install-dialog-title">安装命令</h3></div><div className="segmented install-platform" aria-label="Agent 平台"><button type="button" className={installPlatform === "linux" ? "active" : ""} onClick={() => setInstallPlatform("linux")}>Linux</button><button type="button" className={installPlatform === "windows" ? "active" : ""} onClick={() => setInstallPlatform("windows")}>Windows</button><button type="button" className={installPlatform === "macos" ? "active" : ""} onClick={() => setInstallPlatform("macos")}>macOS ARM</button></div></header><div className="install-list"><pre>{installCommand}</pre></div><div className="form-actions"><button className="secondary-btn" type="button" onClick={() => setInstall(null)}>关闭</button><button className="primary-btn" type="button" onClick={() => void copyInstallCommand()}><Copy size={16} />复制</button></div></section></div> : null}
     </div>
   );
 }

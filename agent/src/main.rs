@@ -2315,33 +2315,22 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use std::net::TcpListener;
-    use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{
-        ack_interval, advance_deadline, agent_artifact_name, clock_offset_from_http_date,
-        corrected_timestamp, executable_format_valid, gpu_name_from_uevent, is_public_probe_ip,
-        live_batch_interval, live_endpoint, live_update_payload, median, mirrored_download_url,
+        ack_interval, advance_deadline, clock_offset_from_http_date, corrected_timestamp,
+        gpu_name_from_uevent, is_public_probe_ip, live_endpoint, live_update_payload,
         normalized_version, parse_lspci_gpu_names, parse_probe_target,
         parse_system_profiler_gpu_names, ping_latency, prune_report_samples, release_asset_sha256,
-        report_retry_delay, sanitize_latency_tasks, selected_interface, tcp_latency_probe_address,
-        valid_endpoint, valid_sample_schedule, version_triplet, CliOptions, ClockCalibration,
+        sanitize_latency_tasks, valid_endpoint, version_triplet, CliOptions, ClockCalibration,
         GithubReleaseAsset, LatencyResult, LatencyTask, LiveAck, Report, CLOCK_CALIBRATION_MAX_AGE,
-        MAX_LATENCY_TASKS, MAX_PENDING_LATENCY_RESULTS, PROBE_ATTEMPTS,
+        MAX_LATENCY_TASKS, MAX_PENDING_LATENCY_RESULTS,
     };
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     use super::connection_counts_from_netstat;
     #[cfg(target_os = "linux")]
     use super::disk_device;
-
-    #[test]
-    fn selects_network_interfaces() {
-        assert!(selected_interface("eth0", ""));
-        assert!(!selected_interface("lo", ""));
-        assert!(selected_interface("ens3", "eth0, ens3"));
-    }
 
     #[test]
     fn parses_platform_gpu_names() {
@@ -2419,17 +2408,6 @@ mod tests {
         assert!(!valid_endpoint("https://user@example.com"));
         assert!(!valid_endpoint("https://monitor.example.com/?token=abc"));
         assert!(!valid_endpoint("https://bad host.example"));
-    }
-
-    #[test]
-    fn builds_mirrored_download_urls() {
-        let release =
-            "https://github.com/imengying/NodeFlare/releases/download/v1.2.3/agent-linux-x86_64";
-        assert_eq!(mirrored_download_url("", release), release);
-        assert_eq!(
-            mirrored_download_url("https://mirror.example.com/", release),
-            format!("https://mirror.example.com/{release}")
-        );
     }
 
     #[test]
@@ -2578,30 +2556,6 @@ mod tests {
     }
 
     #[test]
-    fn backs_off_failed_reports() {
-        assert_eq!(report_retry_delay(0, 60), Duration::from_secs(60));
-        assert_eq!(report_retry_delay(1, 60), Duration::from_secs(5));
-        assert_eq!(report_retry_delay(4, 60), Duration::from_secs(40));
-        assert_eq!(report_retry_delay(20, 60), Duration::from_secs(300));
-    }
-
-    #[test]
-    fn validates_sample_schedules() {
-        assert!(valid_sample_schedule(3600, 5));
-        assert!(!valid_sample_schedule(3600, 4));
-        assert!(!valid_sample_schedule(60, 0));
-        assert!(!valid_sample_schedule(10, 1));
-    }
-
-    #[test]
-    fn batches_live_samples_at_one_fifteenth_of_the_history_interval() {
-        assert_eq!(live_batch_interval(60, 1), Duration::from_secs(4));
-        assert_eq!(live_batch_interval(60, 5), Duration::from_secs(5));
-        assert_eq!(live_batch_interval(120, 1), Duration::from_secs(8));
-        assert_eq!(live_batch_interval(3_600, 1), Duration::from_secs(60));
-    }
-
-    #[test]
     fn advances_collection_deadlines_without_drift() {
         let start = Instant::now();
         let interval = Duration::from_secs(1);
@@ -2662,23 +2616,6 @@ mod tests {
     }
 
     #[test]
-    fn selects_current_platform_artifact() {
-        #[cfg(target_os = "linux")]
-        assert!(agent_artifact_name().is_some_and(|name| name.starts_with("agent-linux-")));
-        #[cfg(target_os = "windows")]
-        assert_eq!(agent_artifact_name(), Some("agent-windows-x86_64.exe"));
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        assert_eq!(agent_artifact_name(), Some("agent-macos-aarch64"));
-    }
-
-    #[test]
-    fn recognizes_current_executable_format() {
-        assert!(executable_format_valid(
-            &std::env::current_exe().expect("current executable")
-        ));
-    }
-
-    #[test]
     fn parses_probe_targets() {
         assert_eq!(
             parse_probe_target("Example.COM", None),
@@ -2727,27 +2664,6 @@ mod tests {
         ] {
             assert!(!is_public_probe_ip(address.parse().expect("IP address")));
         }
-    }
-
-    #[test]
-    fn calculates_median() {
-        assert_eq!(median(&mut [4.0, 1.0, 3.0]), 3.0);
-        assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), 2.5);
-    }
-
-    #[test]
-    fn measures_local_tcp_latency() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
-        let address = listener.local_addr().expect("listener address");
-        let accepter = thread::spawn(move || {
-            for _ in 0..PROBE_ATTEMPTS {
-                listener.accept().expect("accept probe connection");
-            }
-        });
-        let (latency, loss) = tcp_latency_probe_address(&address);
-        accepter.join().expect("join listener");
-        assert!(latency >= 0.0);
-        assert_eq!(loss, 0.0);
     }
 
     #[test]

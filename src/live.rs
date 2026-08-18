@@ -1016,12 +1016,20 @@ impl DurableObject for LiveHub {
         reason: String,
         _was_clean: bool,
     ) -> Result<()> {
-        ws.close(Some(code as u16), Some(reason))
+        match outbound_close_code(code) {
+            Some(code) => ws.close(Some(code), Some(reason)),
+            None => ws.close(None, None::<&str>),
+        }
     }
 
     async fn websocket_error(&self, ws: WebSocket, _error: Error) -> Result<()> {
         ws.close(Some(1011), Some("socket error"))
     }
+}
+
+fn outbound_close_code(code: usize) -> Option<u16> {
+    let code = u16::try_from(code).ok()?;
+    ((1000..=4999).contains(&code) && !matches!(code, 1004..=1006 | 1015)).then_some(code)
 }
 
 async fn post_live_action(env: &Env, path: &str, action: &str, body: &str) -> Result<Response> {
@@ -1126,6 +1134,7 @@ pub async fn disconnect_agents(env: &Env, server_ids: &[String]) -> Result<()> {
 pub async fn upgrade(req: Request, env: &Env) -> Result<Response> {
     let namespace = env.durable_object("LIVE_HUB")?;
     let stub = namespace.id_from_name("dashboard")?.get_stub()?;
+    let req = req.clone_mut()?;
     req.headers().delete("X-Live-Agent-ID")?;
     req.headers().delete("X-Live-Agent-Hidden")?;
     for header in [
@@ -1157,6 +1166,7 @@ pub async fn upgrade_agent(
 ) -> Result<Response> {
     let namespace = env.durable_object("LIVE_HUB")?;
     let stub = namespace.id_from_name("dashboard")?.get_stub()?;
+    let req = req.clone_mut()?;
     req.headers().set("X-Live-Agent-ID", server_id)?;
     req.headers()
         .set("X-Live-Agent-Hidden", if hidden { "1" } else { "0" })?;
@@ -1204,11 +1214,11 @@ pub async fn upgrade_agent(
 mod tests {
     use super::{
         agent_wss_interval_ms, batch_update_parts_at, begin_d1_flush, cached_update_value,
-        finish_d1_flush, live_ack_payload, next_d1_write_ms, trim_cached_live_samples,
-        trim_socket_attachment, update_alert_window, AlertEvaluationServer, AlertWindowSample,
-        CachedLiveSample, SocketAttachment, TrafficAttachment, ALERT_WINDOW_SECONDS,
-        CACHED_LIVE_TTL_SECONDS, MAX_CACHED_LIVE_BYTES, MAX_CACHED_LIVE_SAMPLES,
-        MAX_SERIALIZED_ATTACHMENT_BYTES,
+        finish_d1_flush, live_ack_payload, next_d1_write_ms, outbound_close_code,
+        trim_cached_live_samples, trim_socket_attachment, update_alert_window,
+        AlertEvaluationServer, AlertWindowSample, CachedLiveSample, SocketAttachment,
+        TrafficAttachment, ALERT_WINDOW_SECONDS, CACHED_LIVE_TTL_SECONDS, MAX_CACHED_LIVE_BYTES,
+        MAX_CACHED_LIVE_SAMPLES, MAX_SERIALIZED_ATTACHMENT_BYTES,
     };
     use crate::db::HistoryMetricAggregate;
     use crate::latency::LatencyMetricAggregates;
@@ -1226,6 +1236,19 @@ mod tests {
             net_out: net_in / 2.0,
             ..HistoryPoint::default()
         }
+    }
+
+    #[test]
+    fn filters_reserved_and_invalid_websocket_close_codes() {
+        assert_eq!(outbound_close_code(1000), Some(1000));
+        assert_eq!(outbound_close_code(1011), Some(1011));
+        assert_eq!(outbound_close_code(4000), Some(4000));
+        assert_eq!(outbound_close_code(999), None);
+        assert_eq!(outbound_close_code(1004), None);
+        assert_eq!(outbound_close_code(1005), None);
+        assert_eq!(outbound_close_code(1006), None);
+        assert_eq!(outbound_close_code(1015), None);
+        assert_eq!(outbound_close_code(5000), None);
     }
 
     #[test]

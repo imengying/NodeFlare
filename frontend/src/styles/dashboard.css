@@ -106,6 +106,7 @@
 .error-band button { font-weight: 700; }
 .empty-state, .chart-loading { display: flex; min-height: 340px; align-items: center; justify-content: center; flex-direction: column; gap: 16px; color: var(--muted-foreground); font-size: 13px; }
 .verification-gate { display: flex; width: min(430px, 100%); min-height: 380px; align-items: center; justify-content: center; flex-direction: column; gap: 14px; margin: 12vh auto 0; border: 1px solid var(--border); border-radius: 8px; padding: 30px; background: var(--card); box-shadow: var(--shadow); text-align: center; }
+.verification-gate > img, .dashboard-login-gate > img { object-fit: contain; }
 .verification-gate h1 { margin: 0; font-size: 19px; }
 .verification-gate p { margin: 4px 0 0; color: var(--muted-foreground); font-size: 11px; }
 .dashboard-login-gate { display: flex; width: min(420px, 100%); align-items: center; flex-direction: column; gap: 16px; margin: 9vh auto 0; border-radius: 8px; padding: 28px; }

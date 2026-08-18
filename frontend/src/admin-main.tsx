@@ -43,6 +43,15 @@ function AdminApp() {
   useEffect(() => {
     document.title = config ? `管理面板 · ${config.site_name}` : "管理面板";
   }, [config]);
+  useEffect(() => {
+    let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "icon";
+      document.head.append(link);
+    }
+    link.href = config?.favicon_url || config?.logo_url || "/logo.svg";
+  }, [config?.favicon_url, config?.logo_url]);
 
   if (error) return <div className={`admin-loading ${dark ? "admin-dark" : ""}`}><span>{error}</span><button className="secondary-btn" onClick={() => void loadConfig()}>重试</button></div>;
   if (!config) return <div className={`admin-loading ${dark ? "admin-dark" : ""}`}>正在加载管理面板</div>;

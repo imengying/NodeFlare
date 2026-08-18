@@ -3,6 +3,7 @@ import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react
 import { api } from "../api";
 import type { AdminServer, LatencyTask, LatencyTaskInput } from "../types";
 import { Checkbox } from "./Checkbox";
+import { useDialog } from "./useDialog";
 
 const emptyTask: LatencyTaskInput = {
   name: "",
@@ -48,6 +49,7 @@ export function LatencyManager({
   const [editing, setEditing] = useState<LatencyTask | "new" | null>(null);
   const [form, setForm] = useState<LatencyTaskInput>(emptyTask);
   const [query, setQuery] = useState("");
+  const editorDialog = useDialog<HTMLFormElement>(editing !== null, () => setEditing(null));
 
   const load = useCallback(async () => {
     setBusy(true);
@@ -148,8 +150,8 @@ export function LatencyManager({
       {busy && !tasks.length ? <div className="list-empty">正在读取延迟任务</div> : null}
     </div>
 
-    {editing ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setEditing(null)}><form className="latency-editor glass-panel" onSubmit={save} onMouseDown={(event) => event.stopPropagation()}>
-      <header><div><span className="eyebrow">延迟检测</span><h3>{editing === "new" ? "添加任务" : `编辑 · ${editing.name}`}</h3></div></header>
+    {editing ? <div className="submodal-backdrop" role="presentation" onMouseDown={editorDialog.onBackdropMouseDown}><form ref={editorDialog.dialogRef} className="latency-editor glass-panel" role="dialog" aria-modal="true" aria-labelledby="latency-editor-title" tabIndex={-1} onSubmit={save}>
+      <header><div><span className="eyebrow">延迟检测</span><h3 id="latency-editor-title">{editing === "new" ? "添加任务" : `编辑 · ${editing.name}`}</h3></div></header>
       <div className="form-grid"><label><span>名称</span><input autoFocus required maxLength={80} value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} /></label><label><span>类型</span><div className="segmented task-type-control"><button type="button" className={form.task_type === "icmp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "icmp", port: null }))}>ICMP</button><button type="button" className={form.task_type === "tcp" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, task_type: "tcp", port: current.port ?? 80 }))}>TCP</button></div></label></div>
       <div className="form-grid"><label><span>节点</span><input required maxLength={50} value={form.target} onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))} placeholder={form.task_type === "tcp" ? "example.com" : "1.1.1.1"} /></label>{form.task_type === "tcp" ? <label><span>端口</span><input type="number" min="1" max="65535" required value={form.port ?? ""} onChange={(event) => setForm((current) => ({ ...current, port: event.target.value ? Number(event.target.value) : null }))} placeholder="80" /></label> : <div />}</div>
       <label><span>检测间隔（秒）</span><input type="number" min="30" max="3600" required value={form.interval_seconds} onChange={(event) => setForm((current) => ({ ...current, interval_seconds: Number(event.target.value) }))} /></label>

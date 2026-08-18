@@ -54,6 +54,7 @@ pub struct SettingsInput {
     pub site_name: Option<String>,
     pub site_description: Option<String>,
     pub site_announcement: Option<String>,
+    pub logo_url: Option<String>,
     pub favicon_url: Option<String>,
     pub locale: Option<String>,
     pub public_dashboard: Option<bool>,
@@ -366,4 +367,6 @@ pub struct AlertRuleView {
 #[derive(Debug, Serialize)]
 pub struct ApiError<'a> {
     pub error: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<&'a str>,
 }

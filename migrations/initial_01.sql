@@ -113,6 +113,7 @@ INSERT INTO settings(id, value, updated_at) VALUES (
     '{
       "site_description": "轻量、实时的服务器运行状态",
       "site_announcement": "",
+      "logo_url": "",
       "favicon_url": "",
       "locale": "zh-CN",
       "public_dashboard": "true",

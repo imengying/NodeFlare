@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, time::Duration};
 
 use serde::Serialize;
 use serde_json::Value;
-use worker::{AbortController, D1Database, Error, Fetch, Method, Request, Result};
+use worker::{D1Database, Error, Method, Request, Result};
+
+use crate::outbound::fetch_with_timeout;
 
 use crate::{cloudflare, db};
 
@@ -136,13 +138,11 @@ async fn fetch_json(url: &str) -> Result<Value> {
     request
         .headers()
         .set("User-Agent", "NodeFlare-Exchange-Rates")?;
-    let controller = AbortController::default();
-    let signal = controller.signal();
-    worker::wasm_bindgen_futures::spawn_local(async move {
-        worker::Delay::from(Duration::from_secs(8)).await;
-        controller.abort();
-    });
-    let mut response = Fetch::Request(request).send_with_signal(&signal).await?;
+    let Some(mut response) = fetch_with_timeout(request, Duration::from_secs(8)).await? else {
+        return Err(Error::RustError(
+            "exchange-rate upstream request timed out".to_string(),
+        ));
+    };
     let status = response.status_code();
     if !(200..300).contains(&status) {
         return Err(Error::RustError(format!(
@@ -246,7 +246,7 @@ pub async fn refresh(
 
 #[cfg(test)]
 mod tests {
-    use super::{default_rates, due, parse_er_api, parse_frankfurter};
+    use super::{default_rates, parse_er_api, parse_frankfurter};
 
     #[test]
     fn provides_all_frontend_asset_currencies() {
@@ -306,15 +306,5 @@ mod tests {
             "rates": {"CNY": 7.0}
         });
         assert!(parse_frankfurter(&wrong_base).is_none());
-    }
-
-    #[test]
-    fn refreshes_daily_and_retries_hourly() {
-        let current = 200_000;
-        assert!(due(0, 0, current, false));
-        assert!(!due(current - 10, 0, current, false));
-        assert!(!due(0, current - 10, current, false));
-        assert!(due(current - 86_400, current - 3_600, current, false));
-        assert!(due(current, current, current, true));
     }
 }

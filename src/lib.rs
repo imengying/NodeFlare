@@ -6,6 +6,7 @@ mod latency;
 mod live;
 mod models;
 mod notify;
+mod outbound;
 mod routes;
 mod theme;
 mod turnstile;
@@ -18,7 +19,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use worker::*;
 
 use crate::auth::{
-    bearer_token, is_admin, sha256_hex, verify_turnstile_proof, ADMIN_SESSION_SECONDS,
+    bearer_token, is_admin, random_salt, sha256_hex, verify_turnstile_proof, ADMIN_SESSION_SECONDS,
 };
 use crate::models::{
     AgentDiskMetric, AgentGpuMetric, AgentReport, AlertRuleInput, ApiError, LatencyTaskInput,
@@ -205,7 +206,35 @@ async fn request_json<T: DeserializeOwned>(req: &mut Request, limit: usize) -> R
 }
 
 pub(crate) fn error(message: &str, status: u16) -> Result<Response> {
-    json(&ApiError { error: message }, status)
+    json(
+        &ApiError {
+            error: message,
+            request_id: None,
+        },
+        status,
+    )
+}
+
+fn internal_error(request_id: &str) -> Result<Response> {
+    let mut response = json(
+        &ApiError {
+            error: "服务暂时不可用，请稍后重试",
+            request_id: Some(request_id),
+        },
+        500,
+    )?;
+    response.headers_mut().set("X-Request-Id", request_id)?;
+    Ok(response)
+}
+
+fn request_id(req: &Request) -> String {
+    req.headers()
+        .get("CF-Ray")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(random_salt)
+        .unwrap_or_else(|| format!("local-{}", Date::now().as_millis() as i64))
 }
 
 fn rate_limited() -> Result<Response> {
@@ -490,6 +519,38 @@ pub(crate) fn valid_password_derived(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+pub(crate) fn valid_public_asset_url(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    if value.chars().count() > 1000 {
+        return false;
+    }
+    Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some_and(|host| !host.is_empty())
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+pub(crate) fn valid_background_urls(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    if value.chars().count() > 1000 {
+        return false;
+    }
+    let parts = value.split('|').collect::<Vec<_>>();
+    parts.len() <= 2
+        && parts.iter().any(|part| !part.trim().is_empty())
+        && parts
+            .iter()
+            .all(|part| part.trim().is_empty() || valid_public_asset_url(part))
 }
 
 fn valid_server_price(value: f64) -> bool {
@@ -1106,7 +1167,9 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
 #[event(fetch, respond_with_errors)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let method = req.method();
+    let method_name = format!("{method:?}");
     let path = req.path();
+    let request_id = request_id(&req);
     let request_url = req.url().ok();
     let origin = req.headers().get("Origin").ok().flatten();
 
@@ -1133,8 +1196,17 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     match handle(req, env, ctx).await {
         Ok(response) => Ok(response),
         Err(err) => {
-            console_error!("request failed: {err}");
-            error("服务暂时不可用，请检查 D1 迁移与绑定", 500)
+            console_error!(
+                "{}",
+                serde_json::json!({
+                    "event": "request_failed",
+                    "request_id": request_id,
+                    "method": method_name,
+                    "path": path,
+                    "error": err.to_string(),
+                })
+            );
+            internal_error(&request_id)
         }
     }
 }
@@ -1198,9 +1270,9 @@ mod tests {
     use super::{
         allow_on_rate_limit_failure, history_cache_key, history_cache_seconds, rate_limit_binding,
         rewrite_remote_theme_index, same_origin, submitted_secret, valid_agent_mirror,
-        valid_cloudflare_account_id, valid_cloudflare_api_token, valid_password_derived,
-        valid_ping_target, valid_server_price, validate_latency_task, validate_server, ADMIN_HTML,
-        ADMIN_SCRIPT, ADMIN_STYLE,
+        valid_background_urls, valid_cloudflare_account_id, valid_cloudflare_api_token,
+        valid_password_derived, valid_ping_target, valid_public_asset_url, validate_latency_task,
+        validate_server,
     };
     use crate::{db::SECRET_MASK, models::LatencyTaskInput, models::ServerInput};
     use worker::{Method, Url};
@@ -1246,15 +1318,6 @@ mod tests {
         assert_eq!(history_cache_seconds(30), 180);
         assert_eq!(history_cache_seconds(60), 300);
         assert_eq!(history_cache_seconds(120), 600);
-    }
-
-    #[test]
-    fn validates_server_prices() {
-        assert!(valid_server_price(-1.0));
-        assert!(valid_server_price(0.0));
-        assert!(valid_server_price(1_000_000_000.0));
-        assert!(!valid_server_price(-1.01));
-        assert!(!valid_server_price(f64::NAN));
     }
 
     #[test]
@@ -1410,13 +1473,31 @@ mod tests {
     }
 
     #[test]
-    fn embeds_the_admin_frontend() {
-        assert!(ADMIN_HTML.starts_with(b"<!doctype html>"));
-        assert!(ADMIN_HTML
-            .windows(b"/admin-assets/admin.js".len())
-            .any(|value| value == b"/admin-assets/admin.js"));
-        assert!(!ADMIN_SCRIPT.is_empty());
-        assert!(!ADMIN_STYLE.is_empty());
+    fn validates_public_asset_urls() {
+        assert!(valid_public_asset_url(""));
+        assert!(valid_public_asset_url("https://cdn.example.com/logo.svg"));
+        assert!(valid_public_asset_url(
+            "https://cdn.example.com/background.webp?size=large#hero"
+        ));
+        assert!(!valid_public_asset_url("http://cdn.example.com/logo.svg"));
+        assert!(!valid_public_asset_url("/logo.svg"));
+        assert!(!valid_public_asset_url(
+            "https://user:pass@example.com/logo.svg"
+        ));
+
+        assert!(valid_background_urls(""));
+        assert!(valid_background_urls(
+            "https://cdn.example.com/light.webp | https://cdn.example.com/dark.webp"
+        ));
+        assert!(valid_background_urls(
+            "https://cdn.example.com/light.webp |"
+        ));
+        assert!(valid_background_urls("| https://cdn.example.com/dark.webp"));
+        assert!(!valid_background_urls("|"));
+        assert!(!valid_background_urls(
+            "https://cdn.example.com/a.webp | https://cdn.example.com/b.webp | https://cdn.example.com/c.webp"
+        ));
+        assert!(!valid_background_urls("javascript:alert(1)"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import type { AdminServer, AlertRule, AlertRuleInput } from "../types";
 import { Checkbox } from "./Checkbox";
+import { useDialog } from "./useDialog";
 
 const emptyRule: AlertRuleInput = {
   name: "",
@@ -32,6 +33,7 @@ export function AlertRuleManager({ servers, onError, onNotice }: {
   const [form, setForm] = useState<AlertRuleInput>(emptyRule);
   const [allServers, setAllServers] = useState(true);
   const [busy, setBusy] = useState(false);
+  const editorDialog = useDialog<HTMLElement>(editing !== null, () => setEditing(null));
 
   const load = useCallback(async () => {
     try { setRules((await api.alertRules()).rules); }
@@ -103,8 +105,8 @@ export function AlertRuleManager({ servers, onError, onNotice }: {
       {!rules.length ? <div className="list-empty">尚未配置资源告警规则</div> : null}
     </div>
 
-    {editing ? <div className="submodal-backdrop" role="presentation" onMouseDown={() => setEditing(null)}><section className="alert-rule-editor glass-panel" onMouseDown={(event) => event.stopPropagation()}>
-      <header><div><span className="eyebrow">通知规则</span><h3>{editing === "new" ? "新建资源告警" : "编辑资源告警"}</h3></div></header>
+    {editing ? <div className="submodal-backdrop" role="presentation" onMouseDown={editorDialog.onBackdropMouseDown}><section ref={editorDialog.dialogRef} className="alert-rule-editor glass-panel" role="dialog" aria-modal="true" aria-labelledby="alert-rule-editor-title" tabIndex={-1}>
+      <header><div><span className="eyebrow">通知规则</span><h3 id="alert-rule-editor-title">{editing === "new" ? "新建资源告警" : "编辑资源告警"}</h3></div></header>
       <label><span>规则名称</span><input required maxLength={80} value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} /></label>
       <div className="form-grid"><label><span>监控指标</span><select value={form.metric} onChange={(event) => setForm((current) => ({ ...current, metric: event.target.value as AlertRuleInput["metric"] }))}>{Object.entries(metricLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><label><span>阈值（{unit}）</span><input required type="number" min="0.01" max={unit === "%" ? 100 : 1000000} step="0.01" value={form.threshold} onChange={(event) => setForm((current) => ({ ...current, threshold: Number(event.target.value) }))} /></label></div>
       <div className="form-grid"><label><span>时间窗口（分钟）</span><input required type="number" min="1" max="1440" value={form.duration_minutes} onChange={(event) => setForm((current) => ({ ...current, duration_minutes: Number(event.target.value) }))} /></label><label><span>判断方式</span><select value={form.aggregation} onChange={(event) => setForm((current) => ({ ...current, aggregation: event.target.value as AlertRuleInput["aggregation"] }))}><option value="average">窗口平均值</option><option value="continuous">窗口内持续超限</option></select></label></div>
